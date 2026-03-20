@@ -9,8 +9,8 @@ import express from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
 // server/db.ts
-import { drizzle } from "drizzle-orm/mysql2";
-import mysql from "mysql2/promise";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
 
 // drizzle/schema.ts
 var schema_exports = {};
@@ -21,6 +21,10 @@ __export(schema_exports, {
   bybitApiKeysRelations: () => bybitApiKeysRelations,
   candles: () => candles,
   indicators: () => indicators,
+  logTypeEnum: () => logTypeEnum,
+  sideEnum: () => sideEnum,
+  timeframeEnum: () => timeframeEnum,
+  tradeStatusEnum: () => tradeStatusEnum,
   trades: () => trades,
   tradesRelations: () => tradesRelations,
   tradingConfigs: () => tradingConfigs,
@@ -32,20 +36,35 @@ __export(schema_exports, {
   usersRelations: () => usersRelations
 });
 import {
-  mysqlTable,
-  mysqlEnum,
+  pgTable,
+  pgEnum,
   varchar,
   text,
-  decimal,
-  int,
+  numeric,
+  integer,
   bigint,
   timestamp,
   boolean,
   index,
-  json
-} from "drizzle-orm/mysql-core";
+  jsonb
+} from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
-var users = mysqlTable(
+var timeframeEnum = pgEnum("timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]);
+var sideEnum = pgEnum("side", ["BUY", "SELL"]);
+var tradeStatusEnum = pgEnum("trade_status", ["OPEN", "CLOSED", "CANCELLED"]);
+var logTypeEnum = pgEnum("log_type", [
+  "BOT_START",
+  "BOT_STOP",
+  "SIGNAL_GENERATED",
+  "ORDER_PLACED",
+  "ORDER_FILLED",
+  "ORDER_CANCELLED",
+  "POSITION_OPENED",
+  "POSITION_CLOSED",
+  "ERROR",
+  "INFO"
+]);
+var users = pgTable(
   "users",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -53,13 +72,11 @@ var users = mysqlTable(
     username: varchar("username", { length: 255 }).unique(),
     passwordHash: text("password_hash"),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    emailIdx: index("email_idx").on(table.email)
-  })
+  (table) => [index("email_idx").on(table.email)]
 );
-var bybitApiKeys = mysqlTable(
+var bybitApiKeys = pgTable(
   "bybit_api_keys",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -69,13 +86,11 @@ var bybitApiKeys = mysqlTable(
     isActive: boolean("is_active").default(true),
     testnet: boolean("testnet").default(false),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    userIdIdx: index("user_id_idx").on(table.userId)
-  })
+  (table) => [index("user_id_idx").on(table.userId)]
 );
-var tradingConfigs = mysqlTable(
+var tradingConfigs = pgTable(
   "trading_configs",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -84,55 +99,51 @@ var tradingConfigs = mysqlTable(
     description: text("description"),
     isActive: boolean("is_active").default(false),
     // Trading pairs
-    tradingPairs: json("trading_pairs").$type().default([]),
+    tradingPairs: jsonb("trading_pairs").$type().default([]),
     // Risk management
-    maxPositionSize: decimal("max_position_size", { precision: 20, scale: 8 }).default("0"),
-    maxDrawdown: decimal("max_drawdown", { precision: 5, scale: 2 }).default("10"),
-    stopLossPercent: decimal("stop_loss_percent", { precision: 5, scale: 2 }).default("2"),
-    takeProfitPercent: decimal("take_profit_percent", { precision: 5, scale: 2 }).default("5"),
+    maxPositionSize: numeric("max_position_size", { precision: 20, scale: 8 }).default("0"),
+    maxDrawdown: numeric("max_drawdown", { precision: 5, scale: 2 }).default("10"),
+    stopLossPercent: numeric("stop_loss_percent", { precision: 5, scale: 2 }).default("2"),
+    takeProfitPercent: numeric("take_profit_percent", { precision: 5, scale: 2 }).default("5"),
     // Strategy parameters
-    rsiPeriod: int("rsi_period").default(14),
-    rsiOverbought: int("rsi_overbought").default(70),
-    rsiOversold: int("rsi_oversold").default(30),
-    macdFastPeriod: int("macd_fast_period").default(12),
-    macdSlowPeriod: int("macd_slow_period").default(26),
-    macdSignalPeriod: int("macd_signal_period").default(9),
-    bbPeriod: int("bb_period").default(20),
-    bbStdDev: decimal("bb_std_dev", { precision: 3, scale: 1 }).default("2"),
-    emaPeriod: int("ema_period").default(50),
+    rsiPeriod: integer("rsi_period").default(14),
+    rsiOverbought: integer("rsi_overbought").default(70),
+    rsiOversold: integer("rsi_oversold").default(30),
+    macdFastPeriod: integer("macd_fast_period").default(12),
+    macdSlowPeriod: integer("macd_slow_period").default(26),
+    macdSignalPeriod: integer("macd_signal_period").default(9),
+    bbPeriod: integer("bb_period").default(20),
+    bbStdDev: numeric("bb_std_dev", { precision: 3, scale: 1 }).default("2"),
+    emaPeriod: integer("ema_period").default(50),
     // Volume settings
-    minVolume: decimal("min_volume", { precision: 20, scale: 8 }).default("0"),
+    minVolume: numeric("min_volume", { precision: 20, scale: 8 }).default("0"),
     // Timeframe
-    timeframe: mysqlEnum("timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).default("1h"),
+    timeframe: timeframeEnum("timeframe").default("1h"),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    userIdIdx: index("config_user_id_idx").on(table.userId)
-  })
+  (table) => [index("config_user_id_idx").on(table.userId)]
 );
-var tradingPairs = mysqlTable(
+var tradingPairs = pgTable(
   "trading_pairs",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
     symbol: varchar("symbol", { length: 50 }).notNull().unique(),
     baseCoin: varchar("base_coin", { length: 50 }).notNull(),
     quoteCoin: varchar("quote_coin", { length: 50 }).notNull(),
-    minOrderQty: decimal("min_order_qty", { precision: 20, scale: 8 }).notNull(),
-    maxOrderQty: decimal("max_order_qty", { precision: 20, scale: 8 }).notNull(),
-    minOrderAmt: decimal("min_order_amt", { precision: 20, scale: 8 }).notNull(),
-    maxOrderAmt: decimal("max_order_amt", { precision: 20, scale: 8 }).notNull(),
-    priceScale: int("price_scale").notNull(),
-    qtyScale: int("qty_scale").notNull(),
+    minOrderQty: numeric("min_order_qty", { precision: 20, scale: 8 }).notNull(),
+    maxOrderQty: numeric("max_order_qty", { precision: 20, scale: 8 }).notNull(),
+    minOrderAmt: numeric("min_order_amt", { precision: 20, scale: 8 }).notNull(),
+    maxOrderAmt: numeric("max_order_amt", { precision: 20, scale: 8 }).notNull(),
+    priceScale: integer("price_scale").notNull(),
+    qtyScale: integer("qty_scale").notNull(),
     isActive: boolean("is_active").default(true),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    symbolIdx: index("symbol_idx").on(table.symbol)
-  })
+  (table) => [index("symbol_idx").on(table.symbol)]
 );
-var trades = mysqlTable(
+var trades = pgTable(
   "trades",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -140,59 +151,59 @@ var trades = mysqlTable(
     configId: varchar("config_id", { length: 255 }).notNull(),
     symbol: varchar("symbol", { length: 50 }).notNull(),
     // Trade details
-    side: mysqlEnum("side", ["BUY", "SELL"]).notNull(),
-    entryPrice: decimal("entry_price", { precision: 20, scale: 8 }).notNull(),
-    quantity: decimal("quantity", { precision: 20, scale: 8 }).notNull(),
+    side: sideEnum("side").notNull(),
+    entryPrice: numeric("entry_price", { precision: 20, scale: 8 }).notNull(),
+    quantity: numeric("quantity", { precision: 20, scale: 8 }).notNull(),
     entryTime: timestamp("entry_time").notNull(),
     // Exit details
-    exitPrice: decimal("exit_price", { precision: 20, scale: 8 }),
+    exitPrice: numeric("exit_price", { precision: 20, scale: 8 }),
     exitTime: timestamp("exit_time"),
     exitReason: varchar("exit_reason", { length: 50 }),
     // P&L
-    pnl: decimal("pnl", { precision: 20, scale: 8 }),
-    pnlPercent: decimal("pnl_percent", { precision: 5, scale: 2 }),
+    pnl: numeric("pnl", { precision: 20, scale: 8 }),
+    pnlPercent: numeric("pnl_percent", { precision: 5, scale: 2 }),
     // Risk management
-    stopLoss: decimal("stop_loss", { precision: 20, scale: 8 }),
-    takeProfit: decimal("take_profit", { precision: 20, scale: 8 }),
+    stopLoss: numeric("stop_loss", { precision: 20, scale: 8 }),
+    takeProfit: numeric("take_profit", { precision: 20, scale: 8 }),
     // Status
-    status: mysqlEnum("status", ["OPEN", "CLOSED", "CANCELLED"]).default("OPEN"),
+    status: tradeStatusEnum("status").default("OPEN"),
     // Indicators at entry
-    rsiAtEntry: decimal("rsi_at_entry", { precision: 5, scale: 2 }),
-    macdAtEntry: json("macd_at_entry"),
-    bbAtEntry: json("bb_at_entry"),
+    rsiAtEntry: numeric("rsi_at_entry", { precision: 5, scale: 2 }),
+    macdAtEntry: jsonb("macd_at_entry"),
+    bbAtEntry: jsonb("bb_at_entry"),
     // Bybit order IDs
     bybitOrderId: varchar("bybit_order_id", { length: 255 }),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    userIdIdx: index("trade_user_id_idx").on(table.userId),
-    configIdIdx: index("trade_config_id_idx").on(table.configId),
-    symbolIdx: index("trade_symbol_idx").on(table.symbol),
-    statusIdx: index("trade_status_idx").on(table.status)
-  })
+  (table) => [
+    index("trade_user_id_idx").on(table.userId),
+    index("trade_config_id_idx").on(table.configId),
+    index("trade_symbol_idx").on(table.symbol),
+    index("trade_status_idx").on(table.status)
+  ]
 );
-var candles = mysqlTable(
+var candles = pgTable(
   "candles",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
     symbol: varchar("symbol", { length: 50 }).notNull(),
     timeframe: varchar("timeframe", { length: 10 }).notNull(),
     timestamp: bigint("timestamp", { mode: "number" }).notNull(),
-    open: decimal("open", { precision: 20, scale: 8 }).notNull(),
-    high: decimal("high", { precision: 20, scale: 8 }).notNull(),
-    low: decimal("low", { precision: 20, scale: 8 }).notNull(),
-    close: decimal("close", { precision: 20, scale: 8 }).notNull(),
-    volume: decimal("volume", { precision: 20, scale: 8 }).notNull(),
-    quoteAssetVolume: decimal("quote_asset_volume", { precision: 20, scale: 8 }),
+    open: numeric("open", { precision: 20, scale: 8 }).notNull(),
+    high: numeric("high", { precision: 20, scale: 8 }).notNull(),
+    low: numeric("low", { precision: 20, scale: 8 }).notNull(),
+    close: numeric("close", { precision: 20, scale: 8 }).notNull(),
+    volume: numeric("volume", { precision: 20, scale: 8 }).notNull(),
+    quoteAssetVolume: numeric("quote_asset_volume", { precision: 20, scale: 8 }),
     createdAt: timestamp("created_at").defaultNow()
   },
-  (table) => ({
-    symbolTimeframeIdx: index("symbol_timeframe_idx").on(table.symbol, table.timeframe),
-    timestampIdx: index("timestamp_idx").on(table.timestamp)
-  })
+  (table) => [
+    index("symbol_timeframe_idx").on(table.symbol, table.timeframe),
+    index("timestamp_idx").on(table.timestamp)
+  ]
 );
-var indicators = mysqlTable(
+var indicators = pgTable(
   "indicators",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -200,56 +211,45 @@ var indicators = mysqlTable(
     timeframe: varchar("timeframe", { length: 10 }).notNull(),
     timestamp: bigint("timestamp", { mode: "number" }).notNull(),
     // RSI
-    rsi: decimal("rsi", { precision: 5, scale: 2 }),
+    rsi: numeric("rsi", { precision: 5, scale: 2 }),
     // MACD
-    macdLine: decimal("macd_line", { precision: 20, scale: 8 }),
-    signalLine: decimal("signal_line", { precision: 20, scale: 8 }),
-    histogram: decimal("histogram", { precision: 20, scale: 8 }),
+    macdLine: numeric("macd_line", { precision: 20, scale: 8 }),
+    signalLine: numeric("signal_line", { precision: 20, scale: 8 }),
+    histogram: numeric("histogram", { precision: 20, scale: 8 }),
     // Bollinger Bands
-    bbUpper: decimal("bb_upper", { precision: 20, scale: 8 }),
-    bbMiddle: decimal("bb_middle", { precision: 20, scale: 8 }),
-    bbLower: decimal("bb_lower", { precision: 20, scale: 8 }),
+    bbUpper: numeric("bb_upper", { precision: 20, scale: 8 }),
+    bbMiddle: numeric("bb_middle", { precision: 20, scale: 8 }),
+    bbLower: numeric("bb_lower", { precision: 20, scale: 8 }),
     // EMA
-    ema: decimal("ema", { precision: 20, scale: 8 }),
+    ema: numeric("ema", { precision: 20, scale: 8 }),
     // Volume
-    volumeMA: decimal("volume_ma", { precision: 20, scale: 8 }),
+    volumeMA: numeric("volume_ma", { precision: 20, scale: 8 }),
     createdAt: timestamp("created_at").defaultNow()
   },
-  (table) => ({
-    symbolTimeframeIdx: index("ind_symbol_timeframe_idx").on(table.symbol, table.timeframe),
-    timestampIdx: index("ind_timestamp_idx").on(table.timestamp)
-  })
+  (table) => [
+    index("ind_symbol_timeframe_idx").on(table.symbol, table.timeframe),
+    index("ind_timestamp_idx").on(table.timestamp)
+  ]
 );
-var tradingLogs = mysqlTable(
+var tradingLogs = pgTable(
   "trading_logs",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
     userId: varchar("user_id", { length: 255 }).notNull(),
     configId: varchar("config_id", { length: 255 }).notNull(),
     symbol: varchar("symbol", { length: 50 }).notNull(),
-    logType: mysqlEnum("log_type", [
-      "BOT_START",
-      "BOT_STOP",
-      "SIGNAL_GENERATED",
-      "ORDER_PLACED",
-      "ORDER_FILLED",
-      "ORDER_CANCELLED",
-      "POSITION_OPENED",
-      "POSITION_CLOSED",
-      "ERROR",
-      "INFO"
-    ]).notNull(),
+    logType: logTypeEnum("log_type").notNull(),
     message: text("message").notNull(),
-    details: json("details"),
+    details: jsonb("details"),
     createdAt: timestamp("created_at").defaultNow()
   },
-  (table) => ({
-    userIdIdx: index("log_user_id_idx").on(table.userId),
-    configIdIdx: index("log_config_id_idx").on(table.configId),
-    logTypeIdx: index("log_type_idx").on(table.logType)
-  })
+  (table) => [
+    index("log_user_id_idx").on(table.userId),
+    index("log_config_id_idx").on(table.configId),
+    index("log_type_idx").on(table.logType)
+  ]
 );
-var botStatus = mysqlTable(
+var botStatus = pgTable(
   "bot_status",
   {
     id: varchar("id", { length: 255 }).primaryKey(),
@@ -257,23 +257,21 @@ var botStatus = mysqlTable(
     configId: varchar("config_id", { length: 255 }).notNull(),
     isRunning: boolean("is_running").default(false),
     isPaused: boolean("is_paused").default(false),
-    totalTrades: int("total_trades").default(0),
-    winningTrades: int("winning_trades").default(0),
-    losingTrades: int("losing_trades").default(0),
-    totalPnl: decimal("total_pnl", { precision: 20, scale: 8 }).default("0"),
-    totalPnlPercent: decimal("total_pnl_percent", { precision: 5, scale: 2 }).default("0"),
-    currentBalance: decimal("current_balance", { precision: 20, scale: 8 }).default("0"),
-    initialBalance: decimal("initial_balance", { precision: 20, scale: 8 }).default("0"),
-    maxDrawdownPercent: decimal("max_drawdown_percent", { precision: 5, scale: 2 }).default("0"),
-    winRate: decimal("win_rate", { precision: 5, scale: 2 }).default("0"),
+    totalTrades: integer("total_trades").default(0),
+    winningTrades: integer("winning_trades").default(0),
+    losingTrades: integer("losing_trades").default(0),
+    totalPnl: numeric("total_pnl", { precision: 20, scale: 8 }).default("0"),
+    totalPnlPercent: numeric("total_pnl_percent", { precision: 5, scale: 2 }).default("0"),
+    currentBalance: numeric("current_balance", { precision: 20, scale: 8 }).default("0"),
+    initialBalance: numeric("initial_balance", { precision: 20, scale: 8 }).default("0"),
+    maxDrawdownPercent: numeric("max_drawdown_percent", { precision: 5, scale: 2 }).default("0"),
+    winRate: numeric("win_rate", { precision: 5, scale: 2 }).default("0"),
     lastTradeTime: timestamp("last_trade_time"),
-    lastUpdateTime: timestamp("last_update_time").defaultNow().onUpdateNow(),
+    lastUpdateTime: timestamp("last_update_time").defaultNow(),
     createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow()
+    updatedAt: timestamp("updated_at").defaultNow()
   },
-  (table) => ({
-    userIdIdx: index("status_user_id_idx").on(table.userId)
-  })
+  (table) => [index("status_user_id_idx").on(table.userId)]
 );
 var usersRelations = relations(users, ({ many }) => ({
   apiKeys: many(bybitApiKeys),
@@ -330,19 +328,20 @@ var botStatusRelations = relations(botStatus, ({ one }) => ({
 
 // server/db.ts
 var db;
-var pool;
+var client;
 async function initializeDatabase() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
     throw new Error("DATABASE_URL environment variable is not set");
   }
-  pool = await mysql.createPool({
-    uri: databaseUrl,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+  client = postgres(databaseUrl, {
+    max: 10,
+    idle_timeout: 20,
+    connect_timeout: 10,
+    ssl: process.env.NODE_ENV === "production" ? "require" : void 0
   });
-  db = drizzle(pool, { schema: schema_exports, mode: "default" });
+  db = drizzle(client, { schema: schema_exports });
+  await client`SELECT 1`;
   console.log("\u2705 Database connected successfully");
   return db;
 }

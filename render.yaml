@@ -1,22 +1,29 @@
+databases:
+  - name: cryptotrader-db
+    plan: free
+    databaseName: cryptotrader
+    user: cryptobot
+
 services:
   - type: web
     name: crypto-trader-futures
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm run start
-    healthCheckPath: /
+    buildCommand: pnpm install && pnpm run build && pnpm run db:push
+    startCommand: node dist/index.js
     envVars:
       - key: NODE_VERSION
         value: 22.19.0
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 10000
+        value: 3000
       - key: VITE_APP_ID
         value: cryptotrader
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: cryptotrader-db
+          property: connectionString
       - key: JWT_SECRET
         generateValue: true
       - key: OWNER_OPEN_ID

@@ -1,9 +1,9 @@
-import { drizzle } from "drizzle-orm/mysql2";
-import mysql from "mysql2/promise";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
 import * as schema from "../drizzle/schema";
 
 let db: any;
-let pool: any;
+let client: any;
 
 /**
  * Initialize database connection
@@ -15,14 +15,17 @@ export async function initializeDatabase() {
     throw new Error("DATABASE_URL environment variable is not set");
   }
 
-  pool = await mysql.createPool({
-    uri: databaseUrl,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
+  client = postgres(databaseUrl, {
+    max: 10,
+    idle_timeout: 20,
+    connect_timeout: 10,
+    ssl: process.env.NODE_ENV === "production" ? "require" : undefined,
   });
 
-  db = drizzle(pool, { schema, mode: "default" });
+  db = drizzle(client, { schema });
+
+  // Test connection
+  await client`SELECT 1`;
 
   console.log("✅ Database connected successfully");
 
@@ -34,8 +37,6 @@ export async function initializeDatabase() {
  */
 export function getDatabase() {
   if (!db) {
-    // Return a proxy that will throw a clear error if used before initialization
-    // This allows module-level imports to work
     return new Proxy({} as any, {
       get(target, prop) {
         if (db) return (db as any)[prop];
@@ -50,8 +51,8 @@ export function getDatabase() {
  * Close database connection
  */
 export async function closeDatabase() {
-  if (pool) {
-    await pool.end();
+  if (client) {
+    await client.end();
     console.log("Database connection closed");
   }
 }
