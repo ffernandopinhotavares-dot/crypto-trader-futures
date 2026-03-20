@@ -1,0 +1,15 @@
+Deploy Status - Render
+=====================
+Service: crypto-trader-futures
+URL: https://crypto-trader-futures.onrender.com
+Service ID: srv-d6utgp7kijhs73cgeptg
+Status: Building
+Commit: 5b06e91 - Migrate from MySQL to PostgreSQL for Render deployment
+GitHub: ffernandopinhotavares-dot/crypto-trader-futures (master)
+Instance: Free tier
+
+Next steps:
+1. Wait for build to complete
+2. Create PostgreSQL database on Render
+3. Add DATABASE_URL environment variable
+4. Redeploy

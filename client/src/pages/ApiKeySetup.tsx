@@ -1,141 +1,206 @@
 import { useState } from "react";
 import { trpc } from "../App";
-import { Card } from "../components/ui/card";
-import { Button } from "../components/ui/button";
-import { Input } from "../components/ui/input";
-import { Label } from "../components/ui/label";
-import { AlertCircle, Eye, EyeOff } from "lucide-react";
+import { Zap, Key, Eye, EyeOff, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
 export function ApiKeySetup() {
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [testnet, setTestnet] = useState(true);
+  const [testnet, setTestnet] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
+
   const { mutate: saveKeys, isPending } = trpc.bybitKeys.saveKeys.useMutation({
     onSuccess: () => {
-      toast.success("Chaves API salvas com sucesso!");
-      setApiKey("");
-      setApiSecret("");
+      toast.success("Chaves salvas com sucesso!");
+      setTimeout(() => window.location.reload(), 800);
     },
-    onError: (error) => {
-      toast.error(`Erro: ${error.message}`);
-    },
+    onError: (e) => toast.error("Erro: " + e.message),
   });
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!apiKey || !apiSecret) {
-      toast.error("Por favor, preencha todos os campos");
+    if (!apiKey.trim() || !apiSecret.trim()) {
+      toast.error("Preencha a API Key e o API Secret");
       return;
     }
-    saveKeys({ apiKey, apiSecret, testnet });
+    saveKeys({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), testnet });
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%", padding: "10px 12px",
+    background: "#080b10", border: "1px solid #00ff8820",
+    borderRadius: "6px", color: "#00ff88",
+    fontFamily: "Courier New, monospace", fontSize: "13px",
+    outline: "none", boxSizing: "border-box",
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
-      <Card className="bg-slate-900 border-slate-800 w-full max-w-md p-8">
-        <div className="text-center mb-8">
-          <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center mx-auto mb-4">
-            <span className="text-2xl">🔐</span>
+    <div style={{
+      minHeight: "100vh", background: "#0a0a0f",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontFamily: "Courier New, monospace", padding: "20px",
+    }}>
+      <div style={{ width: "100%", maxWidth: "440px" }}>
+        {/* Logo */}
+        <div style={{ textAlign: "center", marginBottom: "32px" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "10px", marginBottom: "8px" }}>
+            <Zap size={24} style={{ color: "#00ff88" }} />
+            <span style={{ fontSize: "24px", fontWeight: "700", color: "#00ff88", letterSpacing: "1px" }}>
+              CryptoTrader
+            </span>
           </div>
-          <h1 className="text-2xl font-bold text-white">Configurar Bybit API</h1>
-          <p className="text-slate-400 mt-2">
-            Configure suas chaves de API para começar a operar
+          <p style={{ fontSize: "12px", color: "#00ff8844" }}>
+            Configure sua API Bybit para começar a operar
           </p>
         </div>
 
-        {/* Warning */}
-        <div className="bg-amber-600/10 border border-amber-600/30 rounded-lg p-4 mb-6 flex gap-3">
-          <AlertCircle className="text-amber-500 flex-shrink-0" size={20} />
-          <div className="text-sm text-amber-200">
-            <p className="font-medium mb-1">Segurança</p>
-            <p>
-              Suas chaves são criptografadas e nunca são compartilhadas. Use
-              chaves com permissões limitadas de trading.
-            </p>
+        {/* Card */}
+        <form
+          onSubmit={handleSave}
+          style={{
+            background: "#0d1117",
+            border: "1px solid #00ff8820",
+            borderRadius: "10px",
+            padding: "28px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "24px" }}>
+            <Key size={16} style={{ color: "#00ff8866" }} />
+            <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>
+              Configurar API Bybit
+            </h2>
           </div>
-        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
           {/* API Key */}
-          <div>
-            <Label className="text-slate-300 mb-2 block">API Key</Label>
-            <Input
+          <div style={{ marginBottom: "16px" }}>
+            <label style={{ display: "block", fontSize: "11px", color: "#00ff8866", marginBottom: "6px" }}>
+              API KEY
+            </label>
+            <input
               type="text"
-              placeholder="Sua chave API Bybit"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              className="bg-slate-800 border-slate-700 text-white placeholder:text-slate-500"
+              placeholder="Ex: I2oeyomfRJK73..."
+              style={inputStyle}
+              onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
+              onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
               disabled={isPending}
             />
-            <p className="text-xs text-slate-500 mt-1">
-              Obtenha em: https://www.bybit.com/app/user/api-management
-            </p>
           </div>
 
           {/* API Secret */}
-          <div>
-            <Label className="text-slate-300 mb-2 block">API Secret</Label>
-            <div className="relative">
-              <Input
+          <div style={{ marginBottom: "16px" }}>
+            <label style={{ display: "block", fontSize: "11px", color: "#00ff8866", marginBottom: "6px" }}>
+              API SECRET
+            </label>
+            <div style={{ position: "relative" }}>
+              <input
                 type={showSecret ? "text" : "password"}
-                placeholder="Sua chave secreta Bybit"
                 value={apiSecret}
                 onChange={(e) => setApiSecret(e.target.value)}
-                className="bg-slate-800 border-slate-700 text-white placeholder:text-slate-500 pr-10"
+                placeholder="Seu API Secret"
+                style={{ ...inputStyle, paddingRight: "40px" }}
+                onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
+                onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
                 disabled={isPending}
               />
               <button
                 type="button"
                 onClick={() => setShowSecret(!showSecret)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                style={{
+                  position: "absolute", right: "10px", top: "50%",
+                  transform: "translateY(-50%)",
+                  background: "none", border: "none",
+                  color: "#00ff8855", cursor: "pointer",
+                }}
               >
-                {showSecret ? <EyeOff size={18} /> : <Eye size={18} />}
+                {showSecret ? <EyeOff size={15} /> : <Eye size={15} />}
               </button>
             </div>
           </div>
 
-          {/* Testnet Toggle */}
-          <div className="flex items-center gap-3 p-3 bg-slate-800 rounded-lg">
-            <input
-              type="checkbox"
-              id="testnet"
-              checked={testnet}
-              onChange={(e) => setTestnet(e.target.checked)}
-              className="w-4 h-4 rounded border-slate-600 bg-slate-700 cursor-pointer"
-              disabled={isPending}
-            />
-            <label htmlFor="testnet" className="flex-1 cursor-pointer">
-              <p className="text-sm font-medium text-white">Usar Testnet</p>
-              <p className="text-xs text-slate-400">
-                Recomendado para testes iniciais
-              </p>
+          {/* Testnet toggle */}
+          <div style={{ marginBottom: "24px" }}>
+            <label style={{
+              display: "flex", alignItems: "center", gap: "10px",
+              cursor: "pointer",
+            }}>
+              <div
+                onClick={() => setTestnet(!testnet)}
+                style={{
+                  width: "36px", height: "20px", borderRadius: "10px",
+                  background: testnet ? "#00ff8830" : "#ffffff10",
+                  border: `1px solid ${testnet ? "#00ff8850" : "#ffffff15"}`,
+                  position: "relative", transition: "all 0.2s",
+                  cursor: "pointer", flexShrink: 0,
+                }}
+              >
+                <div style={{
+                  width: "14px", height: "14px", borderRadius: "50%",
+                  background: testnet ? "#00ff88" : "#ffffff44",
+                  position: "absolute", top: "2px",
+                  left: testnet ? "18px" : "2px",
+                  transition: "left 0.2s",
+                }} />
+              </div>
+              <div>
+                <p style={{ fontSize: "12px", color: "#00ff8877" }}>Usar Testnet</p>
+                <p style={{ fontSize: "10px", color: "#00ff8833" }}>Recomendado para testes iniciais</p>
+              </div>
             </label>
           </div>
 
-          {/* Submit Button */}
-          <Button
+          {/* Save button */}
+          <button
             type="submit"
             disabled={isPending}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2"
+            style={{
+              width: "100%", padding: "11px",
+              background: "#00ff8820", border: "1px solid #00ff8840",
+              borderRadius: "6px", color: "#00ff88",
+              fontSize: "13px", fontFamily: "Courier New, monospace",
+              fontWeight: "700", cursor: isPending ? "not-allowed" : "pointer",
+              opacity: isPending ? 0.6 : 1,
+              letterSpacing: "0.5px",
+            }}
           >
             {isPending ? "Salvando..." : "Salvar Chaves"}
-          </Button>
+          </button>
+
+          {/* Link to Bybit */}
+          <div style={{ marginTop: "16px", textAlign: "center" }}>
+            <a
+              href="https://www.bybit.com/app/user/api-management"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: "4px",
+                fontSize: "11px", color: "#00ff8844",
+                textDecoration: "none",
+              }}
+            >
+              <ExternalLink size={11} />
+              Criar API Key na Bybit
+            </a>
+          </div>
         </form>
 
-        {/* Help Text */}
-        <div className="mt-6 pt-6 border-t border-slate-800">
-          <p className="text-xs text-slate-500 mb-2 font-medium">Permissões Recomendadas:</p>
-          <ul className="text-xs text-slate-400 space-y-1">
-            <li>✓ Leitura de conta</li>
-            <li>✓ Leitura de posições</li>
-            <li>✓ Leitura de ordens</li>
-            <li>✓ Criação de ordens</li>
-            <li>✓ Cancelamento de ordens</li>
-          </ul>
+        {/* Permissions */}
+        <div style={{
+          marginTop: "16px", padding: "12px 16px",
+          background: "#00ff8806", border: "1px solid #00ff8815",
+          borderRadius: "6px",
+        }}>
+          <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "6px", letterSpacing: "0.5px" }}>
+            PERMISSÕES RECOMENDADAS
+          </p>
+          {["Leitura de conta", "Leitura de posições", "Leitura de ordens", "Criação de ordens", "Cancelamento de ordens"].map((p) => (
+            <p key={p} style={{ fontSize: "11px", color: "#00ff8866", marginBottom: "2px" }}>
+              ✓ {p}
+            </p>
+          ))}
         </div>
-      </Card>
+      </div>
     </div>
   );
 }

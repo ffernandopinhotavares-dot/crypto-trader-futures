@@ -1,164 +1,156 @@
 import { trpc } from "../App";
-import { Card } from "../components/ui/card";
-import { TrendingUp, TrendingDown } from "lucide-react";
+import { List } from "lucide-react";
+
+function NeonCard({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
+  return (
+    <div style={{
+      background: "#0d1117",
+      border: "1px solid #00ff8820",
+      borderRadius: "8px",
+      padding: "20px",
+      ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
 
 export function TradesPage() {
-  const { data: trades } = trpc.trades.getRecent.useQuery({ limit: 100 });
-  const { data: stats } = trpc.trades.getStats.useQuery();
+  const { data: trades } = trpc.trades.getRecent.useQuery({ limit: 100 }, {
+    refetchInterval: 10000,
+  });
+  const { data: stats } = trpc.trades.getStats.useQuery(undefined, {
+    refetchInterval: 10000,
+  });
+
+  const totalPnl = stats?.totalPnl ?? 0;
+  const pnlColor = totalPnl >= 0 ? "#00ff88" : "#ff4466";
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-white">Histórico de Operações</h1>
-        <p className="text-slate-400 mt-1">
-          Visualize todas as suas operações de trading
-        </p>
+    <div style={{ fontFamily: "Courier New, monospace" }}>
+      <div style={{ marginBottom: "20px", display: "flex", alignItems: "center", gap: "10px" }}>
+        <List size={18} style={{ color: "#00ff88" }} />
+        <h1 style={{ fontSize: "18px", fontWeight: "700", color: "#00ff88" }}>Histórico de Trades</h1>
       </div>
 
-      {/* Statistics */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card className="bg-slate-900 border-slate-800 p-6">
-          <p className="text-sm text-slate-400">Total de Operações</p>
-          <p className="text-2xl font-bold text-white mt-2">{stats?.totalTrades || 0}</p>
-        </Card>
-
-        <Card className="bg-slate-900 border-slate-800 p-6">
-          <p className="text-sm text-slate-400">Operações Ganhadoras</p>
-          <p className="text-2xl font-bold text-green-400 mt-2">
-            {stats?.winningTrades || 0}
+      {/* Stats cards */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+        gap: "14px",
+        marginBottom: "20px",
+      }}>
+        <NeonCard style={{ padding: "16px" }}>
+          <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "8px" }}>P&L TOTAL</p>
+          <p style={{ fontSize: "22px", fontWeight: "700", color: pnlColor }}>
+            {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)} USDT
           </p>
-        </Card>
-
-        <Card className="bg-slate-900 border-slate-800 p-6">
-          <p className="text-sm text-slate-400">Operações Perdedoras</p>
-          <p className="text-2xl font-bold text-red-400 mt-2">
-            {stats?.losingTrades || 0}
+        </NeonCard>
+        <NeonCard style={{ padding: "16px" }}>
+          <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "8px" }}>GANHOS</p>
+          <p style={{ fontSize: "22px", fontWeight: "700", color: "#00ff88" }}>
+            {stats?.winningTrades ?? 0}
           </p>
-        </Card>
-
-        <Card className="bg-slate-900 border-slate-800 p-6">
-          <p className="text-sm text-slate-400">Taxa de Ganho</p>
-          <p className="text-2xl font-bold text-blue-400 mt-2">
-            {stats?.winRate?.toFixed(1) || 0}%
+        </NeonCard>
+        <NeonCard style={{ padding: "16px" }}>
+          <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "8px" }}>PERDAS</p>
+          <p style={{ fontSize: "22px", fontWeight: "700", color: "#ff4466" }}>
+            {stats?.losingTrades ?? 0}
           </p>
-        </Card>
+        </NeonCard>
+        <NeonCard style={{ padding: "16px" }}>
+          <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "8px" }}>WIN RATE</p>
+          <p style={{ fontSize: "22px", fontWeight: "700", color: "#ffffff" }}>
+            {(stats?.winRate ?? 0).toFixed(1)}%
+          </p>
+        </NeonCard>
       </div>
 
-      {/* Trades Table */}
-      <Card className="bg-slate-900 border-slate-800 p-6">
-        <h2 className="text-xl font-bold text-white mb-4">Todas as Operações</h2>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+      {/* Trades table */}
+      <NeonCard>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
             <thead>
-              <tr className="border-b border-slate-800">
-                <th className="text-left py-3 px-4 text-slate-400">Data</th>
-                <th className="text-left py-3 px-4 text-slate-400">Par</th>
-                <th className="text-left py-3 px-4 text-slate-400">Lado</th>
-                <th className="text-left py-3 px-4 text-slate-400">Preço Entrada</th>
-                <th className="text-left py-3 px-4 text-slate-400">Preço Saída</th>
-                <th className="text-left py-3 px-4 text-slate-400">Quantidade</th>
-                <th className="text-left py-3 px-4 text-slate-400">P&L</th>
-                <th className="text-left py-3 px-4 text-slate-400">%</th>
-                <th className="text-left py-3 px-4 text-slate-400">Status</th>
+              <tr style={{ borderBottom: "1px solid #00ff8815" }}>
+                {["Data", "Par", "Lado", "Entrada", "Saída", "Qtd", "P&L", "P&L %", "Status"].map((h) => (
+                  <th key={h} style={{
+                    padding: "8px 12px", textAlign: "left",
+                    color: "#00ff8855", fontWeight: "600",
+                  }}>
+                    {h}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {trades?.map((trade) => (
-                <tr
-                  key={trade.id}
-                  className="border-b border-slate-800 hover:bg-slate-800/50 transition"
-                >
-                  <td className="py-3 px-4 text-slate-300">
-                    {new Date(trade.entryTime).toLocaleDateString("pt-BR")}
-                  </td>
-                  <td className="py-3 px-4 font-medium text-white">
-                    {trade.symbol}
-                  </td>
-                  <td className="py-3 px-4">
-                    <span
-                      className={`px-2 py-1 rounded text-xs font-medium flex items-center gap-1 w-fit ${
-                        trade.side === "BUY"
-                          ? "bg-green-600/20 text-green-400"
-                          : "bg-red-600/20 text-red-400"
-                      }`}
+              {trades && trades.length > 0 ? (
+                trades.map((trade: any) => {
+                  const pnl = trade.pnl ? parseFloat(trade.pnl) : null;
+                  const pnlPct = trade.pnlPercent ? parseFloat(trade.pnlPercent) : null;
+                  const pnlColor = pnl !== null ? (pnl >= 0 ? "#00ff88" : "#ff4466") : "#4a7a5a";
+                  return (
+                    <tr
+                      key={trade.id}
+                      style={{ borderBottom: "1px solid #00ff8806" }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "#00ff8806")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                     >
-                      {trade.side === "BUY" ? (
-                        <TrendingUp size={14} />
-                      ) : (
-                        <TrendingDown size={14} />
-                      )}
-                      {trade.side}
-                    </span>
-                  </td>
-                  <td className="py-3 px-4 text-slate-300">
-                    ${parseFloat(trade.entryPrice).toFixed(2)}
-                  </td>
-                  <td className="py-3 px-4 text-slate-300">
-                    {trade.exitPrice
-                      ? `$${parseFloat(trade.exitPrice).toFixed(2)}`
-                      : "—"}
-                  </td>
-                  <td className="py-3 px-4 text-slate-300">
-                    {parseFloat(trade.quantity).toFixed(4)}
-                  </td>
-                  <td className="py-3 px-4">
-                    <span
-                      className={
-                        trade.pnl && parseFloat(trade.pnl) > 0
-                          ? "text-green-400 font-medium"
-                          : trade.pnl && parseFloat(trade.pnl) < 0
-                          ? "text-red-400 font-medium"
-                          : "text-slate-400"
-                      }
-                    >
-                      {trade.pnl ? `$${parseFloat(trade.pnl).toFixed(2)}` : "—"}
-                    </span>
-                  </td>
-                  <td className="py-3 px-4">
-                    <span
-                      className={
-                        trade.pnlPercent && parseFloat(trade.pnlPercent) > 0
-                          ? "text-green-400 font-medium"
-                          : trade.pnlPercent && parseFloat(trade.pnlPercent) < 0
-                          ? "text-red-400 font-medium"
-                          : "text-slate-400"
-                      }
-                    >
-                      {trade.pnlPercent
-                        ? `${parseFloat(trade.pnlPercent).toFixed(2)}%`
-                        : "—"}
-                    </span>
-                  </td>
-                  <td className="py-3 px-4">
-                    <span
-                      className={`px-2 py-1 rounded text-xs font-medium ${
-                        trade.status === "OPEN"
-                          ? "bg-blue-600/20 text-blue-400"
-                          : trade.status === "CLOSED"
-                          ? "bg-slate-600/20 text-slate-400"
-                          : "bg-red-600/20 text-red-400"
-                      }`}
-                    >
-                      {trade.status === "OPEN"
-                        ? "Aberta"
-                        : trade.status === "CLOSED"
-                        ? "Fechada"
-                        : "Cancelada"}
-                    </span>
+                      <td style={{ padding: "8px 12px", color: "#00ff8855", whiteSpace: "nowrap" }}>
+                        {new Date(trade.createdAt || trade.entryTime).toLocaleDateString("pt-BR")}
+                      </td>
+                      <td style={{ padding: "8px 12px", color: "#00ff88", fontWeight: "700" }}>{trade.symbol}</td>
+                      <td style={{ padding: "8px 12px" }}>
+                        <span style={{
+                          padding: "2px 8px", borderRadius: "3px", fontSize: "11px",
+                          background: trade.side === "BUY" ? "#00ff8815" : "#ff446615",
+                          color: trade.side === "BUY" ? "#00ff88" : "#ff4466",
+                          border: `1px solid ${trade.side === "BUY" ? "#00ff8830" : "#ff446630"}`,
+                        }}>
+                          {trade.side}
+                        </span>
+                      </td>
+                      <td style={{ padding: "8px 12px", color: "#00ff8888" }}>
+                        ${parseFloat(trade.entryPrice).toFixed(2)}
+                      </td>
+                      <td style={{ padding: "8px 12px", color: "#00ff8888" }}>
+                        {trade.exitPrice ? `$${parseFloat(trade.exitPrice).toFixed(2)}` : "—"}
+                      </td>
+                      <td style={{ padding: "8px 12px", color: "#00ff8888" }}>
+                        {parseFloat(trade.quantity).toFixed(4)}
+                      </td>
+                      <td style={{ padding: "8px 12px", color: pnlColor, fontWeight: "600" }}>
+                        {pnl !== null ? `${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}` : "—"}
+                      </td>
+                      <td style={{ padding: "8px 12px", color: pnlColor }}>
+                        {pnlPct !== null ? `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%` : "—"}
+                      </td>
+                      <td style={{ padding: "8px 12px" }}>
+                        <span style={{
+                          padding: "2px 8px", borderRadius: "3px", fontSize: "11px",
+                          background: trade.status === "OPEN" ? "#00ff8815" : "#ffffff08",
+                          color: trade.status === "OPEN" ? "#00ff88" : "#ffffff44",
+                          border: `1px solid ${trade.status === "OPEN" ? "#00ff8830" : "#ffffff12"}`,
+                        }}>
+                          {trade.status === "OPEN" ? "Aberta" : trade.status === "CLOSED" ? "Fechada" : "Cancelada"}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={9} style={{
+                    padding: "40px", textAlign: "center",
+                    color: "#00ff8833",
+                  }}>
+                    Nenhuma operação registrada
                   </td>
                 </tr>
-              ))}
+              )}
             </tbody>
           </table>
         </div>
-
-        {!trades || trades.length === 0 ? (
-          <div className="text-center py-12">
-            <p className="text-slate-400">Nenhuma operação registrada ainda</p>
-          </div>
-        ) : null}
-      </Card>
+      </NeonCard>
     </div>
   );
 }

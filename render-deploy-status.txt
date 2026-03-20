@@ -1,0 +1,9 @@
+Render Deploy Status:
+- Repo: ffernandopinhotavares-dot/crypto-trader-futures
+- Name: crypto-trader-futures
+- Language: Node
+- Branch: master
+- Build Command: pnpm install && pnpm run build && pnpm run db:push
+- Start Command: pnpm run start
+- Instance Type: Need to select Free tier
+- Need to scroll down to find Free tier, add env vars, and create

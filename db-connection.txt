@@ -1,0 +1,10 @@
+PostgreSQL Connection Details (Render)
+=======================================
+Hostname: dpg-d6uti0p4tr6s73d9f92g-a
+Port: 5432
+Database: cryptotrader_s6tl
+Username: cryptotrader_s6tl_user
+Password: 8RivKXbTqXDedS4YOihc339B0MXTo00s
+
+Internal Database URL: postgresql://cryptotrader_s6tl_user:8RivKXbTqXDedS4YOihc339B0MXTo00s@dpg-d6uti0p4tr6s73d9f92g-a/cryptotrader_s6tl
+External Database URL: postgresql://cryptotrader_s6tl_user:8RivKXbTqXDedS4YOihc339B0MXTo00s@dpg-d6uti0p4tr6s73d9f92g-a.oregon-postgres.render.com/cryptotrader_s6tl
