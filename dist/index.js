@@ -419,6 +419,28 @@ var GateioClient = class _GateioClient {
       fundingRate: t2.fundingRate || "0"
     }));
   }
+  /**
+   * Returns ALL available futures tickers (no limit), pre-filtered by minimum volume.
+   * Used for full-market scanning across all 650+ pairs.
+   * @param minVolume24hUsd Minimum 24h volume in USD to include (default $50,000)
+   */
+  async getAllTickers(minVolume24hUsd = 5e4) {
+    const result = await this.futuresApi.listFuturesTickers(this.settle);
+    const tickers = result.body;
+    return tickers.filter((t2) => {
+      const vol = parseFloat(t2.volume24hQuote || "0");
+      const price = parseFloat(t2.last || "0");
+      return vol >= minVolume24hUsd && price > 0 && t2.contract;
+    }).sort((a, b) => parseFloat(b.volume24hQuote || "0") - parseFloat(a.volume24hQuote || "0")).map((t2) => ({
+      symbol: t2.contract || "",
+      lastPrice: t2.last || "0",
+      priceChangePercent: t2.changePercentage || "0",
+      volume24h: t2.volume24hQuote || "0",
+      highPrice: t2.high24h || "0",
+      lowPrice: t2.low24h || "0",
+      fundingRate: t2.fundingRate || "0"
+    }));
+  }
   async getTicker(symbol) {
     const result = await this.futuresApi.listFuturesTickers(this.settle, {
       contract: symbol
@@ -769,13 +791,26 @@ function analyzeVolatility(prices, period = 20) {
 import { eq, and } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import OpenAI from "openai";
-var TradingEngine = class {
+var TradingEngine = class _TradingEngine {
   config;
   isRunning = false;
   positions = /* @__PURE__ */ new Map();
   openai;
   cycleCount = 0;
   initialBalance = 0;
+  // [FIX 5.8] Cache for contract info and tickers
+  contractInfoCache = /* @__PURE__ */ new Map();
+  allTickersCache = { data: null, cachedAt: 0 };
+  static CONTRACT_CACHE_TTL = 60 * 60 * 1e3;
+  // 1 hour
+  static ALL_TICKERS_CACHE_TTL = 3 * 60 * 1e3;
+  // 3 minutes (full market scan)
+  static API_DELAY_MS = 100;
+  // 100ms between API calls
+  static SNAPSHOT_BATCH_SIZE = 15;
+  // parallel candle fetches per batch
+  static AI_BATCH_SIZE = 50;
+  // pairs per AI call
   get db() {
     return getDatabase();
   }
@@ -792,9 +827,10 @@ var TradingEngine = class {
     } catch {
       this.initialBalance = 0;
     }
+    await this.syncPositionsFromExchange();
     console.log(`AI Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
-    await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}%`);
+    await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}% | Synced ${this.positions.size} positions from exchange`);
     this.mainLoop();
   }
   async stop() {
@@ -810,10 +846,21 @@ var TradingEngine = class {
       if (result.errors.length > 0) {
         await this.logEvent("ERROR", "SYSTEM", `Failed to close ${result.errors.length} positions: ${result.errors.join("; ")}`);
       }
-      for (const [symbol] of Array.from(this.positions.entries())) {
+      for (const [symbol, position] of Array.from(this.positions.entries())) {
         try {
-          const ticker = await this.config.gateioClient.getTicker(symbol);
-          const exitPrice = parseFloat(ticker.lastPrice);
+          let exitPrice;
+          try {
+            const ticker = await this.config.gateioClient.getTicker(symbol);
+            exitPrice = parseFloat(ticker.lastPrice);
+          } catch {
+            try {
+              const exchangePositions = await this.config.gateioClient.getPositions();
+              const pos = exchangePositions.find((p) => p.symbol === symbol);
+              exitPrice = pos ? parseFloat(pos.markPrice) : position.entryPrice;
+            } catch {
+              exitPrice = position.entryPrice;
+            }
+          }
           await this.closePositionRecord(symbol, exitPrice, "BOT_STOPPED");
         } catch (e) {
           console.error(`Error updating trade record for ${symbol}:`, e);
@@ -828,13 +875,45 @@ var TradingEngine = class {
     console.log(`AI Trading engine stopped for user ${this.config.userId}`);
   }
   // --------------------------------------------------------------------------
+  // [FIX 5.7] Sync positions from exchange into memory on start/restart
+  // --------------------------------------------------------------------------
+  async syncPositionsFromExchange() {
+    try {
+      const exchangePositions = await this.config.gateioClient.getPositions();
+      for (const pos of exchangePositions) {
+        const absSize = Math.abs(parseFloat(pos.size));
+        if (absSize > 0 && !this.positions.has(pos.symbol)) {
+          const side = pos.side === "LONG" ? "BUY" : "SELL";
+          const leverage = parseFloat(pos.leverage) || 10;
+          const entryPrice = parseFloat(pos.entryPrice) || 0;
+          const qm = await this.getCachedContractMultiplier(pos.symbol);
+          this.positions.set(pos.symbol, {
+            symbol: pos.symbol,
+            side,
+            entryPrice,
+            quantity: absSize,
+            entryTime: /* @__PURE__ */ new Date(),
+            // approximate — real entry time unknown after restart
+            leverage,
+            confidence: 50,
+            // unknown for restored positions
+            quantoMultiplier: qm
+          });
+          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm}`);
+        }
+      }
+    } catch (error) {
+      console.error("[SYNC] Error syncing positions from exchange:", this.errStr(error));
+    }
+  }
+  // --------------------------------------------------------------------------
   // Main Loop
   // --------------------------------------------------------------------------
   async mainLoop() {
     while (this.isRunning) {
       try {
         this.cycleCount++;
-        await this.logEvent("CYCLE_START", "SYSTEM", `Cycle #${this.cycleCount} started`);
+        await this.logEvent("CYCLE_START", "SYSTEM", `Cycle #${this.cycleCount} started | Positions: ${this.positions.size}`);
         if (await this.isDrawdownExceeded()) {
           await this.logEvent("RISK_STOP", "SYSTEM", `Max drawdown ${this.config.maxDrawdown}% exceeded. Closing all positions.`);
           await this.closeAllPositions("MAX_DRAWDOWN");
@@ -842,11 +921,14 @@ var TradingEngine = class {
           return;
         }
         await this.monitorPositions();
-        if (this.positions.size < this.config.maxOpenPositions) {
+        const hasOpenSlots = this.positions.size < this.config.maxOpenPositions;
+        if (hasOpenSlots) {
           await this.scanAndTrade();
+        } else {
+          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} \u2014 max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
         }
         await this.updateBotStatus({ isRunning: true });
-        const waitMs = this.config.aggressiveness === "aggressive" ? 2 * 60 * 1e3 : this.config.aggressiveness === "moderate" ? 5 * 60 * 1e3 : 10 * 60 * 1e3;
+        const waitMs = this.config.aggressiveness === "aggressive" ? 5 * 60 * 1e3 : this.config.aggressiveness === "moderate" ? 10 * 60 * 1e3 : 15 * 60 * 1e3;
         await this.sleep(waitMs);
       } catch (error) {
         const msg = this.errStr(error);
@@ -861,48 +943,106 @@ var TradingEngine = class {
   // --------------------------------------------------------------------------
   async scanAndTrade() {
     try {
-      const topPairs = await this.config.gateioClient.getTopPairs(20);
-      console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map((p) => p.symbol).join(", ")}...`);
+      const allTickers = await this.getCachedAllTickers();
+      const candidateTickers = allTickers.filter((t2) => !this.positions.has(t2.symbol));
+      await this.logEvent(
+        "INFO",
+        "SYSTEM",
+        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$50k) | ${candidateTickers.length} candidates (excl. open positions)`
+      );
+      if (candidateTickers.length === 0) {
+        await this.logEvent("INFO", "SYSTEM", `[SCAN] No candidates \u2014 all pairs already in position or below volume threshold`);
+        return;
+      }
       const snapshots = [];
       let snapshotErrors = 0;
-      for (const pair of topPairs) {
-        try {
-          const snapshot = await this.getMarketSnapshot(pair.symbol);
-          if (snapshot) {
-            snapshots.push(snapshot);
+      const batchSize = _TradingEngine.SNAPSHOT_BATCH_SIZE;
+      for (let i = 0; i < candidateTickers.length; i += batchSize) {
+        if (!this.isRunning) break;
+        const batch = candidateTickers.slice(i, i + batchSize);
+        const batchResults = await Promise.allSettled(
+          batch.map((ticker) => this.getMarketSnapshot(ticker.symbol))
+        );
+        for (const result of batchResults) {
+          if (result.status === "fulfilled" && result.value) {
+            snapshots.push(result.value);
           } else {
             snapshotErrors++;
           }
-        } catch (err) {
-          snapshotErrors++;
-          console.error(`[SCAN] Snapshot error for ${pair.symbol}: ${this.errStr(err)}`);
+        }
+        if (i + batchSize < candidateTickers.length) {
+          await this.sleep(_TradingEngine.API_DELAY_MS * 3);
         }
       }
-      console.log(`[SCAN] Got ${snapshots.length} snapshots, ${snapshotErrors} errors`);
+      await this.logEvent(
+        "INFO",
+        "SYSTEM",
+        `[SCAN] Stage 2: ${snapshots.length} snapshots built | ${snapshotErrors} errors | from ${candidateTickers.length} candidates`
+      );
       if (snapshots.length === 0) {
-        console.log(`[SCAN] No valid snapshots \u2014 skipping AI analysis`);
-        await this.logEvent("ERROR", "SYSTEM", `Scan: 0 valid snapshots from ${topPairs.length} pairs (${snapshotErrors} errors)`);
+        await this.logEvent("ERROR", "SYSTEM", `[SCAN] 0 valid snapshots \u2014 skipping AI analysis`);
         return;
       }
-      const decisions = await this.askAIForOpportunities(snapshots);
-      for (const decision of decisions) {
+      const allDecisions = [];
+      const aiBatchSize = _TradingEngine.AI_BATCH_SIZE;
+      for (let i = 0; i < snapshots.length; i += aiBatchSize) {
+        if (!this.isRunning) break;
+        const snapshotBatch = snapshots.slice(i, i + aiBatchSize);
+        const batchDecisions = await this.askAIForOpportunities(snapshotBatch);
+        allDecisions.push(...batchDecisions);
+        await this.logEvent(
+          "INFO",
+          "SYSTEM",
+          `[SCAN] Stage 3 AI batch ${Math.floor(i / aiBatchSize) + 1}/${Math.ceil(snapshots.length / aiBatchSize)}: ${batchDecisions.length} recommendations`
+        );
+      }
+      allDecisions.sort((a, b) => b.confidence - a.confidence);
+      await this.logEvent(
+        "INFO",
+        "SYSTEM",
+        `[SCAN] Stage 3 complete: ${allDecisions.length} total recommendations from ${Math.ceil(snapshots.length / aiBatchSize)} AI calls`
+      );
+      let openedCount = 0;
+      for (const decision of allDecisions) {
         if (!this.isRunning) break;
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue;
-        if (this.positions.size >= this.config.maxOpenPositions) break;
+        const balance = await this.config.gateioClient.getBalance();
+        const available = parseFloat(balance.availableBalance);
+        if (available < 1) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: available balance too low ($${available.toFixed(2)} USDT)`);
+          break;
+        }
+        if (this.positions.size >= this.config.maxOpenPositions) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
+          break;
+        }
+        decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
         try {
           await this.executeDecision(decision);
+          openedCount++;
+          await this.sleep(_TradingEngine.API_DELAY_MS * 2);
         } catch (error) {
           await this.logEvent("ERROR", decision.symbol, `Failed to execute: ${this.errStr(error)}`);
         }
       }
+      await this.logEvent(
+        "INFO",
+        "SYSTEM",
+        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size}/${this.config.maxOpenPositions}`
+      );
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
     }
   }
+  // [FIX 5.5] Increased minimum confidence thresholds
   getMinConfidence() {
-    return this.config.aggressiveness === "conservative" ? 75 : this.config.aggressiveness === "moderate" ? 65 : 55;
+    return this.config.aggressiveness === "conservative" ? 80 : this.config.aggressiveness === "moderate" ? 75 : 70;
+  }
+  // [FIX 5.6] Maximum leverage limits
+  getMaxLeverage() {
+    return this.config.aggressiveness === "conservative" ? 5 : this.config.aggressiveness === "moderate" ? 8 : 10;
   }
   // --------------------------------------------------------------------------
   // Position Monitoring — AI decides when to close
@@ -910,6 +1050,12 @@ var TradingEngine = class {
   async monitorPositions() {
     for (const [symbol, position] of Array.from(this.positions.entries())) {
       try {
+        const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1e3 * 60);
+        const minHoldMinutes = this.getMinHoldMinutes();
+        if (holdTimeMinutes < minHoldMinutes) {
+          console.log(`[MONITOR] ${symbol}: skipping (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
+          continue;
+        }
         const snapshot = await this.getMarketSnapshot(symbol);
         if (!snapshot) continue;
         const pnlPercent = position.side === "BUY" ? (snapshot.price - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - snapshot.price) / position.entryPrice * 100;
@@ -917,10 +1063,24 @@ var TradingEngine = class {
         if (decision.action === "CLOSE") {
           await this.closePosition(symbol, snapshot.price, decision.reasoning);
         }
+        await this.sleep(_TradingEngine.API_DELAY_MS);
       } catch (error) {
         console.error(`Error monitoring ${symbol}:`, this.errStr(error));
       }
     }
+  }
+  // [FIX 5.4] Minimum hold time based on timeframe
+  getMinHoldMinutes() {
+    const tfMinutes = {
+      "1m": 2,
+      "5m": 10,
+      "15m": 15,
+      "30m": 30,
+      "1h": 60,
+      "4h": 240,
+      "1d": 1440
+    };
+    return tfMinutes[this.config.timeframe] || 15;
   }
   // --------------------------------------------------------------------------
   // AI Decision Engine
@@ -942,43 +1102,59 @@ var TradingEngine = class {
       funding_rate: s.fundingRate,
       above_ema50: s.price > s.ema50
     }));
-    const systemPrompt = `Voc\xEA \xE9 um agente de trading algor\xEDtmico avan\xE7ado especializado em criptoativos (futuros), com foco em maximiza\xE7\xE3o de retorno ajustado ao risco.
+    const minConf = this.getMinConfidence();
+    const maxLev = this.getMaxLeverage();
+    const openSlots = this.config.maxOpenPositions - this.positions.size;
+    const maxNewPositions = Math.min(openSlots, Math.floor(availableBalance / 10) + 1);
+    const systemPrompt = `Voc\xEA \xE9 um agente de trading algor\xEDtmico avan\xE7ado especializado em criptoativos (futuros), com foco em MAXIMIZAR o n\xFAmero de posi\xE7\xF5es abertas usando TODO o capital dispon\xEDvel.
+
+OBJETIVO PRINCIPAL: Identificar TODOS os trades vi\xE1veis nos dados fornecidos e recomendar TODOS eles. N\xE3o filtre demais \u2014 se um trade tem evid\xEAncia t\xE9cnica suficiente, recomende-o.
 
 COMPORTAMENTO:
-- Tome decis\xF5es din\xE2micas e aut\xF4nomas baseadas em probabilidade, contexto de mercado e gest\xE3o de risco.
-- Corte preju\xEDzos rapidamente quando a probabilidade piorar.
-- Garanta lucros quando houver sinais de revers\xE3o.
-- Ajuste capital e alavancagem dinamicamente.
-- Prefira abrir MUITAS posi\xE7\xF5es de valores BAIXOS alavancados para diversificar.
+- Tome decis\xF5es baseadas em EVID\xCANCIA T\xC9CNICA CLARA, n\xE3o em intui\xE7\xE3o.
+- Abra posi\xE7\xE3o quando houver CONFLU\xCANCIA de pelo menos 2 indicadores.
+- MAXIMIZE o n\xFAmero de posi\xE7\xF5es: prefira recomendar mais trades com confian\xE7a moderada do que poucos com confian\xE7a alta.
+- Cada posi\xE7\xE3o usa EXATAMENTE $10 USDT de capital base (o sistema aplica isso automaticamente).
+- N\xC3O calcule positionSizePercent \u2014 use sempre 100 (o sistema ignora esse campo e usa $10 fixo).
+
+CRIT\xC9RIOS QUANTITATIVOS:
+- LONG: RSI < 45 OU (RSI 45-55 + MACD bullish + acima EMA50) OU (volume_ratio > 1.5 + tend\xEAncia BULLISH)
+- SHORT: RSI > 55 OU (RSI 45-55 + MACD bearish + abaixo EMA50) OU (volume_ratio > 1.5 + tend\xEAncia BEARISH)
+- Volatilidade m\xEDnima: 0.3% (pares muito est\xE1veis n\xE3o geram lucro)
+- Volume ratio m\xEDnimo: 0.7 (liquidez insuficiente = risco de slippage)
+- Funding rate: negativo favorece longs, positivo favorece shorts
 
 EXCHANGE: Gate.io Futures (USDT-M)
 - S\xEDmbolos usam formato: BTC_USDT, ETH_USDT (com underscore)
 
 PERFIL DE RISCO: ${this.config.aggressiveness}
-- Conservative: alavancagem 1-5x, confian\xE7a m\xEDnima 75%, posi\xE7\xF5es menores
-- Moderate: alavancagem 3-10x, confian\xE7a m\xEDnima 65%, posi\xE7\xF5es m\xE9dias
-- Aggressive: alavancagem 5-20x, confian\xE7a m\xEDnima 55%, posi\xE7\xF5es maiores
+- Alavancagem m\xE1xima: ${maxLev}x
+- Confian\xE7a m\xEDnima: ${minConf}%
 
-REGRAS OBRIGAT\xD3RIAS:
-- CADA posi\xE7\xE3o deve ter valor nocional de no M\xC1XIMO $10 USDT (antes da alavancagem)
-- Abra MUITAS posi\xE7\xF5es pequenas para diversificar (at\xE9 ${this.config.maxOpenPositions} simult\xE2neas, atualmente ${this.positions.size} abertas)
+CAPITAL DISPON\xCDVEL:
 - Saldo dispon\xEDvel: ${availableBalance.toFixed(2)} USDT
-- positionSizePercent deve resultar em ~$5-10 USDT por trade (calcule: ${availableBalance.toFixed(2)} * percent/100 = valor base)
-- Considere funding rate (negativo favorece longs, positivo favorece shorts)
-- Sempre considere risco de liquida\xE7\xE3o
-- PRIORIZE abrir v\xE1rias posi\xE7\xF5es diferentes em vez de poucas grandes
+- Slots dispon\xEDveis: ${openSlots} (posi\xE7\xF5es abertas: ${this.positions.size}/${this.config.maxOpenPositions})
+- Posi\xE7\xF5es que podem ser abertas agora: at\xE9 ${maxNewPositions}
+- CADA posi\xE7\xE3o usa $10 USDT fixo (o sistema calcula os contratos automaticamente)
 
-Responda APENAS com um JSON array de decis\xF5es. Cada decis\xE3o:
-{
-  "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
-  "symbol": "BTC_USDT",
-  "confidence": 75,
-  "leverage": 5,
-  "positionSizePercent": 3,
-  "reasoning": "breve explica\xE7\xE3o"
-}
+REGRAS:
+- Retorne TODOS os trades vi\xE1veis que encontrar, at\xE9 ${maxNewPositions} oportunidades
+- Ordene por confian\xE7a (maior primeiro)
+- NUNCA repita o mesmo s\xEDmbolo
+- S\xF3 inclua trades com confian\xE7a >= ${minConf}%
+- Se n\xE3o houver boas oportunidades, retorne array vazio []
 
-Retorne no m\xE1ximo 10 oportunidades, ordenadas por confian\xE7a. Se n\xE3o houver boas oportunidades, retorne array vazio []. PRIORIZE diversifica\xE7\xE3o: escolha pares DIFERENTES.`;
+Responda APENAS com um JSON array:
+[
+  {
+    "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
+    "symbol": "BTC_USDT",
+    "confidence": 75,
+    "leverage": ${maxLev},
+    "positionSizePercent": 100,
+    "reasoning": "RSI=38 oversold + MACD bullish + acima EMA50 + volume_ratio=1.8"
+  }
+]`;
     try {
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
@@ -1005,6 +1181,7 @@ ${JSON.stringify(marketSummary, null, 2)}` }
       return [];
     }
   }
+  // [FIX 5.2] Completely rewritten position management prompt
   async askAIForPositionManagement(position, snapshot, pnlPercent) {
     const holdTime = (Date.now() - position.entryTime.getTime()) / (1e3 * 60);
     const prompt = `Posi\xE7\xE3o aberta:
@@ -1014,7 +1191,6 @@ ${JSON.stringify(marketSummary, null, 2)}` }
 - Current: ${snapshot.price}
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
-- Confian\xE7a na entrada: ${position.confidence}%
 - Tempo aberta: ${holdTime.toFixed(0)} minutos
 
 Indicadores atuais:
@@ -1025,18 +1201,34 @@ Indicadores atuais:
 - Volume ratio: ${snapshot.volumeAnalysis.volumeRatio}
 - Tend\xEAncia: ${snapshot.trend}
 
-Decida: CLOSE ou HOLD?
-- Se P&L positivo e sinais de revers\xE3o \u2192 CLOSE (proteger lucro)
-- Se P&L negativo e probabilidade de recupera\xE7\xE3o baixa \u2192 CLOSE (cortar preju\xEDzo)
-- Se tend\xEAncia continua favor\xE1vel \u2192 HOLD
+REGRAS DE DECIS\xC3O (siga rigorosamente):
 
+1. ZONA DE TOLER\xC2NCIA AO RU\xCDDO:
+   - Se |P&L| < 1.0%, a posi\xE7\xE3o est\xE1 na zona de ru\xEDdo normal de mercado.
+   - Na zona de ru\xEDdo, S\xD3 feche se houver REVERS\xC3O CLARA de tend\xEAncia (RSI inverteu + MACD cruzou contra a posi\xE7\xE3o).
+   - N\xC3O feche apenas porque o P&L \xE9 levemente negativo.
+
+2. POSI\xC7\xC3O LUCRATIVA (P&L > +1%):
+   - HOLD se a tend\xEAncia continua favor\xE1vel (LONG + BULLISH, ou SHORT + BEARISH).
+   - CLOSE apenas se houver sinais CLAROS de revers\xE3o: RSI extremo (>75 para LONG, <25 para SHORT) + MACD cruzando contra + BB position extrema.
+
+3. POSI\xC7\xC3O COM PREJU\xCDZO (P&L < -1%):
+   - CLOSE se a tend\xEAncia virou contra a posi\xE7\xE3o (LONG + BEARISH, ou SHORT + BULLISH).
+   - HOLD se a tend\xEAncia ainda \xE9 favor\xE1vel e o RSI sugere recupera\xE7\xE3o.
+
+4. STOP LOSS AUTOM\xC1TICO:
+   - CLOSE imediatamente se P&L < -3% (prote\xE7\xE3o de capital).
+
+5. NUNCA use a "confian\xE7a na entrada" como raz\xE3o para fechar. Foque APENAS nos indicadores ATUAIS.
+
+Decida: CLOSE ou HOLD?
 Responda APENAS com JSON:
-{"action": "CLOSE" ou "HOLD", "symbol": "${position.symbol}", "confidence": 0, "leverage": 0, "positionSizePercent": 0, "reasoning": "explica\xE7\xE3o"}`;
+{"action": "CLOSE" ou "HOLD", "symbol": "${position.symbol}", "confidence": 0, "leverage": 0, "positionSizePercent": 0, "reasoning": "explica\xE7\xE3o baseada nos indicadores atuais"}`;
     try {
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: [
-          { role: "system", content: "Voc\xEA \xE9 um gestor de risco de trading de futuros cripto. Seja decisivo. Priorize proteger capital e garantir lucros." },
+          { role: "system", content: "Voc\xEA \xE9 um gestor de risco de trading de futuros cripto. Siga as REGRAS DE DECIS\xC3O fornecidas rigorosamente. N\xE3o feche posi\xE7\xF5es por ru\xEDdo de mercado. Deixe os trades se desenvolverem." },
           { role: "user", content: prompt }
         ],
         temperature: 0.2,
@@ -1100,20 +1292,62 @@ Responda APENAS com JSON:
     }
   }
   // --------------------------------------------------------------------------
+  // [FIX 5.8] Cached API calls
+  // --------------------------------------------------------------------------
+  async getCachedContractMultiplier(symbol) {
+    const cached = this.contractInfoCache.get(symbol);
+    if (cached && Date.now() - cached.cachedAt < _TradingEngine.CONTRACT_CACHE_TTL) {
+      const qm = parseFloat(cached.data.quantoMultiplier || cached.data.quanto_multiplier || "1");
+      return qm;
+    }
+    try {
+      const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+      this.contractInfoCache.set(symbol, { data: contractInfo, cachedAt: Date.now() });
+      return parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
+    } catch (error) {
+      console.error(`[CACHE] Failed to get contract info for ${symbol}: ${this.errStr(error)}`);
+      if (cached) {
+        return parseFloat(cached.data.quantoMultiplier || cached.data.quanto_multiplier || "1");
+      }
+      return 1;
+    }
+  }
+  async getCachedContractInfo(symbol) {
+    const cached = this.contractInfoCache.get(symbol);
+    if (cached && Date.now() - cached.cachedAt < _TradingEngine.CONTRACT_CACHE_TTL) {
+      return cached.data;
+    }
+    const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+    this.contractInfoCache.set(symbol, { data: contractInfo, cachedAt: Date.now() });
+    return contractInfo;
+  }
+  /**
+   * Returns all tickers with volume > $50k, cached for 3 minutes.
+   * Single API call covers all 650+ Gate.io futures pairs.
+   */
+  async getCachedAllTickers() {
+    if (this.allTickersCache.data && Date.now() - this.allTickersCache.cachedAt < _TradingEngine.ALL_TICKERS_CACHE_TTL) {
+      return this.allTickersCache.data;
+    }
+    const tickers = await this.config.gateioClient.getAllTickers(5e4);
+    this.allTickersCache = { data: tickers, cachedAt: Date.now() };
+    return tickers;
+  }
+  // --------------------------------------------------------------------------
   // Trade Execution (Gate.io Futures)
   // --------------------------------------------------------------------------
   async executeDecision(decision) {
     const side = decision.action === "OPEN_LONG" ? "BUY" : "SELL";
+    decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
     try {
       const balance = await this.config.gateioClient.getBalance();
       const available = parseFloat(balance.availableBalance);
-      const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
-      const baseValue = Math.min(available * (sizePercent / 100), 10);
+      const baseValue = Math.min(available, 10);
       const notionalValue = baseValue * decision.leverage;
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
-      const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
+      const contractInfo = await this.getCachedContractInfo(decision.symbol);
       const quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "0.001");
       console.log(`[EXEC] ${decision.symbol}: base=$${baseValue.toFixed(2)}, notional=$${notionalValue.toFixed(2)}, price=${currentPrice}, qm=${quantoMultiplier}`);
       const contractValue = currentPrice * quantoMultiplier;
@@ -1137,7 +1371,9 @@ Responda APENAS com JSON:
         quantity: contracts,
         entryTime: /* @__PURE__ */ new Date(),
         leverage: decision.leverage,
-        confidence: decision.confidence
+        confidence: decision.confidence,
+        quantoMultiplier
+        // [FIX 5.1] cached for correct PnL calculation
       });
       await this.db.insert(trades).values({
         id: nanoid(),
@@ -1148,8 +1384,8 @@ Responda APENAS com JSON:
         entryPrice: currentPrice.toString(),
         quantity: contracts.toString(),
         entryTime: /* @__PURE__ */ new Date(),
-        stopLoss: "0",
-        // AI manages exits dynamically
+        stopLoss: quantoMultiplier.toString(),
+        // [FIX 5.1] Store quantoMultiplier here
         takeProfit: "0",
         status: "OPEN",
         rsiAtEntry: String(decision.confidence),
@@ -1160,7 +1396,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
+        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | QM: ${quantoMultiplier} | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
@@ -1181,19 +1417,28 @@ Responda APENAS com JSON:
     }
   }
   /**
-   * Update DB trade record and in-memory position (does NOT close on exchange)
-   * Used by stop() after closeAllPositions() already closed on exchange
+   * [FIX 5.1] Update DB trade record and in-memory position
+   * Uses cached quantoMultiplier from position for correct PnL calculation
    */
   async closePositionRecord(symbol, exitPrice, reason) {
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
-      let quantoMultiplier = 1;
-      try {
-        const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
-        quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
-      } catch {
-        quantoMultiplier = 1 / position.entryPrice;
+      let quantoMultiplier = position.quantoMultiplier;
+      if (!quantoMultiplier || quantoMultiplier <= 0) {
+        try {
+          const tradeRecord2 = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId))).limit(1);
+          if (tradeRecord2.length > 0 && tradeRecord2[0].stopLoss) {
+            const dbQm = parseFloat(tradeRecord2[0].stopLoss);
+            if (dbQm > 0 && dbQm !== 0) {
+              quantoMultiplier = dbQm;
+            }
+          }
+        } catch {
+        }
+        if (!quantoMultiplier || quantoMultiplier <= 0) {
+          quantoMultiplier = await this.getCachedContractMultiplier(symbol);
+        }
       }
       const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity * quantoMultiplier : (position.entryPrice - exitPrice) * position.quantity * quantoMultiplier;
       const pnlPercent = position.side === "BUY" ? (exitPrice - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - exitPrice) / position.entryPrice * 100;
@@ -1232,7 +1477,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_CLOSED",
         symbol,
-        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
+        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | QM: ${quantoMultiplier} | ${reason}`
       );
     } catch (error) {
       await this.logEvent("ERROR", symbol, `Record close error: ${this.errStr(error)}`);
@@ -1243,6 +1488,7 @@ Responda APENAS com JSON:
       try {
         const ticker = await this.config.gateioClient.getTicker(symbol);
         await this.closePosition(symbol, parseFloat(ticker.lastPrice), reason);
+        await this.sleep(_TradingEngine.API_DELAY_MS);
       } catch (error) {
         await this.logEvent("ERROR", symbol, `Failed to close: ${this.errStr(error)}`);
       }
@@ -1614,14 +1860,38 @@ var botControlRouter = router({
       apiKey: keys[0].apiKey,
       apiSecret: keys[0].apiSecret
     });
-    const result = await gateioClient.closeAllPositions();
     const openTrades = await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.status, "OPEN")));
+    const priceMap = {};
+    for (const t2 of openTrades) {
+      if (!priceMap[t2.symbol]) {
+        try {
+          const ticker = await gateioClient.getTicker(t2.symbol);
+          priceMap[t2.symbol] = parseFloat(ticker.lastPrice);
+        } catch {
+          priceMap[t2.symbol] = 0;
+        }
+      }
+    }
+    const result = await gateioClient.closeAllPositions();
     for (const t2 of openTrades) {
       try {
+        const exitPrice = priceMap[t2.symbol] || 0;
+        const entryPrice = parseFloat(t2.entryPrice || "0");
+        const quantity = parseFloat(t2.quantity || "0");
+        const quantoMultiplier = parseFloat(t2.stopLoss || "0") > 0 ? parseFloat(t2.stopLoss) : 1;
+        let pnl = 0;
+        let pnlPercent = 0;
+        if (exitPrice > 0 && entryPrice > 0) {
+          pnl = t2.side === "BUY" ? (exitPrice - entryPrice) * quantity * quantoMultiplier : (entryPrice - exitPrice) * quantity * quantoMultiplier;
+          pnlPercent = t2.side === "BUY" ? (exitPrice - entryPrice) / entryPrice * 100 : (entryPrice - exitPrice) / entryPrice * 100;
+        }
         await db2.update(trades).set({
           status: "CLOSED",
+          exitPrice: exitPrice > 0 ? exitPrice.toString() : null,
           exitTime: /* @__PURE__ */ new Date(),
-          exitReason: "EMERGENCY_CLOSE"
+          exitReason: "EMERGENCY_CLOSE",
+          pnl: pnl.toString(),
+          pnlPercent: Math.max(-999.99, Math.min(999.99, pnlPercent)).toFixed(2)
         }).where(eq2(trades.id, t2.id));
       } catch (e) {
       }
@@ -1762,6 +2032,124 @@ var logsRouter = router({
     return await db2.select().from(tradingLogs).where(eq2(tradingLogs.userId, userId)).orderBy(desc(tradingLogs.createdAt)).limit(input.limit);
   })
 });
+var maintenanceRouter = router({
+  /**
+   * Recalculate PnL for all closed trades that have incorrect or missing PnL values.
+   * This fixes the historical bug where quantoMultiplier was calculated as 1/entryPrice.
+   * It fetches the correct quantoMultiplier from Gate.io for each symbol and recalculates.
+   */
+  fixHistoricalPnl: protectedProcedure.mutation(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const closedTrades = await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.status, "CLOSED")));
+    const publicClient = createGateioClient({ apiKey: "", apiSecret: "" });
+    const qmCache = {};
+    let fixed = 0;
+    let skipped = 0;
+    let errors = 0;
+    const details = [];
+    for (const t2 of closedTrades) {
+      try {
+        if (!t2.exitPrice || parseFloat(t2.exitPrice) === 0) {
+          skipped++;
+          continue;
+        }
+        const entryPrice = parseFloat(t2.entryPrice || "0");
+        const exitPrice = parseFloat(t2.exitPrice || "0");
+        const quantity = parseFloat(t2.quantity || "0");
+        if (entryPrice <= 0 || exitPrice <= 0 || quantity <= 0) {
+          skipped++;
+          continue;
+        }
+        if (!qmCache[t2.symbol]) {
+          try {
+            const contractInfo = await publicClient.getContractInfo(t2.symbol);
+            qmCache[t2.symbol] = parseFloat(
+              contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1"
+            );
+            await new Promise((r) => setTimeout(r, 150));
+          } catch {
+            qmCache[t2.symbol] = 1;
+          }
+        }
+        const qm = qmCache[t2.symbol];
+        const correctPnl = t2.side === "BUY" ? (exitPrice - entryPrice) * quantity * qm : (entryPrice - exitPrice) * quantity * qm;
+        const correctPnlPercent = t2.side === "BUY" ? (exitPrice - entryPrice) / entryPrice * 100 : (entryPrice - exitPrice) / entryPrice * 100;
+        const oldPnl = parseFloat(t2.pnl || "0");
+        const needsFix = !t2.pnl || Math.abs(oldPnl) === 0 || correctPnl !== 0 && Math.abs((oldPnl - correctPnl) / correctPnl) > 0.1;
+        if (needsFix) {
+          await db2.update(trades).set({
+            pnl: correctPnl.toFixed(8),
+            pnlPercent: Math.max(-999.99, Math.min(999.99, correctPnlPercent)).toFixed(2),
+            stopLoss: qm.toString()
+            // Store correct QM for future reference
+          }).where(eq2(trades.id, t2.id));
+          details.push({
+            id: t2.id,
+            symbol: t2.symbol,
+            oldPnl: t2.pnl || "null",
+            newPnl: correctPnl.toFixed(8),
+            reason: `QM=${qm}, entry=${entryPrice}, exit=${exitPrice}, qty=${quantity}`
+          });
+          fixed++;
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        errors++;
+      }
+    }
+    try {
+      const allTrades = await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.status, "CLOSED")));
+      const totalTrades = allTrades.length;
+      const winningTrades = allTrades.filter((t2) => parseFloat(t2.pnl || "0") > 0).length;
+      const losingTrades = allTrades.filter((t2) => parseFloat(t2.pnl || "0") <= 0).length;
+      const totalPnl = allTrades.reduce((sum, t2) => sum + parseFloat(t2.pnl || "0"), 0);
+      await db2.update(botStatus).set({
+        totalTrades,
+        winningTrades,
+        losingTrades,
+        totalPnl: totalPnl.toFixed(8)
+      }).where(eq2(botStatus.userId, userId));
+    } catch (e) {
+      console.error("Error recalculating bot stats:", e);
+    }
+    return {
+      totalProcessed: closedTrades.length,
+      fixed,
+      skipped,
+      errors,
+      details: details.slice(0, 50)
+      // limit response size
+    };
+  }),
+  /**
+   * Reset bot statistics (totalTrades, winningTrades, losingTrades, totalPnl)
+   * by recalculating from actual trade records in the database.
+   */
+  recalculateStats: protectedProcedure.mutation(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const allTrades = await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.status, "CLOSED")));
+    const totalTrades = allTrades.length;
+    const winningTrades = allTrades.filter((t2) => parseFloat(t2.pnl || "0") > 0).length;
+    const losingTrades = allTrades.filter((t2) => parseFloat(t2.pnl || "0") <= 0).length;
+    const totalPnl = allTrades.reduce((sum, t2) => sum + parseFloat(t2.pnl || "0"), 0);
+    await db2.update(botStatus).set({
+      totalTrades,
+      winningTrades,
+      losingTrades,
+      totalPnl: totalPnl.toFixed(8)
+    }).where(eq2(botStatus.userId, userId));
+    return {
+      totalTrades,
+      winningTrades,
+      losingTrades,
+      totalPnl: parseFloat(totalPnl.toFixed(8)),
+      winRate: totalTrades > 0 ? winningTrades / totalTrades * 100 : 0
+    };
+  })
+});
 var appRouter = router({
   gateioKeys: gateioKeysRouter,
   // Backward compatibility aliases
@@ -1771,7 +2159,8 @@ var appRouter = router({
   botControl: botControlRouter,
   marketData: marketDataRouter,
   trades: tradesRouter,
-  logs: logsRouter
+  logs: logsRouter,
+  maintenance: maintenanceRouter
 });
 
 // server/_core/context.ts
