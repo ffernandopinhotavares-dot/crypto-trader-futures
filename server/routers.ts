@@ -113,7 +113,7 @@ const binanceKeysRouter = router({
 });
 
 // ============================================================================
-// Trading Configuration Router
+// Trading Configuration Router — Autonomous AI Strategy
 // ============================================================================
 
 const tradingConfigRouter = router({
@@ -122,22 +122,11 @@ const tradingConfigRouter = router({
       z.object({
         name: z.string().min(1),
         description: z.string().optional(),
-        tradingPairs: z.array(z.string()),
-        maxPositionSize: z.number().min(0).max(100),
-        maxDrawdown: z.number().min(0).max(100),
-        stopLossPercent: z.number().min(0.1).max(50),
-        takeProfitPercent: z.number().min(0.1).max(100),
-        rsiPeriod: z.number().min(5).max(50),
-        rsiOverbought: z.number().min(50).max(100),
-        rsiOversold: z.number().min(0).max(50),
-        macdFastPeriod: z.number().min(5).max(50),
-        macdSlowPeriod: z.number().min(10).max(100),
-        macdSignalPeriod: z.number().min(5).max(50),
-        bbPeriod: z.number().min(5).max(100),
-        bbStdDev: z.number().min(0.5).max(5),
-        emaPeriod: z.number().min(5).max(200),
-        minVolume: z.number().min(0),
-        timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]),
+        aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).default("moderate"),
+        maxRiskPerTrade: z.number().min(1).max(20).default(5),
+        maxDrawdown: z.number().min(5).max(50).default(15),
+        maxOpenPositions: z.number().min(1).max(30).default(10),
+        timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).default("15m"),
       })
     )
     .mutation(async ({ input, ctx }) => {
@@ -149,25 +138,30 @@ const tradingConfigRouter = router({
         id,
         userId,
         name: input.name,
-        description: input.description,
-        tradingPairs: input.tradingPairs,
-        maxPositionSize: input.maxPositionSize.toString(),
+        description: input.description ?? `Estratégia AI ${input.aggressiveness}`,
+        tradingPairs: ["AUTO"], // AI selects pairs dynamically
+        maxPositionSize: input.maxRiskPerTrade.toString(),
         maxDrawdown: input.maxDrawdown.toString(),
-        stopLossPercent: input.stopLossPercent.toString(),
-        takeProfitPercent: input.takeProfitPercent.toString(),
-        rsiPeriod: input.rsiPeriod,
-        rsiOverbought: input.rsiOverbought,
-        rsiOversold: input.rsiOversold,
-        macdFastPeriod: input.macdFastPeriod,
-        macdSlowPeriod: input.macdSlowPeriod,
-        macdSignalPeriod: input.macdSignalPeriod,
-        bbPeriod: input.bbPeriod,
-        bbStdDev: input.bbStdDev.toString(),
-        emaPeriod: input.emaPeriod,
-        minVolume: input.minVolume.toString(),
+        stopLossPercent: "0", // AI manages dynamically
+        takeProfitPercent: "0", // AI manages dynamically
+        rsiPeriod: input.maxOpenPositions, // reuse field for maxOpenPositions
+        rsiOverbought: 70,
+        rsiOversold: 30,
+        macdFastPeriod: 12,
+        macdSlowPeriod: 26,
+        macdSignalPeriod: 9,
+        bbPeriod: 20,
+        bbStdDev: "2",
+        emaPeriod: 50,
+        minVolume: "0",
         timeframe: input.timeframe,
         isActive: false,
       });
+
+      // Store aggressiveness in description field
+      await db.update(tradingConfigs).set({
+        description: `${input.aggressiveness}|${input.description ?? "Estratégia AI Autônoma"}`,
+      }).where(eq(tradingConfigs.id, id));
 
       return { success: true, id };
     }),
@@ -181,14 +175,25 @@ const tradingConfigRouter = router({
       .from(tradingConfigs)
       .where(eq(tradingConfigs.userId, userId));
 
-    return configs.map((c: any) => ({
-      ...c,
-      tradingPairs: Array.isArray(c.tradingPairs)
-        ? c.tradingPairs
-        : typeof c.tradingPairs === "string"
-        ? JSON.parse(c.tradingPairs)
-        : [],
-    }));
+    return configs.map((c: any) => {
+      // Parse aggressiveness from description
+      const descParts = (c.description ?? "moderate|").split("|");
+      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+      const description = descParts.slice(1).join("|") || "Estratégia AI Autônoma";
+
+      return {
+        id: c.id,
+        name: c.name,
+        description,
+        aggressiveness,
+        maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
+        maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
+        maxOpenPositions: c.rsiPeriod ?? 10,
+        timeframe: c.timeframe ?? "15m",
+        isActive: c.isActive,
+        createdAt: c.createdAt,
+      };
+    });
   }),
 
   getById: protectedProcedure
@@ -206,13 +211,19 @@ const tradingConfigRouter = router({
       if (configs.length === 0) throw new Error("Configuração não encontrada");
 
       const c = configs[0];
+      const descParts = (c.description ?? "moderate|").split("|");
+      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+
       return {
-        ...c,
-        tradingPairs: Array.isArray(c.tradingPairs)
-          ? c.tradingPairs
-          : typeof c.tradingPairs === "string"
-          ? JSON.parse(c.tradingPairs)
-          : [],
+        id: c.id,
+        name: c.name,
+        description: descParts.slice(1).join("|") || "Estratégia AI Autônoma",
+        aggressiveness,
+        maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
+        maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
+        maxOpenPositions: c.rsiPeriod ?? 10,
+        timeframe: c.timeframe ?? "15m",
+        isActive: c.isActive,
       };
     }),
 
@@ -221,11 +232,11 @@ const tradingConfigRouter = router({
       z.object({
         id: z.string(),
         name: z.string().optional(),
-        description: z.string().optional(),
-        tradingPairs: z.array(z.string()).optional(),
-        maxPositionSize: z.number().optional(),
-        stopLossPercent: z.number().optional(),
-        takeProfitPercent: z.number().optional(),
+        aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).optional(),
+        maxRiskPerTrade: z.number().optional(),
+        maxDrawdown: z.number().optional(),
+        maxOpenPositions: z.number().optional(),
+        timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).optional(),
       })
     )
     .mutation(async ({ input, ctx }) => {
@@ -234,11 +245,21 @@ const tradingConfigRouter = router({
 
       const updates: any = {};
       if (input.name !== undefined) updates.name = input.name;
-      if (input.description !== undefined) updates.description = input.description;
-      if (input.tradingPairs !== undefined) updates.tradingPairs = input.tradingPairs;
-      if (input.maxPositionSize !== undefined) updates.maxPositionSize = input.maxPositionSize.toString();
-      if (input.stopLossPercent !== undefined) updates.stopLossPercent = input.stopLossPercent.toString();
-      if (input.takeProfitPercent !== undefined) updates.takeProfitPercent = input.takeProfitPercent.toString();
+      if (input.maxRiskPerTrade !== undefined) updates.maxPositionSize = input.maxRiskPerTrade.toString();
+      if (input.maxDrawdown !== undefined) updates.maxDrawdown = input.maxDrawdown.toString();
+      if (input.maxOpenPositions !== undefined) updates.rsiPeriod = input.maxOpenPositions;
+      if (input.timeframe !== undefined) updates.timeframe = input.timeframe;
+
+      // Update aggressiveness in description
+      if (input.aggressiveness !== undefined) {
+        const existing = await db.select().from(tradingConfigs)
+          .where(and(eq(tradingConfigs.id, input.id), eq(tradingConfigs.userId, userId)))
+          .limit(1);
+        if (existing.length > 0) {
+          const descParts = (existing[0].description ?? "moderate|").split("|");
+          updates.description = `${input.aggressiveness}|${descParts.slice(1).join("|") || "Estratégia AI Autônoma"}`;
+        }
+      }
 
       await db
         .update(tradingConfigs)
@@ -263,7 +284,7 @@ const tradingConfigRouter = router({
 });
 
 // ============================================================================
-// Bot Control Router
+// Bot Control Router — Autonomous AI
 // ============================================================================
 
 const botControlRouter = router({
@@ -301,33 +322,20 @@ const botControlRouter = router({
         testnet: apiKey.testnet ?? false,
       });
 
-      const tradingPairs = Array.isArray(config.tradingPairs)
-        ? config.tradingPairs
-        : typeof config.tradingPairs === "string"
-        ? JSON.parse(config.tradingPairs)
-        : ["BTCUSDT"];
+      // Parse aggressiveness from description
+      const descParts = (config.description ?? "moderate|").split("|");
+      const aggressiveness = (["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate") as "conservative" | "moderate" | "aggressive";
 
-      // Create and start trading engine
+      // Create and start AI trading engine
       const engine = new TradingEngine({
         userId,
         configId: input.configId,
         binanceClient,
-        tradingPairs,
-        maxPositionSize: parseFloat(config.maxPositionSize ?? "5"),
-        maxDrawdown: parseFloat(config.maxDrawdown ?? "10"),
-        stopLossPercent: parseFloat(config.stopLossPercent ?? "2"),
-        takeProfitPercent: parseFloat(config.takeProfitPercent ?? "5"),
-        rsiPeriod: config.rsiPeriod ?? 14,
-        rsiOverbought: config.rsiOverbought ?? 70,
-        rsiOversold: config.rsiOversold ?? 30,
-        macdFastPeriod: config.macdFastPeriod ?? 12,
-        macdSlowPeriod: config.macdSlowPeriod ?? 26,
-        macdSignalPeriod: config.macdSignalPeriod ?? 9,
-        bbPeriod: config.bbPeriod ?? 20,
-        bbStdDev: parseFloat(config.bbStdDev ?? "2"),
-        emaPeriod: config.emaPeriod ?? 50,
-        minVolume: parseFloat(config.minVolume ?? "0"),
-        timeframe: config.timeframe ?? "1h",
+        maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
+        maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
+        maxOpenPositions: config.rsiPeriod ?? 10,
+        timeframe: config.timeframe ?? "15m",
+        aggressiveness,
       });
 
       await engine.start();
@@ -562,7 +570,7 @@ const logsRouter = router({
 
 export const appRouter = router({
   binanceKeys: binanceKeysRouter,
-  // Keep bybitKeys as alias for backward compatibility with any existing frontend calls
+  // Keep bybitKeys as alias for backward compatibility
   bybitKeys: binanceKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,

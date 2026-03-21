@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { trpc } from "../App";
-import { Settings, Plus, Trash2, ChevronUp } from "lucide-react";
+import { Settings, Plus, Trash2, ChevronUp, Brain, Shield, Zap, TrendingUp } from "lucide-react";
 import { toast } from "sonner";
 
 function NeonCard({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
@@ -17,12 +17,15 @@ function NeonCard({ children, style }: { children: React.ReactNode; style?: Reac
   );
 }
 
-function NeonInput({ label, value, onChange, type = "text", step }: {
+function NeonInput({ label, value, onChange, type = "text", step, min, max, hint }: {
   label: string;
   value: string | number;
   onChange: (v: string) => void;
   type?: string;
   step?: string;
+  min?: string;
+  max?: string;
+  hint?: string;
 }) {
   return (
     <div style={{ marginBottom: "14px" }}>
@@ -32,6 +35,8 @@ function NeonInput({ label, value, onChange, type = "text", step }: {
       <input
         type={type}
         step={step}
+        min={min}
+        max={max}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         style={{
@@ -44,28 +49,26 @@ function NeonInput({ label, value, onChange, type = "text", step }: {
         onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
         onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
       />
+      {hint && <p style={{ fontSize: "10px", color: "#00ff8833", marginTop: "4px" }}>{hint}</p>}
     </div>
   );
 }
 
+type Aggressiveness = "conservative" | "moderate" | "aggressive";
+
+const aggressivenessProfiles: Record<Aggressiveness, { label: string; icon: any; color: string; desc: string }> = {
+  conservative: { label: "Conservador", icon: Shield, color: "#00aaff", desc: "Alavancagem 1-5x | Confiança mínima 75% | Posições menores" },
+  moderate: { label: "Moderado", icon: TrendingUp, color: "#00ff88", desc: "Alavancagem 3-10x | Confiança mínima 65% | Posições médias" },
+  aggressive: { label: "Agressivo", icon: Zap, color: "#ff8800", desc: "Alavancagem 5-20x | Confiança mínima 55% | Posições maiores" },
+};
+
 const defaultForm = {
-  name: "Estratégia Principal",
-  tradingPairs: "BTCUSDT,ETHUSDT",
-  timeframe: "1h",
-  stopLossPercent: 2,
-  takeProfitPercent: 5,
-  maxPositionSize: 100,
-  maxDrawdown: 10,
-  rsiPeriod: 14,
-  rsiOverbought: 70,
-  rsiOversold: 30,
-  macdFastPeriod: 12,
-  macdSlowPeriod: 26,
-  macdSignalPeriod: 9,
-  bbPeriod: 20,
-  bbStdDev: 2,
-  emaPeriod: 50,
-  minVolume: 0,
+  name: "AI Trader Autônomo",
+  aggressiveness: "moderate" as Aggressiveness,
+  maxRiskPerTrade: 5,
+  maxDrawdown: 15,
+  maxOpenPositions: 10,
+  timeframe: "15m",
 };
 
 export function ConfigurationPage() {
@@ -75,7 +78,7 @@ export function ConfigurationPage() {
   const { data: configs, refetch } = trpc.tradingConfig.getAll.useQuery();
   const { mutate: createConfig, isPending: isCreating } = trpc.tradingConfig.create.useMutation({
     onSuccess: () => {
-      toast.success("Configuração criada com sucesso!");
+      toast.success("Estratégia AI criada com sucesso!");
       setShowForm(false);
       setForm(defaultForm);
       refetch();
@@ -83,7 +86,7 @@ export function ConfigurationPage() {
     onError: (e) => toast.error("Erro: " + e.message),
   });
   const { mutate: deleteConfig } = trpc.tradingConfig.delete.useMutation({
-    onSuccess: () => { toast.success("Configuração removida"); refetch(); },
+    onSuccess: () => { toast.success("Estratégia removida"); refetch(); },
     onError: (e) => toast.error("Erro: " + e.message),
   });
 
@@ -91,22 +94,11 @@ export function ConfigurationPage() {
     if (!form.name) { toast.error("Preencha o nome da estratégia"); return; }
     createConfig({
       name: form.name,
-      tradingPairs: form.tradingPairs.split(",").map((s) => s.trim()),
-      timeframe: form.timeframe as any,
-      stopLossPercent: Number(form.stopLossPercent),
-      takeProfitPercent: Number(form.takeProfitPercent),
-      maxPositionSize: Number(form.maxPositionSize),
+      aggressiveness: form.aggressiveness,
+      maxRiskPerTrade: Number(form.maxRiskPerTrade),
       maxDrawdown: Number(form.maxDrawdown),
-      rsiPeriod: Number(form.rsiPeriod),
-      rsiOverbought: Number(form.rsiOverbought),
-      rsiOversold: Number(form.rsiOversold),
-      macdFastPeriod: Number(form.macdFastPeriod),
-      macdSlowPeriod: Number(form.macdSlowPeriod),
-      macdSignalPeriod: Number(form.macdSignalPeriod),
-      bbPeriod: Number(form.bbPeriod),
-      bbStdDev: Number(form.bbStdDev),
-      emaPeriod: Number(form.emaPeriod),
-      minVolume: Number(form.minVolume),
+      maxOpenPositions: Number(form.maxOpenPositions),
+      timeframe: form.timeframe as any,
     });
   };
 
@@ -116,8 +108,8 @@ export function ConfigurationPage() {
     <div style={{ fontFamily: "Courier New, monospace" }}>
       <div style={{ marginBottom: "20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-          <Settings size={18} style={{ color: "#00ff88" }} />
-          <h1 style={{ fontSize: "18px", fontWeight: "700", color: "#00ff88" }}>Configuração de Estratégia</h1>
+          <Brain size={18} style={{ color: "#00ff88" }} />
+          <h1 style={{ fontSize: "18px", fontWeight: "700", color: "#00ff88" }}>Estratégia AI Autônoma</h1>
         </div>
         <button
           onClick={() => setShowForm(!showForm)}
@@ -135,17 +127,102 @@ export function ConfigurationPage() {
         </button>
       </div>
 
+      {/* Info Banner */}
+      <NeonCard style={{ marginBottom: "20px", borderColor: "#00ff8830" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
+          <Brain size={20} style={{ color: "#00ff88", flexShrink: 0, marginTop: "2px" }} />
+          <div>
+            <p style={{ fontSize: "12px", color: "#00ff88cc", marginBottom: "8px", fontWeight: "600" }}>
+              Como funciona a estratégia autônoma
+            </p>
+            <p style={{ fontSize: "11px", color: "#00ff8866", lineHeight: "1.6" }}>
+              A IA analisa continuamente os top 20 pares de futuros da Binance usando RSI, MACD, Bollinger Bands,
+              volume, volatilidade, funding rate e tendência. Com base nesses dados, ela decide de forma autônoma:
+              quais pares operar, quando abrir/fechar posições, qual alavancagem usar e quanto capital alocar.
+              Não há stop-loss ou take-profit fixos — a IA gerencia saídas dinamicamente baseada em probabilidade.
+            </p>
+          </div>
+        </div>
+      </NeonCard>
+
       {showForm && (
         <NeonCard style={{ marginBottom: "20px" }}>
           <h2 style={{ fontSize: "14px", color: "#00ff88", marginBottom: "20px", fontWeight: "600" }}>
-            Nova Configuração
+            Nova Estratégia AI
           </h2>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "0 20px" }}>
-            <NeonInput label="Nome da Estratégia" value={form.name} onChange={set("name")} />
-            <NeonInput label="Pares (separados por vírgula)" value={form.tradingPairs} onChange={set("tradingPairs")} />
+
+          <NeonInput label="Nome da Estratégia" value={form.name} onChange={set("name")} />
+
+          {/* Aggressiveness Selector */}
+          <div style={{ marginBottom: "18px" }}>
+            <label style={{ display: "block", fontSize: "11px", color: "#00ff8866", marginBottom: "10px" }}>
+              Perfil de Risco
+            </label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" }}>
+              {(Object.entries(aggressivenessProfiles) as [Aggressiveness, typeof aggressivenessProfiles["conservative"]][]).map(([key, profile]) => {
+                const Icon = profile.icon;
+                const isSelected = form.aggressiveness === key;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => setForm((f) => ({ ...f, aggressiveness: key }))}
+                    style={{
+                      padding: "12px",
+                      borderRadius: "6px",
+                      background: isSelected ? `${profile.color}15` : "#080b10",
+                      border: `1px solid ${isSelected ? profile.color + "60" : "#00ff8815"}`,
+                      cursor: "pointer",
+                      textAlign: "center",
+                      transition: "all 0.2s",
+                    }}
+                  >
+                    <Icon size={20} style={{ color: isSelected ? profile.color : "#00ff8833", marginBottom: "6px" }} />
+                    <p style={{ fontSize: "12px", fontWeight: "600", color: isSelected ? profile.color : "#00ff8855", fontFamily: "Courier New, monospace" }}>
+                      {profile.label}
+                    </p>
+                    <p style={{ fontSize: "9px", color: isSelected ? profile.color + "88" : "#00ff8833", marginTop: "4px", fontFamily: "Courier New, monospace" }}>
+                      {profile.desc}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0 20px" }}>
+            <NeonInput
+              label="Risco Máx. por Trade (%)"
+              value={form.maxRiskPerTrade}
+              onChange={set("maxRiskPerTrade")}
+              type="number"
+              step="1"
+              min="1"
+              max="20"
+              hint="% do saldo alocado por operação"
+            />
+            <NeonInput
+              label="Drawdown Máximo (%)"
+              value={form.maxDrawdown}
+              onChange={set("maxDrawdown")}
+              type="number"
+              step="1"
+              min="5"
+              max="50"
+              hint="Bot para se perda total atingir este %"
+            />
+            <NeonInput
+              label="Máx. Posições Simultâneas"
+              value={form.maxOpenPositions}
+              onChange={set("maxOpenPositions")}
+              type="number"
+              step="1"
+              min="1"
+              max="30"
+              hint="Diversificação: mais posições = menor risco por trade"
+            />
             <div style={{ marginBottom: "14px" }}>
               <label style={{ display: "block", fontSize: "11px", color: "#00ff8866", marginBottom: "6px" }}>
-                Timeframe
+                Timeframe de Análise
               </label>
               <select
                 value={form.timeframe}
@@ -158,31 +235,16 @@ export function ConfigurationPage() {
                   outline: "none",
                 }}
               >
-                {["1m","5m","15m","30m","1h","4h","1d"].map((tf) => (
+                {["1m", "5m", "15m", "30m", "1h", "4h", "1d"].map((tf) => (
                   <option key={tf} value={tf}>{tf}</option>
                 ))}
               </select>
+              <p style={{ fontSize: "10px", color: "#00ff8833", marginTop: "4px" }}>
+                Menor = mais trades, maior = sinais mais fortes
+              </p>
             </div>
-            <NeonInput label="Stop Loss (%)" value={form.stopLossPercent} onChange={set("stopLossPercent")} type="number" step="0.1" />
-            <NeonInput label="Take Profit (%)" value={form.takeProfitPercent} onChange={set("takeProfitPercent")} type="number" step="0.1" />
-            <NeonInput label="Tamanho Máx. Posição (USDT)" value={form.maxPositionSize} onChange={set("maxPositionSize")} type="number" />
-            <NeonInput label="Drawdown Máximo (%)" value={form.maxDrawdown} onChange={set("maxDrawdown")} type="number" step="0.1" />
           </div>
-          <p style={{ fontSize: "11px", color: "#00ff8844", marginBottom: "14px", marginTop: "4px" }}>
-            Parâmetros de Indicadores Técnicos
-          </p>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0 20px" }}>
-            <NeonInput label="RSI Período" value={form.rsiPeriod} onChange={set("rsiPeriod")} type="number" />
-            <NeonInput label="RSI Sobrecomprado" value={form.rsiOverbought} onChange={set("rsiOverbought")} type="number" />
-            <NeonInput label="RSI Sobrevendido" value={form.rsiOversold} onChange={set("rsiOversold")} type="number" />
-            <NeonInput label="MACD Rápido" value={form.macdFastPeriod} onChange={set("macdFastPeriod")} type="number" />
-            <NeonInput label="MACD Lento" value={form.macdSlowPeriod} onChange={set("macdSlowPeriod")} type="number" />
-            <NeonInput label="MACD Sinal" value={form.macdSignalPeriod} onChange={set("macdSignalPeriod")} type="number" />
-            <NeonInput label="Bollinger Período" value={form.bbPeriod} onChange={set("bbPeriod")} type="number" />
-            <NeonInput label="Bollinger Desvio Padrão" value={form.bbStdDev} onChange={set("bbStdDev")} type="number" step="0.1" />
-            <NeonInput label="EMA Período" value={form.emaPeriod} onChange={set("emaPeriod")} type="number" />
-            <NeonInput label="Volume Mínimo" value={form.minVolume} onChange={set("minVolume")} type="number" />
-          </div>
+
           <div style={{ display: "flex", gap: "10px", marginTop: "8px" }}>
             <button
               onClick={handleCreate}
@@ -196,7 +258,7 @@ export function ConfigurationPage() {
                 opacity: isCreating ? 0.6 : 1,
               }}
             >
-              {isCreating ? "Salvando..." : "Salvar Configuração"}
+              {isCreating ? "Criando..." : "Criar Estratégia AI"}
             </button>
             <button
               onClick={() => setShowForm(false)}
@@ -216,49 +278,60 @@ export function ConfigurationPage() {
 
       {configs && configs.length > 0 ? (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "16px" }}>
-          {configs.map((config: any) => (
-            <NeonCard key={config.id}>
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "14px" }}>
-                <div>
-                  <h3 style={{ fontSize: "14px", fontWeight: "700", color: "#00ff88" }}>{config.name}</h3>
-                  <p style={{ fontSize: "11px", color: "#00ff8855", marginTop: "2px" }}>
-                    {Array.isArray(config.tradingPairs) ? config.tradingPairs.join(", ") : config.tradingPairs}
-                  </p>
-                </div>
-                <button
-                  onClick={() => deleteConfig({ id: config.id })}
-                  style={{
-                    background: "transparent", border: "none",
-                    color: "#ff446655", cursor: "pointer", padding: "4px",
-                  }}
-                  onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.color = "#ff4466")}
-                  onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.color = "#ff446655")}
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                {[
-                  ["Timeframe", config.timeframe],
-                  ["Stop Loss", `${config.stopLossPercent}%`],
-                  ["Take Profit", `${config.takeProfitPercent}%`],
-                  ["Pos. Máxima", `${config.maxPositionSize} USDT`],
-                  ["Drawdown Máx.", `${config.maxDrawdown}%`],
-                  ["RSI", `${config.rsiPeriod} (${config.rsiOversold}/${config.rsiOverbought})`],
-                ].map(([label, value]) => (
-                  <div key={label}>
-                    <p style={{ fontSize: "10px", color: "#00ff8844" }}>{label}</p>
-                    <p style={{ fontSize: "12px", color: "#00ff88aa" }}>{value}</p>
+          {configs.map((config: any) => {
+            const profile = aggressivenessProfiles[config.aggressiveness as Aggressiveness] ?? aggressivenessProfiles.moderate;
+            const Icon = profile.icon;
+            return (
+              <NeonCard key={config.id}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <Icon size={16} style={{ color: profile.color }} />
+                    <div>
+                      <h3 style={{ fontSize: "14px", fontWeight: "700", color: "#00ff88" }}>{config.name}</h3>
+                      <p style={{ fontSize: "11px", color: profile.color + "88", marginTop: "2px" }}>
+                        {profile.label}
+                      </p>
+                    </div>
                   </div>
-                ))}
-              </div>
-            </NeonCard>
-          ))}
+                  <button
+                    onClick={() => deleteConfig({ id: config.id })}
+                    style={{
+                      background: "transparent", border: "none",
+                      color: "#ff446655", cursor: "pointer", padding: "4px",
+                    }}
+                    onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.color = "#ff4466")}
+                    onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.color = "#ff446655")}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                  {[
+                    ["Risco/Trade", `${config.maxRiskPerTrade}%`],
+                    ["Drawdown Máx.", `${config.maxDrawdown}%`],
+                    ["Posições Máx.", config.maxOpenPositions],
+                    ["Timeframe", config.timeframe],
+                    ["Pares", "Auto (AI)"],
+                    ["SL/TP", "Dinâmico (AI)"],
+                  ].map(([label, value]) => (
+                    <div key={label as string}>
+                      <p style={{ fontSize: "10px", color: "#00ff8844" }}>{label}</p>
+                      <p style={{ fontSize: "12px", color: "#00ff88aa" }}>{value}</p>
+                    </div>
+                  ))}
+                </div>
+              </NeonCard>
+            );
+          })}
         </div>
       ) : !showForm ? (
         <NeonCard style={{ textAlign: "center", padding: "40px" }}>
-          <p style={{ color: "#00ff8833", fontSize: "13px" }}>
-            Nenhuma configuração criada. Clique em "Nova Estratégia" para começar.
+          <Brain size={32} style={{ color: "#00ff8822", marginBottom: "12px" }} />
+          <p style={{ color: "#00ff8855", fontSize: "13px" }}>
+            Nenhuma estratégia criada. Clique em "Nova Estratégia" para configurar o AI Trader.
+          </p>
+          <p style={{ color: "#00ff8833", fontSize: "11px", marginTop: "6px" }}>
+            A IA escolhe automaticamente os melhores pares e gerencia todas as operações.
           </p>
         </NeonCard>
       ) : null}

@@ -695,6 +695,15 @@ function calculateBollingerBands(prices, period = 20, stdDev = 2) {
     position: Math.min(100, Math.max(0, Math.round(position * 100) / 100))
   };
 }
+function calculateEMAValue(prices, period = 50) {
+  if (prices.length < period) {
+    throw new Error(
+      `Not enough data for EMA calculation. Need at least ${period} prices.`
+    );
+  }
+  const ema = calculateEMA(prices, period);
+  return Math.round(ema[ema.length - 1] * 100) / 100;
+}
 function analyzeVolume(volumes, period = 20) {
   if (volumes.length < period) {
     throw new Error(
@@ -712,209 +721,413 @@ function analyzeVolume(volumes, period = 20) {
     highVolume: volumeRatio > 1.5
   };
 }
-function generateTradingSignal(prices, volumes, rsiConfig, macdConfig, bbConfig) {
-  let signalScore = 0;
-  const signals = {
-    rsi: 0,
-    macd: 0,
-    bollinger: 0,
-    volume: 0
-  };
-  try {
-    const rsi = calculateRSI(prices, rsiConfig.period);
-    if (rsi.oversold) {
-      signals.rsi = 1;
-      signalScore += 25;
-    } else if (rsi.overbought) {
-      signals.rsi = -1;
-      signalScore -= 25;
-    }
-  } catch (e) {
-  }
-  try {
-    const macd = calculateMACD(
-      prices,
-      macdConfig.fast,
-      macdConfig.slow,
-      macdConfig.signal
+function analyzeVolatility(prices, period = 20) {
+  if (prices.length < period) {
+    throw new Error(
+      `Not enough data for volatility analysis. Need at least ${period} prices.`
     );
-    if (macd.bullish && macd.histogram > 0) {
-      signals.macd = 1;
-      signalScore += 25;
-    } else if (macd.bearish && macd.histogram < 0) {
-      signals.macd = -1;
-      signalScore -= 25;
-    }
-  } catch (e) {
   }
-  try {
-    const bb = calculateBollingerBands(
-      prices,
-      bbConfig.period,
-      bbConfig.stdDev
-    );
-    if (bb.position < 20) {
-      signals.bollinger = 1;
-      signalScore += 25;
-    } else if (bb.position > 80) {
-      signals.bollinger = -1;
-      signalScore -= 25;
-    }
-  } catch (e) {
+  const lastPrices = prices.slice(-period);
+  const returns = [];
+  for (let i = 1; i < lastPrices.length; i++) {
+    const ret = (lastPrices[i] - lastPrices[i - 1]) / lastPrices[i - 1];
+    returns.push(ret);
   }
-  try {
-    const volume = analyzeVolume(volumes);
-    if (volume.highVolume) {
-      if (signalScore > 0) {
-        signals.volume = 1;
-        signalScore += 25;
-      } else if (signalScore < 0) {
-        signals.volume = -1;
-        signalScore -= 25;
-      }
-    }
-  } catch (e) {
-  }
-  const strength = Math.max(-100, Math.min(100, signalScore));
-  let recommendation;
-  if (strength >= 75) {
-    recommendation = "STRONG_BUY";
-  } else if (strength >= 25) {
-    recommendation = "BUY";
-  } else if (strength <= -75) {
-    recommendation = "STRONG_SELL";
-  } else if (strength <= -25) {
-    recommendation = "SELL";
+  const meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((sum, ret) => sum + Math.pow(ret - meanReturn, 2), 0) / returns.length;
+  const volatility = Math.sqrt(variance) * 100;
+  let trend;
+  if (volatility > 5) {
+    trend = "HIGH";
+  } else if (volatility > 2) {
+    trend = "NORMAL";
   } else {
-    recommendation = "NEUTRAL";
+    trend = "LOW";
   }
   return {
-    strength,
-    signals,
-    recommendation
+    volatility: Math.round(volatility * 100) / 100,
+    trend
   };
 }
 
 // server/tradingEngine.ts
 import { eq, and } from "drizzle-orm";
 import { nanoid } from "nanoid";
+import OpenAI from "openai";
 var TradingEngine = class {
   config;
   isRunning = false;
   positions = /* @__PURE__ */ new Map();
+  openai;
+  cycleCount = 0;
+  initialBalance = 0;
   get db() {
     return getDatabase();
   }
   constructor(config) {
     this.config = config;
+    this.openai = new OpenAI();
   }
   async start() {
     if (this.isRunning) return;
     this.isRunning = true;
-    console.log(`\u{1F680} Trading engine started for user ${this.config.userId}`);
+    try {
+      const balances = await this.config.binanceClient.getBalance();
+      const usdt = balances.find((b) => b.coin === "USDT");
+      this.initialBalance = parseFloat(usdt?.walletBalance ?? "0");
+    } catch {
+      this.initialBalance = 0;
+    }
+    console.log(`\u{1F680} AI Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
-    await this.logEvent("BOT_START", "SYSTEM", "Trading bot started");
+    await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}%`);
     this.mainLoop();
   }
   async stop() {
     if (!this.isRunning) return;
     this.isRunning = false;
-    console.log(`\u26D4 Trading engine stopped for user ${this.config.userId}`);
+    console.log(`\u26D4 AI Trading engine stopped for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: false });
-    await this.logEvent("BOT_STOP", "SYSTEM", "Trading bot stopped");
+    await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped");
   }
+  // --------------------------------------------------------------------------
+  // Main Loop
+  // --------------------------------------------------------------------------
   async mainLoop() {
     while (this.isRunning) {
       try {
-        for (const symbol of this.config.tradingPairs) {
-          await this.analyzeAndTrade(symbol);
+        this.cycleCount++;
+        await this.logEvent("CYCLE_START", "SYSTEM", `Cycle #${this.cycleCount} started`);
+        if (await this.isDrawdownExceeded()) {
+          await this.logEvent("RISK_STOP", "SYSTEM", `Max drawdown ${this.config.maxDrawdown}% exceeded. Closing all positions.`);
+          await this.closeAllPositions("MAX_DRAWDOWN");
+          await this.stop();
+          return;
         }
-        await this.checkPositions();
-        await this.sleep(5 * 60 * 1e3);
+        await this.monitorPositions();
+        if (this.positions.size < this.config.maxOpenPositions) {
+          await this.scanAndTrade();
+        }
+        await this.updateBotStatus({ isRunning: true });
+        const waitMs = this.config.aggressiveness === "aggressive" ? 2 * 60 * 1e3 : this.config.aggressiveness === "moderate" ? 5 * 60 * 1e3 : 10 * 60 * 1e3;
+        await this.sleep(waitMs);
       } catch (error) {
         const msg = this.errStr(error);
-        console.error("Error in trading loop:", msg);
+        console.error("Error in AI trading loop:", msg);
         await this.logEvent("ERROR", "SYSTEM", `Trading loop error: ${msg}`);
+        await this.sleep(60 * 1e3);
       }
     }
   }
-  async analyzeAndTrade(symbol) {
+  // --------------------------------------------------------------------------
+  // Market Scanning — Discover top opportunities
+  // --------------------------------------------------------------------------
+  async scanAndTrade() {
+    try {
+      const allInstruments = await this.config.binanceClient.getAllInstruments();
+      const symbols = allInstruments.filter((i) => i.status === "TRADING" && i.quoteAsset === "USDT").map((i) => i.symbol).slice(0, 50);
+      const snapshots = [];
+      const batchSymbols = symbols.slice(0, 20);
+      for (const symbol of batchSymbols) {
+        try {
+          const snapshot = await this.getMarketSnapshot(symbol);
+          if (snapshot) snapshots.push(snapshot);
+        } catch {
+        }
+      }
+      if (snapshots.length === 0) return;
+      const decisions = await this.askAIForOpportunities(snapshots);
+      for (const decision of decisions) {
+        if (!this.isRunning) break;
+        if (decision.action === "SKIP" || decision.action === "HOLD") continue;
+        if (decision.confidence < 60) continue;
+        if (this.positions.has(decision.symbol)) continue;
+        if (this.positions.size >= this.config.maxOpenPositions) break;
+        try {
+          await this.executeDecision(decision);
+        } catch (error) {
+          await this.logEvent("ERROR", decision.symbol, `Failed to execute: ${this.errStr(error)}`);
+        }
+      }
+    } catch (error) {
+      await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
+    }
+  }
+  // --------------------------------------------------------------------------
+  // Position Monitoring — AI decides when to close
+  // --------------------------------------------------------------------------
+  async monitorPositions() {
+    for (const [symbol, position] of Array.from(this.positions.entries())) {
+      try {
+        const snapshot = await this.getMarketSnapshot(symbol);
+        if (!snapshot) continue;
+        const pnlPercent = position.side === "BUY" ? (snapshot.price - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - snapshot.price) / position.entryPrice * 100;
+        const decision = await this.askAIForPositionManagement(position, snapshot, pnlPercent);
+        if (decision.action === "CLOSE") {
+          await this.closePosition(symbol, snapshot.price, decision.reasoning);
+        }
+      } catch (error) {
+        console.error(`Error monitoring ${symbol}:`, this.errStr(error));
+      }
+    }
+  }
+  // --------------------------------------------------------------------------
+  // AI Decision Engine
+  // --------------------------------------------------------------------------
+  async askAIForOpportunities(snapshots) {
+    const balances = await this.config.binanceClient.getBalance();
+    const usdt = balances.find((b) => b.coin === "USDT");
+    const availableBalance = parseFloat(usdt?.walletBalance ?? "0");
+    const marketSummary = snapshots.map((s) => ({
+      symbol: s.symbol,
+      price: s.price,
+      change24h: `${s.change24h}%`,
+      rsi: s.rsi,
+      macd_bullish: s.macd.bullish,
+      macd_histogram: s.macd.histogram,
+      bb_position: s.bb.position,
+      volume_ratio: s.volumeAnalysis.volumeRatio,
+      volatility: `${s.volatility.volatility}% (${s.volatility.trend})`,
+      trend: s.trend,
+      funding_rate: s.fundingRate,
+      above_ema50: s.price > s.ema50
+    }));
+    const systemPrompt = `Voc\xEA \xE9 um agente de trading algor\xEDtmico avan\xE7ado especializado em criptoativos (futuros), com foco em maximiza\xE7\xE3o de retorno ajustado ao risco.
+
+COMPORTAMENTO:
+- Tome decis\xF5es din\xE2micas e aut\xF4nomas baseadas em probabilidade, contexto de mercado e gest\xE3o de risco.
+- Corte preju\xEDzos rapidamente quando a probabilidade piorar.
+- Garanta lucros quando houver sinais de revers\xE3o.
+- Ajuste capital e alavancagem dinamicamente.
+- Prefira abrir MUITAS posi\xE7\xF5es de valores BAIXOS alavancados para diversificar.
+
+PERFIL DE RISCO: ${this.config.aggressiveness}
+- Conservative: alavancagem 1-5x, confian\xE7a m\xEDnima 75%, posi\xE7\xF5es menores
+- Moderate: alavancagem 3-10x, confian\xE7a m\xEDnima 65%, posi\xE7\xF5es m\xE9dias
+- Aggressive: alavancagem 5-20x, confian\xE7a m\xEDnima 55%, posi\xE7\xF5es maiores
+
+REGRAS:
+- M\xE1ximo ${this.config.maxRiskPerTrade}% do saldo por opera\xE7\xE3o
+- M\xE1ximo ${this.config.maxOpenPositions} posi\xE7\xF5es simult\xE2neas (atualmente ${this.positions.size} abertas)
+- Saldo dispon\xEDvel: ${availableBalance.toFixed(2)} USDT
+- Considere funding rate (negativo favorece longs, positivo favorece shorts)
+- Alta volatilidade = menor alavancagem
+- Sempre considere risco de liquida\xE7\xE3o
+
+Responda APENAS com um JSON array de decis\xF5es. Cada decis\xE3o:
+{
+  "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
+  "symbol": "BTCUSDT",
+  "confidence": 75,
+  "leverage": 5,
+  "positionSizePercent": 3,
+  "reasoning": "breve explica\xE7\xE3o"
+}
+
+Retorne no m\xE1ximo 5 oportunidades, ordenadas por confian\xE7a. Se n\xE3o houver boas oportunidades, retorne array vazio [].`;
+    try {
+      const response = await this.openai.chat.completions.create({
+        model: "gemini-2.5-flash",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: `Dados de mercado atuais:
+${JSON.stringify(marketSummary, null, 2)}` }
+        ],
+        temperature: 0.3,
+        max_tokens: 2e3
+      });
+      const content = response.choices[0]?.message?.content ?? "[]";
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) return [];
+      return JSON.parse(jsonMatch[0]);
+    } catch (error) {
+      await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${this.errStr(error)}`);
+      return [];
+    }
+  }
+  async askAIForPositionManagement(position, snapshot, pnlPercent) {
+    const holdTime = (Date.now() - position.entryTime.getTime()) / (1e3 * 60);
+    const prompt = `Posi\xE7\xE3o aberta:
+- Symbol: ${position.symbol}
+- Side: ${position.side}
+- Entry: ${position.entryPrice}
+- Current: ${snapshot.price}
+- P&L: ${pnlPercent.toFixed(2)}%
+- Leverage: ${position.leverage}x
+- Confian\xE7a na entrada: ${position.confidence}%
+- Tempo aberta: ${holdTime.toFixed(0)} minutos
+
+Indicadores atuais:
+- RSI: ${snapshot.rsi}
+- MACD bullish: ${snapshot.macd.bullish}, histogram: ${snapshot.macd.histogram}
+- BB position: ${snapshot.bb.position}
+- Volatilidade: ${snapshot.volatility.volatility}% (${snapshot.volatility.trend})
+- Volume ratio: ${snapshot.volumeAnalysis.volumeRatio}
+- Tend\xEAncia: ${snapshot.trend}
+
+Decida: CLOSE ou HOLD?
+- Se P&L positivo e sinais de revers\xE3o \u2192 CLOSE (proteger lucro)
+- Se P&L negativo e probabilidade de recupera\xE7\xE3o baixa \u2192 CLOSE (cortar preju\xEDzo)
+- Se tend\xEAncia continua favor\xE1vel \u2192 HOLD
+
+Responda APENAS com JSON:
+{"action": "CLOSE" ou "HOLD", "symbol": "${position.symbol}", "confidence": 0, "leverage": 0, "positionSizePercent": 0, "reasoning": "explica\xE7\xE3o"}`;
+    try {
+      const response = await this.openai.chat.completions.create({
+        model: "gemini-2.5-flash",
+        messages: [
+          { role: "system", content: "Voc\xEA \xE9 um gestor de risco de trading de futuros cripto. Seja decisivo. Priorize proteger capital e garantir lucros." },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0.2,
+        max_tokens: 500
+      });
+      const content = response.choices[0]?.message?.content ?? '{"action":"HOLD"}';
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "Parse error" };
+      return JSON.parse(jsonMatch[0]);
+    } catch (error) {
+      await this.logEvent("ERROR", "AI", `AI position management failed: ${this.errStr(error)}`);
+      return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "AI error - holding" };
+    }
+  }
+  // --------------------------------------------------------------------------
+  // Market Data Collection
+  // --------------------------------------------------------------------------
+  async getMarketSnapshot(symbol) {
     try {
       const klines = await this.config.binanceClient.getKlines(
         symbol,
         this.timeframeToInterval(this.config.timeframe),
         200
       );
-      if (klines.length < 50) return;
+      if (klines.length < 50) return null;
       const prices = klines.map((k) => parseFloat(k.closePrice));
       const volumes = klines.map((k) => parseFloat(k.volume));
-      await this.saveCandles(symbol, klines);
-      const signal = generateTradingSignal(
-        prices,
-        volumes,
-        { period: this.config.rsiPeriod, overbought: this.config.rsiOverbought, oversold: this.config.rsiOversold },
-        { fast: this.config.macdFastPeriod, slow: this.config.macdSlowPeriod, signal: this.config.macdSignalPeriod },
-        { period: this.config.bbPeriod, stdDev: this.config.bbStdDev }
-      );
-      await this.saveIndicators(symbol, prices, volumes);
-      await this.logEvent("SIGNAL_GENERATED", symbol, `Signal: ${signal.recommendation} (strength: ${signal.strength})`);
-      if (signal.strength >= 50 && !this.positions.has(symbol)) {
-        const ticker = await this.config.binanceClient.getTicker(symbol);
-        const currentPrice = parseFloat(ticker.lastPrice);
-        const positionSize = await this.calculatePositionSize(currentPrice);
-        if (positionSize > 0) await this.openPosition(symbol, "BUY", currentPrice, positionSize, prices);
-      } else if (signal.strength <= -50 && this.positions.has(symbol)) {
-        const ticker = await this.config.binanceClient.getTicker(symbol);
-        await this.closePosition(symbol, parseFloat(ticker.lastPrice));
+      const currentPrice = prices[prices.length - 1];
+      const rsi = calculateRSI(prices, 14);
+      const macd = calculateMACD(prices, 12, 26, 9);
+      const bb = calculateBollingerBands(prices, 20, 2);
+      const vol = analyzeVolume(volumes);
+      const volat = analyzeVolatility(prices);
+      const ema50 = calculateEMAValue(prices, 50);
+      const ticker = await this.config.binanceClient.getTicker(symbol);
+      const change24h = parseFloat(ticker.lowPrice) !== 0 ? (currentPrice - parseFloat(ticker.lowPrice)) / parseFloat(ticker.lowPrice) * 100 : 0;
+      let fundingRate = 0;
+      try {
+        const fr = await this.config.binanceClient.getFundingRate(symbol);
+        fundingRate = parseFloat(fr.fundingRate);
+      } catch {
       }
+      let trend = "SIDEWAYS";
+      if (currentPrice > ema50 && macd.bullish && rsi.rsi > 50) trend = "BULLISH";
+      else if (currentPrice < ema50 && macd.bearish && rsi.rsi < 50) trend = "BEARISH";
+      await this.saveCandles(symbol, klines);
+      await this.saveIndicators(symbol, prices, volumes);
+      return {
+        symbol,
+        price: currentPrice,
+        change24h,
+        volume24h: parseFloat(ticker.volume),
+        rsi: rsi.rsi,
+        macd: { macdLine: macd.macdLine, signalLine: macd.signalLine, histogram: macd.histogram, bullish: macd.bullish },
+        bb: { upper: bb.upper, middle: bb.middle, lower: bb.lower, position: bb.position },
+        volumeAnalysis: { volumeRatio: vol.volumeRatio, highVolume: vol.highVolume },
+        volatility: { volatility: volat.volatility, trend: volat.trend },
+        ema50,
+        fundingRate,
+        trend
+      };
     } catch (error) {
-      const msg = this.errStr(error);
-      console.error(`Error analyzing ${symbol}:`, msg);
-      await this.logEvent("ERROR", symbol, `Error analyzing: ${msg}`);
+      return null;
     }
   }
-  async openPosition(symbol, side, entryPrice, quantity, prices) {
+  // --------------------------------------------------------------------------
+  // Trade Execution
+  // --------------------------------------------------------------------------
+  async executeDecision(decision) {
+    const side = decision.action === "OPEN_LONG" ? "BUY" : "SELL";
     try {
-      await this.config.binanceClient.setLeverage(symbol, 5);
-      const order = await this.config.binanceClient.placeOrder(symbol, side, "MARKET", quantity.toFixed(3));
-      const stopLoss = entryPrice * (1 - this.config.stopLossPercent / 100);
-      const takeProfit = entryPrice * (1 + this.config.takeProfitPercent / 100);
-      await this.config.binanceClient.setStopLossTakeProfit(symbol, side, stopLoss.toFixed(2), takeProfit.toFixed(2));
-      const rsi = calculateRSI(prices, this.config.rsiPeriod);
-      const macd = calculateMACD(prices, this.config.macdFastPeriod, this.config.macdSlowPeriod, this.config.macdSignalPeriod);
-      const bb = calculateBollingerBands(prices, this.config.bbPeriod, this.config.bbStdDev);
+      const balances = await this.config.binanceClient.getBalance();
+      const usdt = balances.find((b) => b.coin === "USDT");
+      const available = parseFloat(usdt?.walletBalance ?? "0");
+      const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
+      const notionalValue = available * (sizePercent / 100) * decision.leverage;
+      const ticker = await this.config.binanceClient.getTicker(decision.symbol);
+      const currentPrice = parseFloat(ticker.lastPrice);
+      if (currentPrice <= 0) return;
+      const instruments = await this.config.binanceClient.getInstruments(decision.symbol);
+      const instrument = instruments[0];
+      let stepSize = 1e-3;
+      if (instrument?.filters) {
+        const lotFilter = instrument.filters.find((f) => f.filterType === "LOT_SIZE");
+        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
+      }
+      const rawQty = notionalValue / currentPrice;
+      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
+      const quantity = Math.floor(rawQty / stepSize) * stepSize;
+      if (quantity <= 0) return;
+      await this.config.binanceClient.setLeverage(decision.symbol, decision.leverage);
+      const order = await this.config.binanceClient.placeOrder(
+        decision.symbol,
+        side,
+        "MARKET",
+        quantity.toFixed(precision)
+      );
+      this.positions.set(decision.symbol, {
+        symbol: decision.symbol,
+        side,
+        entryPrice: currentPrice,
+        quantity,
+        entryTime: /* @__PURE__ */ new Date(),
+        leverage: decision.leverage,
+        confidence: decision.confidence
+      });
+      const rsi = calculateRSI([currentPrice], 14).rsi.toString();
       await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
         configId: this.config.configId,
-        symbol,
+        symbol: decision.symbol,
         side,
-        entryPrice: entryPrice.toString(),
+        entryPrice: currentPrice.toString(),
         quantity: quantity.toString(),
         entryTime: /* @__PURE__ */ new Date(),
-        stopLoss: stopLoss.toString(),
-        takeProfit: takeProfit.toString(),
+        stopLoss: "0",
+        // AI manages exits dynamically
+        takeProfit: "0",
         status: "OPEN",
-        rsiAtEntry: rsi.rsi.toString(),
-        macdAtEntry: macd,
-        bbAtEntry: bb,
+        rsiAtEntry: String(decision.confidence),
+        macdAtEntry: `lev:${decision.leverage}x`,
+        bbAtEntry: decision.reasoning,
         bybitOrderId: order.orderId
       });
-      this.positions.set(symbol, { symbol, side, entryPrice, quantity, entryTime: /* @__PURE__ */ new Date(), stopLoss, takeProfit });
-      await this.logEvent("POSITION_OPENED", symbol, `Opened ${side} at ${entryPrice}`);
+      await this.logEvent(
+        "POSITION_OPENED",
+        decision.symbol,
+        `${side} ${quantity.toFixed(precision)} @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
+      );
     } catch (error) {
-      await this.logEvent("ERROR", symbol, `Error opening position: ${this.errStr(error)}`);
+      await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
     }
   }
-  async closePosition(symbol, exitPrice) {
+  async closePosition(symbol, exitPrice, reason) {
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
       const closeSide = position.side === "BUY" ? "SELL" : "BUY";
-      await this.config.binanceClient.placeOrder(symbol, closeSide, "MARKET", position.quantity.toFixed(3));
+      const instruments = await this.config.binanceClient.getInstruments(symbol);
+      const instrument = instruments[0];
+      let stepSize = 1e-3;
+      if (instrument?.filters) {
+        const lotFilter = instrument.filters.find((f) => f.filterType === "LOT_SIZE");
+        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
+      }
+      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
+      await this.config.binanceClient.placeOrder(symbol, closeSide, "MARKET", position.quantity.toFixed(precision));
       const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity : (position.entryPrice - exitPrice) * position.quantity;
-      const pnlPercent = (exitPrice - position.entryPrice) / position.entryPrice * 100;
-      const tradeRecord = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"))).limit(1);
+      const pnlPercent = position.side === "BUY" ? (exitPrice - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - exitPrice) / position.entryPrice * 100;
+      const tradeRecord = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId))).limit(1);
       if (tradeRecord.length > 0) {
         await this.db.update(trades).set({
           exitPrice: exitPrice.toString(),
@@ -922,39 +1135,47 @@ var TradingEngine = class {
           pnl: pnl.toString(),
           pnlPercent: pnlPercent.toString(),
           status: "CLOSED",
-          exitReason: pnl > 0 ? "TAKE_PROFIT" : "STOP_LOSS"
+          exitReason: reason
         }).where(eq(trades.id, tradeRecord[0].id));
       }
       this.positions.delete(symbol);
-      await this.logEvent("POSITION_CLOSED", symbol, `Closed at ${exitPrice}. PnL: ${pnl.toFixed(2)}`);
+      await this.logEvent(
+        "POSITION_CLOSED",
+        symbol,
+        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
+      );
     } catch (error) {
-      await this.logEvent("ERROR", symbol, `Error closing position: ${this.errStr(error)}`);
+      await this.logEvent("ERROR", symbol, `Close error: ${this.errStr(error)}`);
     }
   }
-  async checkPositions() {
-    for (const [symbol, position] of Array.from(this.positions.entries())) {
+  async closeAllPositions(reason) {
+    for (const [symbol] of Array.from(this.positions.entries())) {
       try {
         const ticker = await this.config.binanceClient.getTicker(symbol);
-        const currentPrice = parseFloat(ticker.lastPrice);
-        const slTriggered = position.side === "BUY" && currentPrice <= position.stopLoss || position.side === "SELL" && currentPrice >= position.stopLoss;
-        const tpTriggered = position.side === "BUY" && currentPrice >= position.takeProfit || position.side === "SELL" && currentPrice <= position.takeProfit;
-        if (slTriggered || tpTriggered) await this.closePosition(symbol, currentPrice);
+        await this.closePosition(symbol, parseFloat(ticker.lastPrice), reason);
       } catch (error) {
-        console.error(`Error checking position ${symbol}:`, this.errStr(error));
+        await this.logEvent("ERROR", symbol, `Failed to close: ${this.errStr(error)}`);
       }
     }
   }
-  async calculatePositionSize(currentPrice) {
+  // --------------------------------------------------------------------------
+  // Risk Management
+  // --------------------------------------------------------------------------
+  async isDrawdownExceeded() {
+    if (this.initialBalance <= 0) return false;
     try {
       const balances = await this.config.binanceClient.getBalance();
-      const usdtBalance = balances.find((b) => b.coin === "USDT");
-      if (!usdtBalance) return 0;
-      const available = parseFloat(usdtBalance.walletBalance);
-      return Math.max(0, available * (this.config.maxPositionSize / 100) / currentPrice);
+      const usdt = balances.find((b) => b.coin === "USDT");
+      const currentBalance = parseFloat(usdt?.walletBalance ?? "0");
+      const drawdown = (this.initialBalance - currentBalance) / this.initialBalance * 100;
+      return drawdown >= this.config.maxDrawdown;
     } catch {
-      return 0;
+      return false;
     }
   }
+  // --------------------------------------------------------------------------
+  // Data Persistence
+  // --------------------------------------------------------------------------
   async saveCandles(symbol, klines) {
     try {
       for (const kline of klines.slice(-10)) {
@@ -976,9 +1197,9 @@ var TradingEngine = class {
   }
   async saveIndicators(symbol, prices, volumes) {
     try {
-      const rsi = calculateRSI(prices, this.config.rsiPeriod);
-      const macd = calculateMACD(prices, this.config.macdFastPeriod, this.config.macdSlowPeriod, this.config.macdSignalPeriod);
-      const bb = calculateBollingerBands(prices, this.config.bbPeriod, this.config.bbStdDev);
+      const rsi = calculateRSI(prices, 14);
+      const macd = calculateMACD(prices, 12, 26, 9);
+      const bb = calculateBollingerBands(prices, 20, 2);
       const vol = analyzeVolume(volumes);
       await this.db.insert(indicators).values({
         id: nanoid(),
@@ -1037,8 +1258,11 @@ var TradingEngine = class {
       console.error("Error updating bot status:", error);
     }
   }
+  // --------------------------------------------------------------------------
+  // Utilities
+  // --------------------------------------------------------------------------
   timeframeToInterval(timeframe) {
-    return { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d" }[timeframe] || "1h";
+    return { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d" }[timeframe] || "15m";
   }
   sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
@@ -1129,22 +1353,11 @@ var tradingConfigRouter = router({
     z.object({
       name: z.string().min(1),
       description: z.string().optional(),
-      tradingPairs: z.array(z.string()),
-      maxPositionSize: z.number().min(0).max(100),
-      maxDrawdown: z.number().min(0).max(100),
-      stopLossPercent: z.number().min(0.1).max(50),
-      takeProfitPercent: z.number().min(0.1).max(100),
-      rsiPeriod: z.number().min(5).max(50),
-      rsiOverbought: z.number().min(50).max(100),
-      rsiOversold: z.number().min(0).max(50),
-      macdFastPeriod: z.number().min(5).max(50),
-      macdSlowPeriod: z.number().min(10).max(100),
-      macdSignalPeriod: z.number().min(5).max(50),
-      bbPeriod: z.number().min(5).max(100),
-      bbStdDev: z.number().min(0.5).max(5),
-      emaPeriod: z.number().min(5).max(200),
-      minVolume: z.number().min(0),
-      timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+      aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).default("moderate"),
+      maxRiskPerTrade: z.number().min(1).max(20).default(5),
+      maxDrawdown: z.number().min(5).max(50).default(15),
+      maxOpenPositions: z.number().min(1).max(30).default(10),
+      timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).default("15m")
     })
   ).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
@@ -1154,35 +1367,55 @@ var tradingConfigRouter = router({
       id,
       userId,
       name: input.name,
-      description: input.description,
-      tradingPairs: input.tradingPairs,
-      maxPositionSize: input.maxPositionSize.toString(),
+      description: input.description ?? `Estrat\xE9gia AI ${input.aggressiveness}`,
+      tradingPairs: ["AUTO"],
+      // AI selects pairs dynamically
+      maxPositionSize: input.maxRiskPerTrade.toString(),
       maxDrawdown: input.maxDrawdown.toString(),
-      stopLossPercent: input.stopLossPercent.toString(),
-      takeProfitPercent: input.takeProfitPercent.toString(),
-      rsiPeriod: input.rsiPeriod,
-      rsiOverbought: input.rsiOverbought,
-      rsiOversold: input.rsiOversold,
-      macdFastPeriod: input.macdFastPeriod,
-      macdSlowPeriod: input.macdSlowPeriod,
-      macdSignalPeriod: input.macdSignalPeriod,
-      bbPeriod: input.bbPeriod,
-      bbStdDev: input.bbStdDev.toString(),
-      emaPeriod: input.emaPeriod,
-      minVolume: input.minVolume.toString(),
+      stopLossPercent: "0",
+      // AI manages dynamically
+      takeProfitPercent: "0",
+      // AI manages dynamically
+      rsiPeriod: input.maxOpenPositions,
+      // reuse field for maxOpenPositions
+      rsiOverbought: 70,
+      rsiOversold: 30,
+      macdFastPeriod: 12,
+      macdSlowPeriod: 26,
+      macdSignalPeriod: 9,
+      bbPeriod: 20,
+      bbStdDev: "2",
+      emaPeriod: 50,
+      minVolume: "0",
       timeframe: input.timeframe,
       isActive: false
     });
+    await db2.update(tradingConfigs).set({
+      description: `${input.aggressiveness}|${input.description ?? "Estrat\xE9gia AI Aut\xF4noma"}`
+    }).where(eq2(tradingConfigs.id, id));
     return { success: true, id };
   }),
   getAll: protectedProcedure.query(async ({ ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
     const configs = await db2.select().from(tradingConfigs).where(eq2(tradingConfigs.userId, userId));
-    return configs.map((c) => ({
-      ...c,
-      tradingPairs: Array.isArray(c.tradingPairs) ? c.tradingPairs : typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : []
-    }));
+    return configs.map((c) => {
+      const descParts = (c.description ?? "moderate|").split("|");
+      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+      const description = descParts.slice(1).join("|") || "Estrat\xE9gia AI Aut\xF4noma";
+      return {
+        id: c.id,
+        name: c.name,
+        description,
+        aggressiveness,
+        maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
+        maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
+        maxOpenPositions: c.rsiPeriod ?? 10,
+        timeframe: c.timeframe ?? "15m",
+        isActive: c.isActive,
+        createdAt: c.createdAt
+      };
+    });
   }),
   getById: protectedProcedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
     const db2 = getDatabase();
@@ -1190,31 +1423,46 @@ var tradingConfigRouter = router({
     const configs = await db2.select().from(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId))).limit(1);
     if (configs.length === 0) throw new Error("Configura\xE7\xE3o n\xE3o encontrada");
     const c = configs[0];
+    const descParts = (c.description ?? "moderate|").split("|");
+    const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
     return {
-      ...c,
-      tradingPairs: Array.isArray(c.tradingPairs) ? c.tradingPairs : typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : []
+      id: c.id,
+      name: c.name,
+      description: descParts.slice(1).join("|") || "Estrat\xE9gia AI Aut\xF4noma",
+      aggressiveness,
+      maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
+      maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
+      maxOpenPositions: c.rsiPeriod ?? 10,
+      timeframe: c.timeframe ?? "15m",
+      isActive: c.isActive
     };
   }),
   update: protectedProcedure.input(
     z.object({
       id: z.string(),
       name: z.string().optional(),
-      description: z.string().optional(),
-      tradingPairs: z.array(z.string()).optional(),
-      maxPositionSize: z.number().optional(),
-      stopLossPercent: z.number().optional(),
-      takeProfitPercent: z.number().optional()
+      aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).optional(),
+      maxRiskPerTrade: z.number().optional(),
+      maxDrawdown: z.number().optional(),
+      maxOpenPositions: z.number().optional(),
+      timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).optional()
     })
   ).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
     const updates = {};
     if (input.name !== void 0) updates.name = input.name;
-    if (input.description !== void 0) updates.description = input.description;
-    if (input.tradingPairs !== void 0) updates.tradingPairs = input.tradingPairs;
-    if (input.maxPositionSize !== void 0) updates.maxPositionSize = input.maxPositionSize.toString();
-    if (input.stopLossPercent !== void 0) updates.stopLossPercent = input.stopLossPercent.toString();
-    if (input.takeProfitPercent !== void 0) updates.takeProfitPercent = input.takeProfitPercent.toString();
+    if (input.maxRiskPerTrade !== void 0) updates.maxPositionSize = input.maxRiskPerTrade.toString();
+    if (input.maxDrawdown !== void 0) updates.maxDrawdown = input.maxDrawdown.toString();
+    if (input.maxOpenPositions !== void 0) updates.rsiPeriod = input.maxOpenPositions;
+    if (input.timeframe !== void 0) updates.timeframe = input.timeframe;
+    if (input.aggressiveness !== void 0) {
+      const existing = await db2.select().from(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId))).limit(1);
+      if (existing.length > 0) {
+        const descParts = (existing[0].description ?? "moderate|").split("|");
+        updates.description = `${input.aggressiveness}|${descParts.slice(1).join("|") || "Estrat\xE9gia AI Aut\xF4noma"}`;
+      }
+    }
     await db2.update(tradingConfigs).set(updates).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId)));
     return { success: true };
   }),
@@ -1240,27 +1488,17 @@ var botControlRouter = router({
       apiSecret: apiKey.apiSecret,
       testnet: apiKey.testnet ?? false
     });
-    const tradingPairs2 = Array.isArray(config.tradingPairs) ? config.tradingPairs : typeof config.tradingPairs === "string" ? JSON.parse(config.tradingPairs) : ["BTCUSDT"];
+    const descParts = (config.description ?? "moderate|").split("|");
+    const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
     const engine = new TradingEngine({
       userId,
       configId: input.configId,
       binanceClient,
-      tradingPairs: tradingPairs2,
-      maxPositionSize: parseFloat(config.maxPositionSize ?? "5"),
-      maxDrawdown: parseFloat(config.maxDrawdown ?? "10"),
-      stopLossPercent: parseFloat(config.stopLossPercent ?? "2"),
-      takeProfitPercent: parseFloat(config.takeProfitPercent ?? "5"),
-      rsiPeriod: config.rsiPeriod ?? 14,
-      rsiOverbought: config.rsiOverbought ?? 70,
-      rsiOversold: config.rsiOversold ?? 30,
-      macdFastPeriod: config.macdFastPeriod ?? 12,
-      macdSlowPeriod: config.macdSlowPeriod ?? 26,
-      macdSignalPeriod: config.macdSignalPeriod ?? 9,
-      bbPeriod: config.bbPeriod ?? 20,
-      bbStdDev: parseFloat(config.bbStdDev ?? "2"),
-      emaPeriod: config.emaPeriod ?? 50,
-      minVolume: parseFloat(config.minVolume ?? "0"),
-      timeframe: config.timeframe ?? "1h"
+      maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
+      maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
+      maxOpenPositions: config.rsiPeriod ?? 10,
+      timeframe: config.timeframe ?? "15m",
+      aggressiveness
     });
     await engine.start();
     tradingEngines.set(userId, engine);
@@ -1408,7 +1646,7 @@ var logsRouter = router({
 });
 var appRouter = router({
   binanceKeys: binanceKeysRouter,
-  // Keep bybitKeys as alias for backward compatibility with any existing frontend calls
+  // Keep bybitKeys as alias for backward compatibility
   bybitKeys: binanceKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,
