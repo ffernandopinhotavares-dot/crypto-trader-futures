@@ -34,7 +34,7 @@ export interface TradingEngineConfig {
   gateioClient: GateioClient;
   // Autonomous config — no fixed pairs, no fixed SL/TP
   maxRiskPerTrade: number;     // max % of balance per trade (default 5)
-  maxDrawdown: number;         // max total drawdown % before stopping (default 15)
+  maxDrawdown: number;         // max total drawdown % before stopping (default 10)
   maxOpenPositions: number;    // kept for compatibility but no longer enforced — capital is the only limit
   timeframe: string;           // analysis timeframe (default "15m")
   aggressiveness: "conservative" | "moderate" | "aggressive"; // risk profile
@@ -212,8 +212,26 @@ export class TradingEngine {
         if (await this.isDrawdownExceeded()) {
           await this.logEvent("RISK_STOP", "SYSTEM", `Max drawdown ${this.config.maxDrawdown}% exceeded. Closing all positions.`);
           await this.closeAllPositions("MAX_DRAWDOWN");
-          await this.stop();
-          return;
+          
+          // [AUTO-RESTART] Instead of stopping, reset balance baseline and continue
+          // This allows the bot to close losing positions and immediately look for new opportunities
+          await this.logEvent("AUTO_RESTART", "SYSTEM", "Drawdown limit hit. All positions closed. Resetting balance baseline and resuming scan for new opportunities.");
+          
+          // Reset the initial balance to current balance so drawdown is calculated fresh
+          try {
+            const freshBalance = await this.config.gateioClient.getBalance();
+            this.initialBalance = parseFloat(freshBalance.totalBalance);
+            await this.logEvent("AUTO_RESTART", "SYSTEM", `New balance baseline: $${this.initialBalance.toFixed(2)} USDT. Resuming trading.`);
+          } catch (e) {
+            await this.logEvent("ERROR", "SYSTEM", `Failed to reset balance: ${this.errStr(e)}. Stopping bot.`);
+            await this.stop();
+            return;
+          }
+          
+          // Wait 2 minutes cooldown before resuming to let the market settle
+          await this.logEvent("AUTO_RESTART", "SYSTEM", "Cooldown: waiting 2 minutes before resuming scan...");
+          await this.sleep(2 * 60 * 1000);
+          continue; // Skip the rest of this cycle and start fresh
         }
 
         // 2. Monitor existing positions — ask AI if we should close any
