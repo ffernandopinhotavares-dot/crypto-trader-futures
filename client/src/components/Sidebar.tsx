@@ -9,6 +9,7 @@ import {
   Zap,
   Menu,
   X,
+  SlidersHorizontal,
 } from "lucide-react";
 
 type Page = "dashboard" | "futures" | "configuration" | "trades" | "logs" | "corrections" | "admin" | "settings" | "api-setup";
@@ -28,6 +29,7 @@ const menuItems = [
   { id: "logs" as Page, label: "Logs", icon: FileText },
   { id: "corrections" as Page, label: "Correções", icon: AlertTriangle },
   { id: "admin" as Page, label: "Admin", icon: ShieldCheck },
+  { id: "settings" as Page, label: "Configurações", icon: SlidersHorizontal },
 ];
 
 export function Sidebar({ currentPage, onPageChange, isOpen, onToggle }: SidebarProps) {
