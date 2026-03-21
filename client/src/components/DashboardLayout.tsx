@@ -8,9 +8,10 @@ import { ApiKeySetup } from "../pages/ApiKeySetup";
 import { SettingsPage } from "../pages/Settings";
 import { LogsPage } from "../pages/Logs";
 import { FuturesPage } from "../pages/Futures";
+import { MonitorPage } from "../pages/Monitor";
 import { RefreshCw, Power } from "lucide-react";
 
-type Page = "dashboard" | "futures" | "configuration" | "trades" | "logs" | "corrections" | "admin" | "settings" | "api-setup";
+type Page = "dashboard" | "futures" | "monitor" | "configuration" | "trades" | "logs" | "corrections" | "admin" | "settings" | "api-setup";
 
 function useCurrentTime() {
   const [time, setTime] = useState(() => new Date().toLocaleTimeString("pt-BR", { hour12: false }));
@@ -24,7 +25,7 @@ function useCurrentTime() {
 }
 
 export function DashboardLayout() {
-  const [currentPage, setCurrentPage] = useState<Page>("dashboard");
+  const [currentPage, setCurrentPage] = useState<Page>("monitor");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const currentTime = useCurrentTime();
 
@@ -63,6 +64,7 @@ export function DashboardLayout() {
   }
 
   const pageTitles: Record<Page, string> = {
+    monitor: "CryptoTrader",
     dashboard: "CryptoTrader",
     futures: "CryptoTrader",
     configuration: "CryptoTrader",
@@ -180,6 +182,7 @@ export function DashboardLayout() {
         <main style={{ flex: 1, overflow: "auto", padding: "20px 24px" }}>
           {currentPage === "dashboard" && <DashboardPage onStartBot={() => {}} />}
           {currentPage === "futures" && <FuturesPage />}
+          {currentPage === "monitor" && <MonitorPage />}
           {currentPage === "configuration" && <ConfigurationPage />}
           {currentPage === "trades" && <TradesPage />}
           {currentPage === "logs" && <LogsPage />}
