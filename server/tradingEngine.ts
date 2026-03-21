@@ -104,9 +104,10 @@ export class TradingEngine {
         await this.checkPositions();
         await this.sleep(5 * 60 * 1000);
       } catch (error) {
-        console.error("Error in trading loop:", error);
-        await this.logTrade("ERROR", `Trading loop error: ${error}`, {
-          error: String(error),
+        const errMsg = error instanceof Error ? error.message : (typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error));
+        console.error("Error in trading loop:", errMsg);
+        await this.logTrade("ERROR", `Trading loop error: ${errMsg}`, {
+          error: errMsg,
         });
       }
     }
@@ -170,10 +171,11 @@ export class TradingEngine {
         await this.closePosition(symbol, currentPrice);
       }
     } catch (error) {
-      console.error(`Error analyzing ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error analyzing ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : (typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error));
+      console.error(`Error analyzing ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error analyzing ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error),
+        error: errMsg,
       });
     }
   }
@@ -255,10 +257,11 @@ export class TradingEngine {
         `✅ Opened ${side} position on ${symbol} at ${entryPrice} with quantity ${quantity}`
       );
     } catch (error) {
-      console.error(`Error opening position on ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error opening position on ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : (typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error));
+      console.error(`Error opening position on ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error opening position on ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error),
+        error: errMsg,
       });
     }
   }
@@ -325,10 +328,11 @@ export class TradingEngine {
         `✅ Closed position on ${symbol} at ${exitPrice}. P&L: ${pnl} (${pnlPercent}%)`
       );
     } catch (error) {
-      console.error(`Error closing position on ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error closing position on ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : (typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error));
+      console.error(`Error closing position on ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error closing position on ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error),
+        error: errMsg,
       });
     }
   }
