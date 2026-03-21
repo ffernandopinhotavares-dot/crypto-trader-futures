@@ -4,7 +4,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, AreaChart, Area,
 } from "recharts";
-import { DollarSign, TrendingUp, BarChart2, Activity, Zap } from "lucide-react";
+import { DollarSign, TrendingUp, BarChart2, Activity, Zap, AlertTriangle, Square, XCircle } from "lucide-react";
 
 interface DashboardPageProps {
   onStartBot?: () => void;
@@ -25,16 +25,28 @@ function NeonCard({ children, style }: { children: React.ReactNode; style?: Reac
   );
 }
 
-// Balance bar at the top
-function BalanceBar({ balance }: { balance: any }) {
-  const total = balance?.total ?? "—";
-  const available = balance?.available ?? "—";
-  const margin = balance?.margin ?? "—";
-  const unrealizedPnl = balance?.unrealizedPnl ?? "—";
-  const openPositions = balance?.openPositions ?? 0;
+// Balance bar at the top — LIVE from Gate.io
+function BalanceBar() {
+  const { data: balance } = trpc.marketData.getBalance.useQuery(undefined, {
+    refetchInterval: 5000, // refresh every 5s
+  });
+  const { data: positions } = trpc.marketData.getPositions.useQuery(undefined, {
+    refetchInterval: 5000,
+  });
 
-  const pnlNum = typeof unrealizedPnl === "number" ? unrealizedPnl : parseFloat(unrealizedPnl);
+  const total = balance?.balance ?? "—";
+  const available = balance?.available ?? "—";
+  const margin = balance?.marginBalance ?? "—";
+  const unrealizedPnl = balance?.unrealizedPnl ?? "—";
+  const openPositions = positions?.length ?? 0;
+
+  const pnlNum = typeof unrealizedPnl === "string" ? parseFloat(unrealizedPnl) : unrealizedPnl;
   const pnlColor = !isNaN(pnlNum) && pnlNum < 0 ? "#ff4466" : "#00ff88";
+
+  const formatUsd = (val: string | number) => {
+    const n = typeof val === "string" ? parseFloat(val) : val;
+    return isNaN(n) ? "—" : n.toFixed(2);
+  };
 
   return (
     <NeonCard style={{ padding: "16px 20px", marginBottom: "20px" }}>
@@ -48,21 +60,27 @@ function BalanceBar({ balance }: { balance: any }) {
         }}>
           SALDO GATE.IO FUTURES (AO VIVO)
         </span>
+        <span style={{
+          marginLeft: "auto", fontSize: "10px", color: "#00ff8844",
+          fontFamily: "Courier New, monospace",
+        }}>
+          Atualiza a cada 5s
+        </span>
       </div>
       <div style={{
         display: "grid",
         gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
         gap: "16px",
       }}>
-        <BalanceItem label="Total" value={`$${typeof total === "number" ? total.toFixed(2) : total} USDT`} color="#00ff88" />
-        <BalanceItem label="Disponível" value={`$${typeof available === "number" ? available.toFixed(2) : available} USDT`} color="#00ff88" />
-        <BalanceItem label="Saldo de Margem" value={`$${typeof margin === "number" ? margin.toFixed(2) : margin} USDT`} color="#00ff88" />
+        <BalanceItem label="Total" value={`$${formatUsd(total)} USDT`} color="#00ff88" />
+        <BalanceItem label="Disponivel" value={`$${formatUsd(available)} USDT`} color="#00ff88" />
+        <BalanceItem label="Saldo de Margem" value={`$${formatUsd(margin)} USDT`} color="#00ff88" />
         <BalanceItem
-          label="P&L não realizado"
-          value={`${!isNaN(pnlNum) && pnlNum >= 0 ? "+" : ""}${typeof unrealizedPnl === "number" ? unrealizedPnl.toFixed(4) : unrealizedPnl} USDT`}
+          label="P&L nao realizado"
+          value={`${!isNaN(pnlNum) && pnlNum >= 0 ? "+" : ""}${formatUsd(unrealizedPnl)} USDT`}
           color={pnlColor}
         />
-        <BalanceItem label="Posições abertas" value={String(openPositions)} color="#ffffff" />
+        <BalanceItem label="Posicoes abertas" value={String(openPositions)} color="#ffffff" />
       </div>
     </NeonCard>
   );
@@ -78,6 +96,87 @@ function BalanceItem({ label, value, color }: { label: string; value: string; co
         {value}
       </p>
     </div>
+  );
+}
+
+// Live positions table
+function LivePositions() {
+  const { data: positions } = trpc.marketData.getPositions.useQuery(undefined, {
+    refetchInterval: 5000,
+  });
+
+  if (!positions || positions.length === 0) return null;
+
+  return (
+    <NeonCard style={{ marginBottom: "20px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
+        <Activity size={14} style={{ color: "#00ff8866" }} />
+        <span style={{ fontSize: "12px", color: "#00ff8888", letterSpacing: "0.5px" }}>
+          Posicoes Abertas (Tempo Real)
+        </span>
+        <span style={{
+          marginLeft: "auto", fontSize: "11px", padding: "2px 8px",
+          borderRadius: "3px", background: "#00ff8815", color: "#00ff88",
+          border: "1px solid #00ff8830",
+        }}>
+          {positions.length} ativas
+        </span>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #00ff8815" }}>
+              {["Par", "Lado", "Tamanho", "Entrada", "Marca", "P&L", "Alavancagem"].map((h) => (
+                <th key={h} style={{
+                  padding: "8px 12px", textAlign: "left",
+                  color: "#00ff8855", fontWeight: "600",
+                  fontFamily: "Courier New, monospace",
+                }}>
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {positions.map((pos: any, i: number) => {
+              const pnl = parseFloat(pos.unrealizedPnl || "0");
+              const pnlColor = pnl >= 0 ? "#00ff88" : "#ff4466";
+              return (
+                <tr
+                  key={`${pos.symbol}-${pos.side}-${i}`}
+                  style={{ borderBottom: "1px solid #00ff8808" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "#00ff8806")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                >
+                  <td style={{ padding: "8px 12px", color: "#00ff88", fontWeight: "600" }}>{pos.symbol}</td>
+                  <td style={{ padding: "8px 12px" }}>
+                    <span style={{
+                      padding: "2px 8px", borderRadius: "3px", fontSize: "11px",
+                      background: pos.side === "LONG" ? "#00ff8815" : "#ff446615",
+                      color: pos.side === "LONG" ? "#00ff88" : "#ff4466",
+                      border: `1px solid ${pos.side === "LONG" ? "#00ff8830" : "#ff446630"}`,
+                    }}>
+                      {pos.side}
+                    </span>
+                  </td>
+                  <td style={{ padding: "8px 12px", color: "#00ff8888" }}>{pos.size}</td>
+                  <td style={{ padding: "8px 12px", color: "#00ff8888" }}>
+                    ${parseFloat(pos.entryPrice).toFixed(4)}
+                  </td>
+                  <td style={{ padding: "8px 12px", color: "#00ff8888" }}>
+                    ${parseFloat(pos.markPrice).toFixed(4)}
+                  </td>
+                  <td style={{ padding: "8px 12px", color: pnlColor, fontWeight: "600" }}>
+                    {pnl >= 0 ? "+" : ""}{pnl.toFixed(4)} USDT
+                  </td>
+                  <td style={{ padding: "8px 12px", color: "#00ff8888" }}>{pos.leverage}x</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </NeonCard>
   );
 }
 
@@ -131,7 +230,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
   const { data: botStatus, refetch: refetchStatus } = trpc.botControl.getStatus.useQuery(undefined, {
     refetchInterval: 5000,
   });
-  const { data: tradeStats, refetch: refetchStats } = trpc.trades.getStats.useQuery(undefined, {
+  const { data: tradeStats } = trpc.trades.getStats.useQuery(undefined, {
     refetchInterval: 10000,
   });
   const { data: recentTrades } = trpc.trades.getRecent.useQuery({ limit: 10 }, {
@@ -141,6 +240,26 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
   const { mutate: startBot, isPending: isStarting } = trpc.botControl.start.useMutation({
     onSuccess: () => refetchStatus(),
   });
+  const { mutate: stopBot, isPending: isStopping } = trpc.botControl.stop.useMutation({
+    onSuccess: () => refetchStatus(),
+  });
+  const { mutate: emergencyClose, isPending: isClosing } = trpc.botControl.emergencyCloseAll.useMutation({
+    onSuccess: (data) => {
+      refetchStatus();
+      const msg = data.closed.length > 0
+        ? `Fechadas ${data.closed.length} posicoes: ${data.closed.join(", ")}`
+        : "Nenhuma posicao aberta para fechar.";
+      const errMsg = data.errors.length > 0
+        ? `\nErros: ${data.errors.join(", ")}`
+        : "";
+      alert(msg + errMsg);
+    },
+    onError: (err) => {
+      alert(`Erro ao fechar posicoes: ${err.message}`);
+    },
+  });
+
+  const [showEmergencyConfirm, setShowEmergencyConfirm] = useState(false);
 
   const isRunning = botStatus?.isRunning ?? false;
   const activeConfig = configs?.[0];
@@ -148,7 +267,6 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
   // Generate P&L chart data from recent trades
   const pnlChartData = (() => {
     if (!recentTrades || recentTrades.length === 0) {
-      // Generate flat placeholder data
       return Array.from({ length: 10 }, (_, i) => ({
         label: `${i * 3}d`,
         pnl: 0,
@@ -175,14 +293,25 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
   const handleStartBot = () => {
     const configId = activeConfig?.id;
     if (!configId) {
-      alert("Nenhuma configuração encontrada. Crie uma na aba Configuração.");
+      alert("Nenhuma configuracao encontrada. Crie uma na aba Configuracao.");
       return;
     }
     startBot({ configId });
   };
 
+  const handleStopBot = () => {
+    if (confirm("Deseja parar o bot? Todas as posicoes abertas serao fechadas automaticamente.")) {
+      stopBot(undefined as any);
+    }
+  };
+
+  const handleEmergencyClose = () => {
+    setShowEmergencyConfirm(false);
+    emergencyClose(undefined as any);
+  };
+
   const totalPnl = tradeStats?.totalPnl ?? 0;
-  const todayPnl = 0; // todayPnl not tracked yet
+  const todayPnl = 0;
   const winRate = tradeStats?.winRate ?? 0;
   const totalTrades = (tradeStats?.closedTrades ?? 0) + (tradeStats?.openTrades ?? 0);
 
@@ -191,8 +320,116 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
 
   return (
     <div style={{ fontFamily: "Courier New, monospace" }}>
-      {/* Balance bar */}
-      <BalanceBar balance={null} />
+      {/* Balance bar — LIVE */}
+      <BalanceBar />
+
+      {/* Control buttons */}
+      <div style={{ display: "flex", gap: "12px", marginBottom: "20px", flexWrap: "wrap" }}>
+        {/* Start / Stop bot button */}
+        {!isRunning ? (
+          <button
+            onClick={handleStartBot}
+            disabled={isStarting}
+            style={{
+              display: "flex", alignItems: "center", gap: "8px",
+              padding: "10px 20px", borderRadius: "6px",
+              background: "#00ff8815", border: "1px solid #00ff8840",
+              color: "#00ff88", fontSize: "13px",
+              fontFamily: "Courier New, monospace", fontWeight: "600",
+              cursor: isStarting ? "not-allowed" : "pointer",
+              opacity: isStarting ? 0.6 : 1,
+            }}
+          >
+            <Zap size={15} />
+            {isStarting ? "Iniciando..." : "Iniciar Bot"}
+          </button>
+        ) : (
+          <button
+            onClick={handleStopBot}
+            disabled={isStopping}
+            style={{
+              display: "flex", alignItems: "center", gap: "8px",
+              padding: "10px 20px", borderRadius: "6px",
+              background: "#ff446615", border: "1px solid #ff446640",
+              color: "#ff4466", fontSize: "13px",
+              fontFamily: "Courier New, monospace", fontWeight: "600",
+              cursor: isStopping ? "not-allowed" : "pointer",
+              opacity: isStopping ? 0.6 : 1,
+            }}
+          >
+            <Square size={15} />
+            {isStopping ? "Parando..." : "Parar Bot"}
+          </button>
+        )}
+
+        {/* Emergency close button — ALWAYS visible */}
+        <button
+          onClick={() => setShowEmergencyConfirm(true)}
+          disabled={isClosing}
+          style={{
+            display: "flex", alignItems: "center", gap: "8px",
+            padding: "10px 20px", borderRadius: "6px",
+            background: "#ff220015", border: "1px solid #ff220040",
+            color: "#ff6633", fontSize: "13px",
+            fontFamily: "Courier New, monospace", fontWeight: "600",
+            cursor: isClosing ? "not-allowed" : "pointer",
+            opacity: isClosing ? 0.6 : 1,
+          }}
+        >
+          <AlertTriangle size={15} />
+          {isClosing ? "Fechando..." : "Fechar Tudo (Emergencia)"}
+        </button>
+      </div>
+
+      {/* Emergency confirmation modal */}
+      {showEmergencyConfirm && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.8)", display: "flex",
+          alignItems: "center", justifyContent: "center", zIndex: 9999,
+        }}>
+          <div style={{
+            background: "#0d1117", border: "2px solid #ff4466",
+            borderRadius: "12px", padding: "32px", maxWidth: "440px",
+            textAlign: "center",
+          }}>
+            <AlertTriangle size={48} style={{ color: "#ff4466", marginBottom: "16px" }} />
+            <h3 style={{ color: "#ff4466", fontSize: "18px", marginBottom: "12px" }}>
+              Fechamento de Emergencia
+            </h3>
+            <p style={{ color: "#ffffff88", fontSize: "13px", marginBottom: "24px", lineHeight: "1.6" }}>
+              Isso vai <strong style={{ color: "#ff4466" }}>fechar TODAS as posicoes abertas</strong> na Gate.io
+              imediatamente a preco de mercado e parar o bot.
+              <br /><br />
+              Esta acao nao pode ser desfeita.
+            </p>
+            <div style={{ display: "flex", gap: "12px", justifyContent: "center" }}>
+              <button
+                onClick={() => setShowEmergencyConfirm(false)}
+                style={{
+                  padding: "10px 24px", borderRadius: "6px",
+                  background: "#ffffff10", border: "1px solid #ffffff20",
+                  color: "#ffffff88", fontSize: "13px",
+                  fontFamily: "Courier New, monospace", cursor: "pointer",
+                }}
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleEmergencyClose}
+                style={{
+                  padding: "10px 24px", borderRadius: "6px",
+                  background: "#ff446630", border: "1px solid #ff4466",
+                  color: "#ff4466", fontSize: "13px", fontWeight: "700",
+                  fontFamily: "Courier New, monospace", cursor: "pointer",
+                }}
+              >
+                CONFIRMAR FECHAMENTO
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Metric cards */}
       <div style={{
@@ -216,7 +453,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
         <MetricCard
           icon={BarChart2}
           label="| Total Trades"
-          value={totalTrades.toFixed(2)}
+          value={String(totalTrades)}
           color="#00ff88"
         />
         <MetricCard
@@ -226,28 +463,6 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
           color="#ffffff"
         />
       </div>
-
-      {/* Start bot button (only when stopped) */}
-      {!isRunning && (
-        <div style={{ marginBottom: "20px" }}>
-          <button
-            onClick={handleStartBot}
-            disabled={isStarting}
-            style={{
-              display: "flex", alignItems: "center", gap: "8px",
-              padding: "10px 20px", borderRadius: "6px",
-              background: "#00ff8815", border: "1px solid #00ff8840",
-              color: "#00ff88", fontSize: "13px",
-              fontFamily: "Courier New, monospace", fontWeight: "600",
-              cursor: isStarting ? "not-allowed" : "pointer",
-              opacity: isStarting ? 0.6 : 1,
-            }}
-          >
-            <Zap size={15} />
-            {isStarting ? "Iniciando..." : "Iniciar Bot"}
-          </button>
-        </div>
-      )}
 
       {/* Active config info */}
       {activeConfig && (
@@ -260,7 +475,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
           {" | "}Pares: <span style={{ color: "#00ff88" }}>
             {Array.isArray(activeConfig.tradingPairs)
               ? activeConfig.tradingPairs.join(", ")
-              : "N/A"}
+              : "AI Auto-Select"}
           </span>
           {" | "}Timeframe: <span style={{ color: "#00ff88" }}>{activeConfig.timeframe}</span>
           {" | "}Status:{" "}
@@ -270,12 +485,15 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
         </div>
       )}
 
+      {/* Live positions table */}
+      <LivePositions />
+
       {/* P&L Chart */}
       <NeonCard style={{ marginBottom: "20px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
           <TrendingUp size={14} style={{ color: "#00ff8866" }} />
           <span style={{ fontSize: "12px", color: "#00ff8888", letterSpacing: "0.5px" }}>
-            P&L — últimos 30 dias
+            P&L — ultimos 30 dias
           </span>
         </div>
         <ResponsiveContainer width="100%" height={240}>
@@ -319,7 +537,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
         <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
           <BarChart2 size={14} style={{ color: "#00ff8866" }} />
           <span style={{ fontSize: "12px", color: "#00ff8888", letterSpacing: "0.5px" }}>
-            Operações Recentes
+            Operacoes Recentes
           </span>
         </div>
         <div style={{ overflowX: "auto" }}>
@@ -367,7 +585,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
                         {parseFloat(trade.quantity).toFixed(4)}
                       </td>
                       <td style={{ padding: "8px 12px", color: pnlColor, fontWeight: "600" }}>
-                        {pnl !== null ? `${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}` : "—"}
+                        {pnl !== null ? `${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)}` : "—"}
                       </td>
                       <td style={{ padding: "8px 12px" }}>
                         <span style={{
@@ -388,7 +606,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
                     padding: "32px", textAlign: "center",
                     color: "#00ff8833", fontFamily: "Courier New, monospace",
                   }}>
-                    Nenhuma operação registrada ainda
+                    Nenhuma operacao registrada ainda
                   </td>
                 </tr>
               )}
