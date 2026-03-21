@@ -542,13 +542,16 @@ Responda APENAS com JSON:
         .limit(1);
 
       if (tradeRecord.length > 0) {
+        // DB constraints: exit_reason varchar(50), pnl_percent numeric(5,2) max ±999.99
+        const truncatedReason = reason.substring(0, 50);
+        const clampedPnlPercent = Math.max(-999.99, Math.min(999.99, pnlPercent));
         await this.db.update(trades).set({
           exitPrice: exitPrice.toString(),
           exitTime: new Date(),
           pnl: pnl.toString(),
-          pnlPercent: pnlPercent.toString(),
+          pnlPercent: clampedPnlPercent.toFixed(2),
           status: "CLOSED",
-          exitReason: reason,
+          exitReason: truncatedReason,
         }).where(eq(trades.id, tradeRecord[0].id));
       }
 
