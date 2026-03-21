@@ -1219,6 +1219,11 @@ Responda APENAS com JSON:
 import { eq as eq2, and as and2, desc } from "drizzle-orm";
 import { nanoid as nanoid2 } from "nanoid";
 import GateApi2 from "gate-api";
+
+// server/engineStore.ts
+var tradingEngines = /* @__PURE__ */ new Map();
+
+// server/routers.ts
 var gateioKeysRouter = router({
   saveKeys: protectedProcedure.input(
     z.object({
@@ -1590,7 +1595,6 @@ import { eq as eq3 } from "drizzle-orm";
 import path from "path";
 var app = express();
 var PORT = process.env.PORT || 3e3;
-var tradingEngines = /* @__PURE__ */ new Map();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -1682,6 +1686,3 @@ async function startServer() {
   }
 }
 startServer();
-export {
-  tradingEngines
-};

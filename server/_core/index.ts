@@ -12,8 +12,8 @@ import path from "path";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Export trading engines map so routers can access it
-export const tradingEngines = new Map<string, TradingEngine>();
+// Import shared trading engines map
+import { tradingEngines } from "../engineStore";
 
 // Middleware
 app.use(express.json());
