@@ -343,6 +343,45 @@ const botControlRouter = router({
     return { success: true };
   }),
 
+  emergencyCloseAll: protectedProcedure.mutation(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    // Get API keys directly from DB
+    const keys = await db.select().from(bybitApiKeys).where(eq(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) throw new Error("Chaves da API não encontradas");
+
+    const gateioClient = createGateioClient({
+      apiKey: keys[0].apiKey,
+      apiSecret: keys[0].apiSecret,
+    });
+
+    // Close all positions directly on the exchange
+    const result = await gateioClient.closeAllPositions();
+
+    // Also update any OPEN trades in DB to CLOSED
+    const openTrades = await db.select().from(trades)
+      .where(and(eq(trades.userId, userId), eq(trades.status, "OPEN")));
+    for (const t of openTrades) {
+      try {
+        await db.update(trades).set({
+          status: "CLOSED",
+          exitTime: new Date(),
+          exitReason: "EMERGENCY_CLOSE",
+        }).where(eq(trades.id, t.id));
+      } catch (e) { /* ignore */ }
+    }
+
+    // Stop engine if running
+    const engine = tradingEngines.get(userId);
+    if (engine) {
+      engine.stop();
+      tradingEngines.delete(userId);
+    }
+
+    return { closed: result.closed, errors: result.errors };
+  }),
+
   getStatus: protectedProcedure.query(async ({ ctx }) => {
     const db = getDatabase();
     const userId = ctx.user?.id || "local-owner";

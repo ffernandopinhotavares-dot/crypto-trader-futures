@@ -1608,6 +1608,34 @@ var botControlRouter = router({
     tradingEngines.delete(userId);
     return { success: true };
   }),
+  emergencyCloseAll: protectedProcedure.mutation(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) throw new Error("Chaves da API n\xE3o encontradas");
+    const gateioClient = createGateioClient({
+      apiKey: keys[0].apiKey,
+      apiSecret: keys[0].apiSecret
+    });
+    const result = await gateioClient.closeAllPositions();
+    const openTrades = await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.status, "OPEN")));
+    for (const t2 of openTrades) {
+      try {
+        await db2.update(trades).set({
+          status: "CLOSED",
+          exitTime: /* @__PURE__ */ new Date(),
+          exitReason: "EMERGENCY_CLOSE"
+        }).where(eq2(trades.id, t2.id));
+      } catch (e) {
+      }
+    }
+    const engine = tradingEngines.get(userId);
+    if (engine) {
+      engine.stop();
+      tradingEngines.delete(userId);
+    }
+    return { closed: result.closed, errors: result.errors };
+  }),
   getStatus: protectedProcedure.query(async ({ ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
