@@ -385,15 +385,15 @@ var GateioClient = class _GateioClient {
   async getTopPairs(limit = 20) {
     const result = await this.futuresApi.listFuturesTickers(this.settle);
     const tickers = result.body;
-    const sorted = tickers.filter((t2) => t2.volume_24h_quote && parseFloat(t2.volume_24h_quote) > 0).sort((a, b) => parseFloat(b.volume_24h_quote || "0") - parseFloat(a.volume_24h_quote || "0")).slice(0, limit);
+    const sorted = tickers.filter((t2) => t2.volume24hQuote && parseFloat(t2.volume24hQuote) > 0).sort((a, b) => parseFloat(b.volume24hQuote || "0") - parseFloat(a.volume24hQuote || "0")).slice(0, limit);
     return sorted.map((t2) => ({
       symbol: t2.contract || "",
       lastPrice: t2.last || "0",
-      priceChangePercent: t2.change_percentage || "0",
-      volume24h: t2.volume_24h_quote || "0",
-      highPrice: t2.high_24h || "0",
-      lowPrice: t2.low_24h || "0",
-      fundingRate: t2.funding_rate || "0"
+      priceChangePercent: t2.changePercentage || "0",
+      volume24h: t2.volume24hQuote || "0",
+      highPrice: t2.high24h || "0",
+      lowPrice: t2.low24h || "0",
+      fundingRate: t2.fundingRate || "0"
     }));
   }
   async getTicker(symbol) {
@@ -408,11 +408,11 @@ var GateioClient = class _GateioClient {
     return {
       symbol: t2.contract || symbol,
       lastPrice: t2.last || "0",
-      priceChangePercent: t2.change_percentage || "0",
-      volume24h: t2.volume_24h_quote || "0",
-      highPrice: t2.high_24h || "0",
-      lowPrice: t2.low_24h || "0",
-      fundingRate: t2.funding_rate || "0"
+      priceChangePercent: t2.changePercentage || "0",
+      volume24h: t2.volume24hQuote || "0",
+      highPrice: t2.high24h || "0",
+      lowPrice: t2.low24h || "0",
+      fundingRate: t2.fundingRate || "0"
     };
   }
   async getCandles(symbol, interval = "15m", limit = 100) {
@@ -442,7 +442,7 @@ var GateioClient = class _GateioClient {
     return {
       totalBalance: account.total || "0",
       availableBalance: account.available || "0",
-      unrealizedPnl: account.unrealised_pnl || "0",
+      unrealizedPnl: account.unrealisedPnl || account.unrealised_pnl || "0",
       marginBalance: String(
         parseFloat(account.total || "0") + parseFloat(account.unrealised_pnl || "0")
       )
@@ -457,9 +457,9 @@ var GateioClient = class _GateioClient {
       symbol: p.contract || "",
       side: p.size > 0 ? "LONG" : "SHORT",
       size: String(Math.abs(p.size || 0)),
-      entryPrice: p.entry_price || "0",
-      markPrice: p.mark_price || "0",
-      unrealizedPnl: p.unrealised_pnl || "0",
+      entryPrice: p.entryPrice || p.entry_price || "0",
+      markPrice: p.markPrice || p.mark_price || "0",
+      unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
       leverage: p.leverage || "0",
       marginMode: p.mode || "single"
     }));
@@ -478,7 +478,7 @@ var GateioClient = class _GateioClient {
       // 0 = market order
       tif: params.price ? "gtc" : "ioc",
       // ioc for market, gtc for limit
-      reduce_only: params.reduceOnly || false
+      reduceOnly: params.reduceOnly || false
     };
     const result = await this.futuresApi.createFuturesOrder(this.settle, order);
     const o = result.body;
@@ -1014,7 +1014,8 @@ Responda APENAS com JSON:
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
       const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
-      const quantoMultiplier = parseFloat(contractInfo.quanto_multiplier || "0.001");
+      const quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "0.001");
+      console.log(`[EXEC] ${decision.symbol}: base=$${baseValue.toFixed(2)}, notional=$${notionalValue.toFixed(2)}, price=${currentPrice}, qm=${quantoMultiplier}`);
       const contractValue = currentPrice * quantoMultiplier;
       const rawContracts = notionalValue / contractValue;
       const contracts = Math.floor(rawContracts);

@@ -459,7 +459,8 @@ Responda APENAS com JSON:
       // Get contract info for quantity calculation
       // Gate.io uses contract size (quanto_multiplier) — size is in number of contracts
       const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
-      const quantoMultiplier = parseFloat(contractInfo.quanto_multiplier || "0.001");
+      const quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "0.001");
+      console.log(`[EXEC] ${decision.symbol}: base=$${baseValue.toFixed(2)}, notional=$${notionalValue.toFixed(2)}, price=${currentPrice}, qm=${quantoMultiplier}`);
       const contractValue = currentPrice * quantoMultiplier; // value of 1 contract in USDT
       const rawContracts = notionalValue / contractValue;
       const contracts = Math.floor(rawContracts);

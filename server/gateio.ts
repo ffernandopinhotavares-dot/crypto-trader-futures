@@ -76,20 +76,20 @@ export class GateioClient {
     const result = await this.futuresApi.listFuturesTickers(this.settle);
     const tickers = result.body;
 
-    // Sort by 24h quote volume descending, take top N
+    // SDK returns camelCase: volume24hQuote, changePercentage, high24h, low24h, fundingRate
     const sorted = tickers
-      .filter((t: any) => t.volume_24h_quote && parseFloat(t.volume_24h_quote) > 0)
-      .sort((a: any, b: any) => parseFloat(b.volume_24h_quote || "0") - parseFloat(a.volume_24h_quote || "0"))
+      .filter((t: any) => t.volume24hQuote && parseFloat(t.volume24hQuote) > 0)
+      .sort((a: any, b: any) => parseFloat(b.volume24hQuote || "0") - parseFloat(a.volume24hQuote || "0"))
       .slice(0, limit);
 
     return sorted.map((t: any) => ({
       symbol: t.contract || "",
       lastPrice: t.last || "0",
-      priceChangePercent: t.change_percentage || "0",
-      volume24h: t.volume_24h_quote || "0",
-      highPrice: t.high_24h || "0",
-      lowPrice: t.low_24h || "0",
-      fundingRate: t.funding_rate || "0",
+      priceChangePercent: t.changePercentage || "0",
+      volume24h: t.volume24hQuote || "0",
+      highPrice: t.high24h || "0",
+      lowPrice: t.low24h || "0",
+      fundingRate: t.fundingRate || "0",
     }));
   }
 
@@ -105,11 +105,11 @@ export class GateioClient {
     return {
       symbol: t.contract || symbol,
       lastPrice: t.last || "0",
-      priceChangePercent: t.change_percentage || "0",
-      volume24h: t.volume_24h_quote || "0",
-      highPrice: t.high_24h || "0",
-      lowPrice: t.low_24h || "0",
-      fundingRate: t.funding_rate || "0",
+      priceChangePercent: t.changePercentage || "0",
+      volume24h: t.volume24hQuote || "0",
+      highPrice: t.high24h || "0",
+      lowPrice: t.low24h || "0",
+      fundingRate: t.fundingRate || "0",
     };
   }
 
@@ -149,7 +149,7 @@ export class GateioClient {
     return {
       totalBalance: account.total || "0",
       availableBalance: account.available || "0",
-      unrealizedPnl: account.unrealised_pnl || "0",
+      unrealizedPnl: account.unrealisedPnl || account.unrealised_pnl || "0",
       marginBalance: String(
         parseFloat(account.total || "0") +
           parseFloat(account.unrealised_pnl || "0")
@@ -167,9 +167,9 @@ export class GateioClient {
       symbol: p.contract || "",
       side: p.size > 0 ? "LONG" : "SHORT",
       size: String(Math.abs(p.size || 0)),
-      entryPrice: p.entry_price || "0",
-      markPrice: p.mark_price || "0",
-      unrealizedPnl: p.unrealised_pnl || "0",
+      entryPrice: p.entryPrice || p.entry_price || "0",
+      markPrice: p.markPrice || p.mark_price || "0",
+      unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
       leverage: p.leverage || "0",
       marginMode: p.mode || "single",
     }));
@@ -197,7 +197,7 @@ export class GateioClient {
       size: sizeValue,
       price: params.price ? String(params.price) : "0", // 0 = market order
       tif: params.price ? "gtc" : "ioc", // ioc for market, gtc for limit
-      reduce_only: params.reduceOnly || false,
+      reduceOnly: params.reduceOnly || false,
     };
 
     const result = await this.futuresApi.createFuturesOrder(this.settle, order);
