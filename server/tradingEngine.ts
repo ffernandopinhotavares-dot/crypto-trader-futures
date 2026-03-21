@@ -101,9 +101,36 @@ export class TradingEngine {
   async stop(): Promise<void> {
     if (!this.isRunning) return;
     this.isRunning = false;
-    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
+    console.log(`AI Trading engine stopping for user ${this.config.userId}...`);
+
+    // CRITICAL: Close ALL open positions on the exchange before stopping
+    try {
+      await this.logEvent("BOT_STOP", "SYSTEM", "Closing all positions before stopping...");
+      const result = await this.config.gateioClient.closeAllPositions();
+      if (result.closed.length > 0) {
+        await this.logEvent("BOT_STOP", "SYSTEM", `Closed ${result.closed.length} positions: ${result.closed.join(", ")}`);
+      }
+      if (result.errors.length > 0) {
+        await this.logEvent("ERROR", "SYSTEM", `Failed to close ${result.errors.length} positions: ${result.errors.join("; ")}`);
+      }
+      // Also update in-memory positions and DB trades
+      for (const [symbol] of Array.from(this.positions.entries())) {
+        try {
+          const ticker = await this.config.gateioClient.getTicker(symbol);
+          const exitPrice = parseFloat(ticker.lastPrice);
+          await this.closePositionRecord(symbol, exitPrice, "BOT_STOPPED");
+        } catch (e) {
+          console.error(`Error updating trade record for ${symbol}:`, e);
+        }
+      }
+    } catch (error) {
+      console.error("Error closing positions on stop:", error);
+      await this.logEvent("ERROR", "SYSTEM", `Error closing positions: ${this.errStr(error)}`);
+    }
+
     await this.updateBotStatus({ isRunning: false });
-    await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped");
+    await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped. All positions closed.");
+    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
   }
 
   // --------------------------------------------------------------------------
@@ -521,17 +548,50 @@ Responda APENAS com JSON:
     }
   }
 
+  /**
+   * Close position on exchange AND update DB record
+   */
   private async closePosition(symbol: string, exitPrice: number, reason: string): Promise<void> {
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
 
-      // Close position via Gate.io
-      await this.config.gateioClient.closePosition(symbol);
+      // Close position via Gate.io (pass side for dual mode)
+      const positionSide = position.side === "BUY" ? "LONG" : "SHORT";
+      await this.config.gateioClient.closePosition(symbol, positionSide);
+
+      // Update DB record
+      await this.closePositionRecord(symbol, exitPrice, reason);
+    } catch (error) {
+      await this.logEvent("ERROR", symbol, `Close error: ${this.errStr(error)}`);
+    }
+  }
+
+  /**
+   * Update DB trade record and in-memory position (does NOT close on exchange)
+   * Used by stop() after closeAllPositions() already closed on exchange
+   */
+  private async closePositionRecord(symbol: string, exitPrice: number, reason: string): Promise<void> {
+    try {
+      const position = this.positions.get(symbol);
+      if (!position) return;
+
+      // Get quantoMultiplier for correct P&L calculation
+      // quantity is in CONTRACTS, not in asset units
+      // P&L = (exitPrice - entryPrice) * contracts * quantoMultiplier
+      let quantoMultiplier = 1;
+      try {
+        const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+        quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
+      } catch {
+        // If we can't get contract info, estimate from entry price
+        // For most USDT contracts, quantoMultiplier makes 1 contract ≈ $1 at current price
+        quantoMultiplier = 1 / position.entryPrice;
+      }
 
       const pnl = position.side === "BUY"
-        ? (exitPrice - position.entryPrice) * position.quantity
-        : (position.entryPrice - exitPrice) * position.quantity;
+        ? (exitPrice - position.entryPrice) * position.quantity * quantoMultiplier
+        : (position.entryPrice - exitPrice) * position.quantity * quantoMultiplier;
       const pnlPercent = position.side === "BUY"
         ? ((exitPrice - position.entryPrice) / position.entryPrice) * 100
         : ((position.entryPrice - exitPrice) / position.entryPrice) * 100;
@@ -542,7 +602,6 @@ Responda APENAS com JSON:
         .limit(1);
 
       if (tradeRecord.length > 0) {
-        // DB constraints: exit_reason varchar(50), pnl_percent numeric(5,2) max ±999.99
         const truncatedReason = reason.substring(0, 50);
         const clampedPnlPercent = Math.max(-999.99, Math.min(999.99, pnlPercent));
         await this.db.update(trades).set({
@@ -555,14 +614,35 @@ Responda APENAS com JSON:
         }).where(eq(trades.id, tradeRecord[0].id));
       }
 
+      // Update bot_status counters
+      try {
+        const statusRows = await this.db.select().from(botStatus)
+          .where(eq(botStatus.userId, this.config.userId)).limit(1);
+        if (statusRows.length > 0) {
+          const s = statusRows[0];
+          const newTotal = (s.totalTrades || 0) + 1;
+          const newWins = (s.winningTrades || 0) + (pnl > 0 ? 1 : 0);
+          const newLosses = (s.losingTrades || 0) + (pnl <= 0 ? 1 : 0);
+          const newPnl = parseFloat(s.totalPnl || "0") + pnl;
+          await this.db.update(botStatus).set({
+            totalTrades: newTotal,
+            winningTrades: newWins,
+            losingTrades: newLosses,
+            totalPnl: newPnl.toFixed(8),
+          }).where(eq(botStatus.userId, this.config.userId));
+        }
+      } catch (e) {
+        console.error("Error updating bot stats:", e);
+      }
+
       this.positions.delete(symbol);
       await this.logEvent(
         "POSITION_CLOSED",
         symbol,
-        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
+        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
       );
     } catch (error) {
-      await this.logEvent("ERROR", symbol, `Close error: ${this.errStr(error)}`);
+      await this.logEvent("ERROR", symbol, `Record close error: ${this.errStr(error)}`);
     }
   }
 

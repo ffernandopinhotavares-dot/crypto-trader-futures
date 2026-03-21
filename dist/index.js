@@ -373,10 +373,33 @@ import GateApi from "gate-api";
 var GateioClient = class _GateioClient {
   futuresApi;
   settle = "usdt";
+  isDualMode = null;
+  // cached after first check
   constructor(config) {
     const client2 = new GateApi.ApiClient();
     client2.setApiKeySecret(config.apiKey, config.apiSecret);
     this.futuresApi = new GateApi.FuturesApi(client2);
+  }
+  // ========== Dual Mode Detection ==========
+  async checkDualMode() {
+    if (this.isDualMode !== null) return this.isDualMode;
+    try {
+      const positions = await this.futuresApi.listPositions(this.settle, { holding: true });
+      const body = positions.body;
+      this.isDualMode = body.some((p) => p.mode === "dual_long" || p.mode === "dual_short");
+      if (!this.isDualMode && body.length === 0) {
+        try {
+          await this.futuresApi.getDualModePosition(this.settle, "BTC_USDT");
+          this.isDualMode = true;
+        } catch {
+          this.isDualMode = false;
+        }
+      }
+    } catch {
+      this.isDualMode = false;
+    }
+    console.log(`[GATEIO] Dual mode detected: ${this.isDualMode}`);
+    return this.isDualMode;
   }
   // ========== Public Methods (no auth needed) ==========
   static createPublicClient() {
@@ -439,13 +462,13 @@ var GateioClient = class _GateioClient {
   async getBalance() {
     const result = await this.futuresApi.listFuturesAccounts(this.settle);
     const account = result.body;
+    const total = parseFloat(account.total || "0");
+    const unrealizedPnl = parseFloat(account.unrealisedPnl || account.unrealised_pnl || "0");
     return {
       totalBalance: account.total || "0",
       availableBalance: account.available || "0",
-      unrealizedPnl: account.unrealisedPnl || account.unrealised_pnl || "0",
-      marginBalance: String(
-        parseFloat(account.total || "0") + parseFloat(account.unrealised_pnl || "0")
-      )
+      unrealizedPnl: String(unrealizedPnl),
+      marginBalance: String(total + unrealizedPnl)
     };
   }
   async getPositions() {
@@ -453,21 +476,49 @@ var GateioClient = class _GateioClient {
       holding: true
     });
     const positions = result.body;
-    return positions.map((p) => ({
-      symbol: p.contract || "",
-      side: p.size > 0 ? "LONG" : "SHORT",
-      size: String(Math.abs(p.size || 0)),
-      entryPrice: p.entryPrice || p.entry_price || "0",
-      markPrice: p.markPrice || p.mark_price || "0",
-      unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
-      leverage: p.leverage || "0",
-      marginMode: p.mode || "single"
-    }));
+    return positions.map((p) => {
+      const mode = p.mode || "single";
+      let side;
+      if (mode === "dual_long") {
+        side = "LONG";
+      } else if (mode === "dual_short") {
+        side = "SHORT";
+      } else {
+        side = p.size > 0 ? "LONG" : "SHORT";
+      }
+      return {
+        symbol: p.contract || "",
+        side,
+        size: String(Math.abs(p.size || 0)),
+        entryPrice: p.entryPrice || p.entry_price || "0",
+        markPrice: p.markPrice || p.mark_price || "0",
+        unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
+        leverage: p.leverage || p.crossLeverageLimit || "0",
+        marginMode: mode
+      };
+    });
   }
   async setLeverage(symbol, leverage) {
-    await this.futuresApi.updatePositionLeverage(this.settle, symbol, String(leverage), {
-      crossLeverageLimit: String(leverage)
-    });
+    const dual = await this.checkDualMode();
+    try {
+      if (dual) {
+        await this.futuresApi.updateDualModePositionLeverage(
+          this.settle,
+          symbol,
+          String(leverage),
+          { crossLeverageLimit: String(leverage) }
+        );
+      } else {
+        await this.futuresApi.updatePositionLeverage(
+          this.settle,
+          symbol,
+          String(leverage),
+          { crossLeverageLimit: String(leverage) }
+        );
+      }
+    } catch (e) {
+      console.log(`[GATEIO] Leverage set note for ${symbol}: ${e?.message || String(e)}`);
+    }
   }
   async placeOrder(params) {
     const sizeValue = params.side === "BUY" ? Math.abs(params.size) : -Math.abs(params.size);
@@ -476,10 +527,15 @@ var GateioClient = class _GateioClient {
       size: sizeValue,
       price: params.price ? String(params.price) : "0",
       // 0 = market order
-      tif: params.price ? "gtc" : "ioc",
+      tif: params.price ? "gtc" : "ioc"
       // ioc for market, gtc for limit
-      reduceOnly: params.reduceOnly || false
     };
+    if (params.autoSize) {
+      order.size = 0;
+      order.autoSize = params.autoSize;
+    } else if (params.reduceOnly) {
+      order.reduceOnly = true;
+    }
     const result = await this.futuresApi.createFuturesOrder(this.settle, order);
     const o = result.body;
     return {
@@ -487,41 +543,65 @@ var GateioClient = class _GateioClient {
       symbol: o.contract || params.symbol,
       side: params.side,
       size: Math.abs(o.size || params.size),
-      price: o.fill_price || o.price || "0",
+      price: o.fillPrice || o.fill_price || o.price || "0",
       status: o.status || "unknown"
     };
   }
-  async closePosition(symbol) {
+  async closePosition(symbol, positionSide) {
+    const dual = await this.checkDualMode();
     const positions = await this.getPositions();
-    const pos = positions.find((p) => p.symbol === symbol);
-    if (!pos || parseFloat(pos.size) === 0) return null;
-    const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-    return await this.placeOrder({
-      symbol,
-      side: closeSide,
-      size: Math.abs(parseFloat(pos.size)),
-      reduceOnly: true
-    });
+    if (dual) {
+      const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide));
+      if (!pos || parseFloat(pos.size) === 0) return null;
+      const autoSize = pos.side === "LONG" ? "close_long" : "close_short";
+      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+      console.log(`[GATEIO] Closing dual ${pos.side} position ${symbol}: autoSize=${autoSize}`);
+      return await this.placeOrder({
+        symbol,
+        side: closeSide,
+        size: 0,
+        // auto_size will determine
+        autoSize
+      });
+    } else {
+      const pos = positions.find((p) => p.symbol === symbol);
+      if (!pos || parseFloat(pos.size) === 0) return null;
+      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+      return await this.placeOrder({
+        symbol,
+        side: closeSide,
+        size: Math.abs(parseFloat(pos.size)),
+        reduceOnly: true
+      });
+    }
   }
   async closeAllPositions() {
     const positions = await this.getPositions();
+    const closed = [];
+    const errors = [];
     for (const pos of positions) {
       if (parseFloat(pos.size) > 0) {
         try {
-          await this.closePosition(pos.symbol);
+          await this.closePosition(pos.symbol, pos.side);
+          closed.push(`${pos.symbol} ${pos.side}`);
+          console.log(`[GATEIO] Closed ${pos.symbol} ${pos.side} (${pos.size} contracts)`);
         } catch (err) {
-          console.error(`Error closing position ${pos.symbol}:`, err);
+          const msg = `${pos.symbol} ${pos.side}: ${err?.message || String(err)}`;
+          errors.push(msg);
+          console.error(`[GATEIO] Error closing ${msg}`);
         }
       }
     }
+    return { closed, errors };
   }
   async testConnection() {
     try {
       const balance = await this.getBalance();
+      const dual = await this.checkDualMode();
       return {
         success: true,
         balance: balance.totalBalance,
-        message: "Conex\xE3o com Gate.io Futures estabelecida com sucesso"
+        message: `Conex\xE3o com Gate.io Futures estabelecida com sucesso (modo: ${dual ? "dual/hedge" : "single"})`
       };
     } catch (error) {
       throw new Error(`Falha na conex\xE3o: ${error?.message || String(error)}`);
@@ -723,9 +803,32 @@ var TradingEngine = class {
   async stop() {
     if (!this.isRunning) return;
     this.isRunning = false;
-    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
+    console.log(`AI Trading engine stopping for user ${this.config.userId}...`);
+    try {
+      await this.logEvent("BOT_STOP", "SYSTEM", "Closing all positions before stopping...");
+      const result = await this.config.gateioClient.closeAllPositions();
+      if (result.closed.length > 0) {
+        await this.logEvent("BOT_STOP", "SYSTEM", `Closed ${result.closed.length} positions: ${result.closed.join(", ")}`);
+      }
+      if (result.errors.length > 0) {
+        await this.logEvent("ERROR", "SYSTEM", `Failed to close ${result.errors.length} positions: ${result.errors.join("; ")}`);
+      }
+      for (const [symbol] of Array.from(this.positions.entries())) {
+        try {
+          const ticker = await this.config.gateioClient.getTicker(symbol);
+          const exitPrice = parseFloat(ticker.lastPrice);
+          await this.closePositionRecord(symbol, exitPrice, "BOT_STOPPED");
+        } catch (e) {
+          console.error(`Error updating trade record for ${symbol}:`, e);
+        }
+      }
+    } catch (error) {
+      console.error("Error closing positions on stop:", error);
+      await this.logEvent("ERROR", "SYSTEM", `Error closing positions: ${this.errStr(error)}`);
+    }
     await this.updateBotStatus({ isRunning: false });
-    await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped");
+    await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped. All positions closed.");
+    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
   }
   // --------------------------------------------------------------------------
   // Main Loop
@@ -1066,12 +1169,36 @@ Responda APENAS com JSON:
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
     }
   }
+  /**
+   * Close position on exchange AND update DB record
+   */
   async closePosition(symbol, exitPrice, reason) {
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
-      await this.config.gateioClient.closePosition(symbol);
-      const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity : (position.entryPrice - exitPrice) * position.quantity;
+      const positionSide = position.side === "BUY" ? "LONG" : "SHORT";
+      await this.config.gateioClient.closePosition(symbol, positionSide);
+      await this.closePositionRecord(symbol, exitPrice, reason);
+    } catch (error) {
+      await this.logEvent("ERROR", symbol, `Close error: ${this.errStr(error)}`);
+    }
+  }
+  /**
+   * Update DB trade record and in-memory position (does NOT close on exchange)
+   * Used by stop() after closeAllPositions() already closed on exchange
+   */
+  async closePositionRecord(symbol, exitPrice, reason) {
+    try {
+      const position = this.positions.get(symbol);
+      if (!position) return;
+      let quantoMultiplier = 1;
+      try {
+        const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+        quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
+      } catch {
+        quantoMultiplier = 1 / position.entryPrice;
+      }
+      const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity * quantoMultiplier : (position.entryPrice - exitPrice) * position.quantity * quantoMultiplier;
       const pnlPercent = position.side === "BUY" ? (exitPrice - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - exitPrice) / position.entryPrice * 100;
       const tradeRecord = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId))).limit(1);
       if (tradeRecord.length > 0) {
@@ -1086,14 +1213,32 @@ Responda APENAS com JSON:
           exitReason: truncatedReason
         }).where(eq(trades.id, tradeRecord[0].id));
       }
+      try {
+        const statusRows = await this.db.select().from(botStatus).where(eq(botStatus.userId, this.config.userId)).limit(1);
+        if (statusRows.length > 0) {
+          const s = statusRows[0];
+          const newTotal = (s.totalTrades || 0) + 1;
+          const newWins = (s.winningTrades || 0) + (pnl > 0 ? 1 : 0);
+          const newLosses = (s.losingTrades || 0) + (pnl <= 0 ? 1 : 0);
+          const newPnl = parseFloat(s.totalPnl || "0") + pnl;
+          await this.db.update(botStatus).set({
+            totalTrades: newTotal,
+            winningTrades: newWins,
+            losingTrades: newLosses,
+            totalPnl: newPnl.toFixed(8)
+          }).where(eq(botStatus.userId, this.config.userId));
+        }
+      } catch (e) {
+        console.error("Error updating bot stats:", e);
+      }
       this.positions.delete(symbol);
       await this.logEvent(
         "POSITION_CLOSED",
         symbol,
-        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
+        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
       );
     } catch (error) {
-      await this.logEvent("ERROR", symbol, `Close error: ${this.errStr(error)}`);
+      await this.logEvent("ERROR", symbol, `Record close error: ${this.errStr(error)}`);
     }
   }
   async closeAllPositions(reason) {

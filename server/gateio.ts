@@ -1,6 +1,6 @@
 /**
  * Gate.io Futures (USDT-M) Client
- * Replaces Binance client due to Binance geo-blocking datacenter IPs
+ * Supports DUAL MODE (hedge) — separate long/short positions per contract
  */
 import GateApi from "gate-api";
 
@@ -58,6 +58,7 @@ export interface GateioOrderResult {
 export class GateioClient {
   private futuresApi: InstanceType<typeof GateApi.FuturesApi>;
   private settle = "usdt";
+  private isDualMode: boolean | null = null; // cached after first check
 
   constructor(config: GateioConfig) {
     const client = new GateApi.ApiClient();
@@ -65,10 +66,35 @@ export class GateioClient {
     this.futuresApi = new GateApi.FuturesApi(client);
   }
 
+  // ========== Dual Mode Detection ==========
+
+  private async checkDualMode(): Promise<boolean> {
+    if (this.isDualMode !== null) return this.isDualMode;
+    try {
+      // Try to get dual mode positions — if it works, we're in dual mode
+      const positions = await this.futuresApi.listPositions(this.settle, { holding: true });
+      const body = positions.body as any[];
+      // In dual mode, positions have mode "dual_long" or "dual_short"
+      this.isDualMode = body.some((p: any) => p.mode === "dual_long" || p.mode === "dual_short");
+      if (!this.isDualMode && body.length === 0) {
+        // No positions — check by trying getDualModePosition on a common contract
+        try {
+          await this.futuresApi.getDualModePosition(this.settle, "BTC_USDT");
+          this.isDualMode = true;
+        } catch {
+          this.isDualMode = false;
+        }
+      }
+    } catch {
+      this.isDualMode = false;
+    }
+    console.log(`[GATEIO] Dual mode detected: ${this.isDualMode}`);
+    return this.isDualMode;
+  }
+
   // ========== Public Methods (no auth needed) ==========
 
   static createPublicClient(): GateioClient {
-    // Create a client without auth for public endpoints
     return new GateioClient({ apiKey: "", apiSecret: "" });
   }
 
@@ -76,7 +102,6 @@ export class GateioClient {
     const result = await this.futuresApi.listFuturesTickers(this.settle);
     const tickers = result.body;
 
-    // SDK returns camelCase: volume24hQuote, changePercentage, high24h, low24h, fundingRate
     const sorted = tickers
       .filter((t: any) => t.volume24hQuote && parseFloat(t.volume24hQuote) > 0)
       .sort((a: any, b: any) => parseFloat(b.volume24hQuote || "0") - parseFloat(a.volume24hQuote || "0"))
@@ -118,7 +143,6 @@ export class GateioClient {
     interval: string = "15m",
     limit: number = 100
   ): Promise<GateioCandle[]> {
-    // Gate.io interval format: 10s, 1m, 5m, 15m, 30m, 1h, 4h, 8h, 1d, 7d, 30d
     const result = await this.futuresApi.listFuturesCandlesticks(
       this.settle,
       symbol,
@@ -146,14 +170,13 @@ export class GateioClient {
   async getBalance(): Promise<GateioBalance> {
     const result = await this.futuresApi.listFuturesAccounts(this.settle);
     const account = result.body as any;
+    const total = parseFloat(account.total || "0");
+    const unrealizedPnl = parseFloat(account.unrealisedPnl || account.unrealised_pnl || "0");
     return {
       totalBalance: account.total || "0",
       availableBalance: account.available || "0",
-      unrealizedPnl: account.unrealisedPnl || account.unrealised_pnl || "0",
-      marginBalance: String(
-        parseFloat(account.total || "0") +
-          parseFloat(account.unrealised_pnl || "0")
-      ),
+      unrealizedPnl: String(unrealizedPnl),
+      marginBalance: String(total + unrealizedPnl),
     };
   }
 
@@ -163,22 +186,55 @@ export class GateioClient {
     });
     const positions = result.body;
 
-    return (positions as any[]).map((p: any) => ({
-      symbol: p.contract || "",
-      side: p.size > 0 ? "LONG" : "SHORT",
-      size: String(Math.abs(p.size || 0)),
-      entryPrice: p.entryPrice || p.entry_price || "0",
-      markPrice: p.markPrice || p.mark_price || "0",
-      unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
-      leverage: p.leverage || "0",
-      marginMode: p.mode || "single",
-    }));
+    return (positions as any[]).map((p: any) => {
+      const mode = p.mode || "single";
+      // In dual mode: mode is "dual_long" or "dual_short"
+      // size is always positive for dual_long, always negative for dual_short
+      let side: string;
+      if (mode === "dual_long") {
+        side = "LONG";
+      } else if (mode === "dual_short") {
+        side = "SHORT";
+      } else {
+        side = p.size > 0 ? "LONG" : "SHORT";
+      }
+
+      return {
+        symbol: p.contract || "",
+        side,
+        size: String(Math.abs(p.size || 0)),
+        entryPrice: p.entryPrice || p.entry_price || "0",
+        markPrice: p.markPrice || p.mark_price || "0",
+        unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
+        leverage: p.leverage || p.crossLeverageLimit || "0",
+        marginMode: mode,
+      };
+    });
   }
 
   async setLeverage(symbol: string, leverage: number): Promise<void> {
-    await this.futuresApi.updatePositionLeverage(this.settle, symbol, String(leverage), {
-      crossLeverageLimit: String(leverage),
-    });
+    const dual = await this.checkDualMode();
+    try {
+      if (dual) {
+        // In dual mode, use the dual-specific endpoint
+        await this.futuresApi.updateDualModePositionLeverage(
+          this.settle,
+          symbol,
+          String(leverage),
+          { crossLeverageLimit: String(leverage) }
+        );
+      } else {
+        await this.futuresApi.updatePositionLeverage(
+          this.settle,
+          symbol,
+          String(leverage),
+          { crossLeverageLimit: String(leverage) }
+        );
+      }
+    } catch (e: any) {
+      // Log but don't throw — leverage might already be set
+      console.log(`[GATEIO] Leverage set note for ${symbol}: ${e?.message || String(e)}`);
+    }
   }
 
   async placeOrder(params: {
@@ -187,6 +243,7 @@ export class GateioClient {
     size: number;
     price?: number;
     reduceOnly?: boolean;
+    autoSize?: string; // "close_long" or "close_short" for dual mode close
   }): Promise<GateioOrderResult> {
     // Gate.io uses positive size for long, negative for short
     const sizeValue =
@@ -197,8 +254,15 @@ export class GateioClient {
       size: sizeValue,
       price: params.price ? String(params.price) : "0", // 0 = market order
       tif: params.price ? "gtc" : "ioc", // ioc for market, gtc for limit
-      reduceOnly: params.reduceOnly || false,
     };
+
+    // In dual mode, use auto_size to close positions instead of reduce_only
+    if (params.autoSize) {
+      order.size = 0; // auto_size determines the size
+      order.autoSize = params.autoSize;
+    } else if (params.reduceOnly) {
+      order.reduceOnly = true;
+    }
 
     const result = await this.futuresApi.createFuturesOrder(this.settle, order);
     const o = result.body as any;
@@ -208,47 +272,78 @@ export class GateioClient {
       symbol: o.contract || params.symbol,
       side: params.side,
       size: Math.abs(o.size || params.size),
-      price: o.fill_price || o.price || "0",
+      price: o.fillPrice || o.fill_price || o.price || "0",
       status: o.status || "unknown",
     };
   }
 
-  async closePosition(symbol: string): Promise<GateioOrderResult | null> {
-    // Get current position to know the size
+  async closePosition(symbol: string, positionSide?: string): Promise<GateioOrderResult | null> {
+    const dual = await this.checkDualMode();
     const positions = await this.getPositions();
-    const pos = positions.find((p) => p.symbol === symbol);
-    if (!pos || parseFloat(pos.size) === 0) return null;
 
-    // Close by placing opposite order
-    const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-    return await this.placeOrder({
-      symbol,
-      side: closeSide,
-      size: Math.abs(parseFloat(pos.size)),
-      reduceOnly: true,
-    });
+    if (dual) {
+      // In dual mode, we need to close the specific side
+      // positionSide should be "LONG" or "SHORT"
+      const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide));
+      if (!pos || parseFloat(pos.size) === 0) return null;
+
+      // Use auto_size to close: "close_long" closes long, "close_short" closes short
+      const autoSize = pos.side === "LONG" ? "close_long" : "close_short";
+      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+
+      console.log(`[GATEIO] Closing dual ${pos.side} position ${symbol}: autoSize=${autoSize}`);
+
+      return await this.placeOrder({
+        symbol,
+        side: closeSide,
+        size: 0, // auto_size will determine
+        autoSize,
+      });
+    } else {
+      // Single mode: use reduce_only
+      const pos = positions.find((p) => p.symbol === symbol);
+      if (!pos || parseFloat(pos.size) === 0) return null;
+
+      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+      return await this.placeOrder({
+        symbol,
+        side: closeSide,
+        size: Math.abs(parseFloat(pos.size)),
+        reduceOnly: true,
+      });
+    }
   }
 
-  async closeAllPositions(): Promise<void> {
+  async closeAllPositions(): Promise<{ closed: string[]; errors: string[] }> {
     const positions = await this.getPositions();
+    const closed: string[] = [];
+    const errors: string[] = [];
+
     for (const pos of positions) {
       if (parseFloat(pos.size) > 0) {
         try {
-          await this.closePosition(pos.symbol);
-        } catch (err) {
-          console.error(`Error closing position ${pos.symbol}:`, err);
+          await this.closePosition(pos.symbol, pos.side);
+          closed.push(`${pos.symbol} ${pos.side}`);
+          console.log(`[GATEIO] Closed ${pos.symbol} ${pos.side} (${pos.size} contracts)`);
+        } catch (err: any) {
+          const msg = `${pos.symbol} ${pos.side}: ${err?.message || String(err)}`;
+          errors.push(msg);
+          console.error(`[GATEIO] Error closing ${msg}`);
         }
       }
     }
+
+    return { closed, errors };
   }
 
   async testConnection(): Promise<{ success: boolean; balance: string; message: string }> {
     try {
       const balance = await this.getBalance();
+      const dual = await this.checkDualMode();
       return {
         success: true,
         balance: balance.totalBalance,
-        message: "Conexão com Gate.io Futures estabelecida com sucesso",
+        message: `Conexão com Gate.io Futures estabelecida com sucesso (modo: ${dual ? "dual/hedge" : "single"})`,
       };
     } catch (error: any) {
       throw new Error(`Falha na conexão: ${error?.message || String(error)}`);
