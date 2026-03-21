@@ -261,13 +261,9 @@ var botStatus = pgTable(
     winningTrades: integer("winning_trades").default(0),
     losingTrades: integer("losing_trades").default(0),
     totalPnl: numeric("total_pnl", { precision: 20, scale: 8 }).default("0"),
-    totalPnlPercent: numeric("total_pnl_percent", { precision: 5, scale: 2 }).default("0"),
-    currentBalance: numeric("current_balance", { precision: 20, scale: 8 }).default("0"),
-    initialBalance: numeric("initial_balance", { precision: 20, scale: 8 }).default("0"),
-    maxDrawdownPercent: numeric("max_drawdown_percent", { precision: 5, scale: 2 }).default("0"),
-    winRate: numeric("win_rate", { precision: 5, scale: 2 }).default("0"),
-    lastTradeTime: timestamp("last_trade_time"),
-    lastUpdateTime: timestamp("last_update_time").defaultNow(),
+    startedAt: timestamp("started_at"),
+    stoppedAt: timestamp("stopped_at"),
+    lastHeartbeat: timestamp("last_heartbeat"),
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow()
   },
@@ -372,204 +368,230 @@ var protectedProcedure = t.procedure;
 // server/routers.ts
 import { z } from "zod";
 
-// server/bybit.ts
-import { RestClientV5 } from "bybit-api";
-var BybitClient = class {
+// server/binance.ts
+import { USDMClient } from "binance";
+var BinanceClient = class {
   client;
   constructor(config) {
-    this.client = new RestClientV5({
-      key: config.apiKey,
-      secret: config.apiSecret,
-      testnet: config.testnet ?? false,
-      // Use the NL/EU endpoint which avoids CloudFront geo-blocking on US servers
-      // This is the recommended approach for servers hosted in regions that face 403 errors
-      baseUrl: config.testnet ? "https://api-testnet.bybit.com" : "https://api.bytick.com",
-      recv_window: 1e4
+    this.client = new USDMClient({
+      api_key: config.apiKey,
+      api_secret: config.apiSecret,
+      ...config.testnet ? { baseUrl: "https://testnet.binancefuture.com" } : {}
     });
   }
   /**
-   * Get account balance
+   * Get account balance (USDT futures)
    */
   async getBalance() {
-    const response = await this.client.getWalletBalance({
-      accountType: "UNIFIED"
-    });
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list[0]?.coin ?? [];
+    const balances = await this.client.getBalance();
+    return balances.map((b) => ({
+      coin: b.asset,
+      walletBalance: b.balance
+    }));
+  }
+  /**
+   * Get account info (includes balance, unrealized PnL, positions count)
+   */
+  async getAccountInfo() {
+    const account = await this.client.getAccountInformation();
+    const positions = account.positions.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
+      symbol: p.symbol,
+      positionSide: p.positionSide,
+      positionAmt: p.positionAmt,
+      entryPrice: p.entryPrice,
+      markPrice: p.markPrice ?? "0",
+      unrealizedProfit: p.unrealizedProfit,
+      leverage: p.leverage,
+      notional: p.notional ?? "0"
+    }));
+    return {
+      totalWalletBalance: account.totalWalletBalance,
+      availableBalance: account.availableBalance,
+      totalMarginBalance: account.totalMarginBalance,
+      totalUnrealizedProfit: account.totalUnrealizedProfit,
+      positions
+    };
   }
   /**
    * Get open positions
    */
   async getPositions(symbol) {
-    const params = {
-      category: "linear",
-      settleCoin: "USDT"
-    };
-    if (symbol) params.symbol = symbol;
-    const response = await this.client.getPositionInfo(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list;
+    const positions = await this.client.getPositions(symbol ? { symbol } : void 0);
+    return positions.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
+      symbol: p.symbol,
+      positionSide: p.positionSide,
+      positionAmt: p.positionAmt,
+      entryPrice: p.entryPrice,
+      markPrice: p.markPrice ?? "0",
+      unrealizedProfit: p.unrealizedProfit,
+      leverage: p.leverage,
+      notional: p.notional ?? "0"
+    }));
   }
   /**
    * Place order
    */
   async placeOrder(symbol, side, orderType, qty, price) {
     const params = {
-      category: "linear",
       symbol,
       side,
-      orderType,
-      qty,
-      timeInForce: "GTC"
+      type: orderType,
+      quantity: qty
     };
-    if (orderType === "Limit" && price) {
+    if (orderType === "LIMIT" && price) {
       params.price = price;
+      params.timeInForce = "GTC";
     }
-    const response = await this.client.submitOrder(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result;
+    const response = await this.client.submitNewOrder(params);
+    return { orderId: String(response.orderId) };
   }
   /**
    * Cancel order
    */
   async cancelOrder(symbol, orderId) {
-    const response = await this.client.cancelOrder({
-      category: "linear",
+    await this.client.cancelOrder({
       symbol,
-      orderId
+      orderId: parseInt(orderId)
     });
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
   }
   /**
    * Get order history
    */
   async getOrderHistory(symbol, limit = 50) {
-    const params = {
-      category: "linear",
-      limit
-    };
+    const params = { limit };
     if (symbol) params.symbol = symbol;
-    const response = await this.client.getHistoricOrders(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list;
+    const orders = await this.client.getAllOrders(params);
+    return orders.map((o) => ({
+      orderId: String(o.orderId),
+      symbol: o.symbol,
+      side: o.side,
+      type: o.type,
+      price: o.price,
+      origQty: o.origQty,
+      status: o.status,
+      time: o.time,
+      updateTime: o.updateTime
+    }));
   }
   /**
    * Get klines (candlestick data)
    */
   async getKlines(symbol, interval, limit = 200, startTime) {
     const params = {
-      category: "linear",
       symbol,
       interval,
       limit
     };
-    if (startTime) params.start = startTime;
-    const response = await this.client.getKline(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list.map((k) => ({
-      startTime: k[0],
-      openPrice: k[1],
-      highPrice: k[2],
-      lowPrice: k[3],
-      closePrice: k[4],
-      volume: k[5],
-      turnover: k[6]
+    if (startTime) params.startTime = startTime;
+    const klines = await this.client.getKlines(params);
+    return klines.map((k) => ({
+      startTime: String(k[0]),
+      openPrice: String(k[1]),
+      highPrice: String(k[2]),
+      lowPrice: String(k[3]),
+      closePrice: String(k[4]),
+      volume: String(k[5]),
+      turnover: String(k[7])
+      // quoteAssetVolume
     }));
   }
   /**
    * Get ticker (current price and stats)
    */
   async getTicker(symbol) {
-    const response = await this.client.getTickers({
-      category: "linear",
-      symbol
-    });
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list[0];
+    const ticker = await this.client.get24hrChangeStatistics({ symbol });
+    const t2 = Array.isArray(ticker) ? ticker[0] : ticker;
+    return {
+      symbol: t2.symbol,
+      lastPrice: t2.lastPrice,
+      highPrice: t2.highPrice,
+      lowPrice: t2.lowPrice,
+      prevClosePrice: t2.prevClosePrice,
+      volume: t2.volume,
+      quoteVolume: t2.quoteVolume,
+      bidPrice: t2.bidPrice ?? t2.lastPrice,
+      askPrice: t2.askPrice ?? t2.lastPrice
+    };
   }
   /**
-   * Get instrument info
+   * Get exchange info (instruments)
    */
   async getInstruments(symbol) {
-    const params = { category: "linear" };
-    if (symbol) params.symbol = symbol;
-    const response = await this.client.getInstrumentsInfo(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    const info = await this.client.getExchangeInfo();
+    let symbols = info.symbols;
+    if (symbol) {
+      symbols = symbols.filter((s) => s.symbol === symbol);
     }
-    return response.result.list;
+    return symbols.map((s) => ({
+      symbol: s.symbol,
+      baseAsset: s.baseAsset,
+      quoteAsset: s.quoteAsset,
+      filters: s.filters,
+      status: s.status
+    }));
   }
   /**
-   * Get all trading pairs
+   * Get all USDT perpetual trading pairs
    */
   async getAllInstruments() {
-    const response = await this.client.getInstrumentsInfo({ category: "linear" });
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list;
+    const info = await this.client.getExchangeInfo();
+    return info.symbols.filter((s) => s.quoteAsset === "USDT" && s.status === "TRADING").map((s) => ({
+      symbol: s.symbol,
+      baseAsset: s.baseAsset,
+      quoteAsset: s.quoteAsset,
+      filters: s.filters,
+      status: s.status
+    }));
   }
   /**
    * Set leverage
    */
   async setLeverage(symbol, leverage) {
-    const response = await this.client.setLeverage({
-      category: "linear",
-      symbol,
-      buyLeverage: leverage.toString(),
-      sellLeverage: leverage.toString()
-    });
-    if (response.retCode !== 0 && response.retCode !== 110043) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
+    await this.client.setLeverage({ symbol, leverage });
   }
   /**
-   * Set stop loss and take profit
+   * Place order with stop loss and take profit (using STOP_MARKET and TAKE_PROFIT_MARKET)
    */
   async setStopLossTakeProfit(symbol, side, stopLoss, takeProfit) {
-    const params = {
-      category: "linear",
-      symbol,
-      side
-    };
-    if (stopLoss) params.stopLoss = stopLoss;
-    if (takeProfit) params.takeProfit = takeProfit;
-    const response = await this.client.setTPSLMode(params);
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    const closeSide = side === "BUY" ? "SELL" : "BUY";
+    if (stopLoss) {
+      await this.client.submitNewOrder({
+        symbol,
+        side: closeSide,
+        type: "STOP_MARKET",
+        stopPrice: stopLoss,
+        closePosition: "true"
+      });
+    }
+    if (takeProfit) {
+      await this.client.submitNewOrder({
+        symbol,
+        side: closeSide,
+        type: "TAKE_PROFIT_MARKET",
+        stopPrice: takeProfit,
+        closePosition: "true"
+      });
     }
   }
   /**
    * Get funding rate
    */
   async getFundingRate(symbol) {
-    const response = await this.client.getFundingRateHistory({
-      category: "linear",
-      symbol,
-      limit: 1
-    });
-    if (response.retCode !== 0) {
-      throw new Error(`Bybit API Error: ${response.retMsg}`);
-    }
-    return response.result.list[0];
+    const rates = await this.client.getFundingRateHistory({ symbol, limit: 1 });
+    const r = Array.isArray(rates) ? rates[0] : rates;
+    return { fundingRate: String(r?.fundingRate ?? "0") };
+  }
+  /**
+   * Get current mark price
+   */
+  async getMarkPrice(symbol) {
+    const price = await this.client.getMarkPrice({ symbol });
+    const p = Array.isArray(price) ? price[0] : price;
+    return String(p.markPrice ?? "0");
   }
 };
-function createBybitClient(config) {
-  return new BybitClient(config);
+function createBinanceClient(config) {
+  return new BinanceClient(config);
 }
 
 // server/indicators.ts
@@ -787,27 +809,19 @@ var TradingEngine = class {
     this.config = config;
   }
   async start() {
-    if (this.isRunning) {
-      console.log("Trading engine is already running");
-      return;
-    }
+    if (this.isRunning) return;
     this.isRunning = true;
     console.log(`\u{1F680} Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
-    await this.logTrade("BOT_START", "Trading bot started", {
-      config: this.config
-    });
+    await this.logEvent("BOT_START", "SYSTEM", "Trading bot started");
     this.mainLoop();
   }
   async stop() {
-    if (!this.isRunning) {
-      console.log("Trading engine is not running");
-      return;
-    }
+    if (!this.isRunning) return;
     this.isRunning = false;
     console.log(`\u26D4 Trading engine stopped for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: false });
-    await this.logTrade("BOT_STOP", "Trading bot stopped", {});
+    await this.logEvent("BOT_STOP", "SYSTEM", "Trading bot stopped");
   }
   async mainLoop() {
     while (this.isRunning) {
@@ -818,97 +832,58 @@ var TradingEngine = class {
         await this.checkPositions();
         await this.sleep(5 * 60 * 1e3);
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
-        console.error("Error in trading loop:", errMsg);
-        await this.logTrade("ERROR", `Trading loop error: ${errMsg}`, {
-          error: errMsg
-        });
+        const msg = this.errStr(error);
+        console.error("Error in trading loop:", msg);
+        await this.logEvent("ERROR", "SYSTEM", `Trading loop error: ${msg}`);
       }
     }
   }
   async analyzeAndTrade(symbol) {
     try {
-      const klines = await this.config.bybitClient.getKlines(
+      const klines = await this.config.binanceClient.getKlines(
         symbol,
         this.timeframeToInterval(this.config.timeframe),
         200
       );
-      if (klines.length < 50) {
-        console.log(`Not enough data for ${symbol}`);
-        return;
-      }
+      if (klines.length < 50) return;
       const prices = klines.map((k) => parseFloat(k.closePrice));
       const volumes = klines.map((k) => parseFloat(k.volume));
       await this.saveCandles(symbol, klines);
       const signal = generateTradingSignal(
         prices,
         volumes,
-        {
-          period: this.config.rsiPeriod,
-          overbought: this.config.rsiOverbought,
-          oversold: this.config.rsiOversold
-        },
-        {
-          fast: this.config.macdFastPeriod,
-          slow: this.config.macdSlowPeriod,
-          signal: this.config.macdSignalPeriod
-        },
-        {
-          period: this.config.bbPeriod,
-          stdDev: this.config.bbStdDev
-        }
+        { period: this.config.rsiPeriod, overbought: this.config.rsiOverbought, oversold: this.config.rsiOversold },
+        { fast: this.config.macdFastPeriod, slow: this.config.macdSlowPeriod, signal: this.config.macdSignalPeriod },
+        { period: this.config.bbPeriod, stdDev: this.config.bbStdDev }
       );
       await this.saveIndicators(symbol, prices, volumes);
-      await this.logTrade("SIGNAL_GENERATED", `Signal for ${symbol}: ${signal.recommendation}`, {
-        symbol,
-        signal
-      });
+      await this.logEvent("SIGNAL_GENERATED", symbol, `Signal: ${signal.recommendation} (strength: ${signal.strength})`);
       if (signal.strength >= 50 && !this.positions.has(symbol)) {
-        const ticker = await this.config.bybitClient.getTicker(symbol);
+        const ticker = await this.config.binanceClient.getTicker(symbol);
         const currentPrice = parseFloat(ticker.lastPrice);
-        const positionSize = await this.calculatePositionSize(symbol, currentPrice);
-        if (positionSize > 0) {
-          await this.openPosition(symbol, "BUY", currentPrice, positionSize, prices);
-        }
+        const positionSize = await this.calculatePositionSize(currentPrice);
+        if (positionSize > 0) await this.openPosition(symbol, "BUY", currentPrice, positionSize, prices);
       } else if (signal.strength <= -50 && this.positions.has(symbol)) {
-        const ticker = await this.config.bybitClient.getTicker(symbol);
-        const currentPrice = parseFloat(ticker.lastPrice);
-        await this.closePosition(symbol, currentPrice);
+        const ticker = await this.config.binanceClient.getTicker(symbol);
+        await this.closePosition(symbol, parseFloat(ticker.lastPrice));
       }
     } catch (error) {
-      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
-      console.error(`Error analyzing ${symbol}:`, errMsg);
-      await this.logTrade("ERROR", `Error analyzing ${symbol}: ${errMsg}`, {
-        symbol,
-        error: errMsg
-      });
+      const msg = this.errStr(error);
+      console.error(`Error analyzing ${symbol}:`, msg);
+      await this.logEvent("ERROR", symbol, `Error analyzing: ${msg}`);
     }
   }
   async openPosition(symbol, side, entryPrice, quantity, prices) {
     try {
-      const order = await this.config.bybitClient.placeOrder(
-        symbol,
-        side === "BUY" ? "Buy" : "Sell",
-        "Market",
-        quantity.toString()
-      );
+      await this.config.binanceClient.setLeverage(symbol, 5);
+      const order = await this.config.binanceClient.placeOrder(symbol, side, "MARKET", quantity.toFixed(3));
       const stopLoss = entryPrice * (1 - this.config.stopLossPercent / 100);
       const takeProfit = entryPrice * (1 + this.config.takeProfitPercent / 100);
-      await this.config.bybitClient.setStopLossTakeProfit(
-        symbol,
-        side === "BUY" ? "Buy" : "Sell",
-        stopLoss.toString(),
-        takeProfit.toString()
-      );
+      await this.config.binanceClient.setStopLossTakeProfit(symbol, side, stopLoss.toFixed(2), takeProfit.toFixed(2));
       const rsi = calculateRSI(prices, this.config.rsiPeriod);
-      const macd = calculateMACD(
-        prices,
-        this.config.macdFastPeriod,
-        this.config.macdSlowPeriod,
-        this.config.macdSignalPeriod
-      );
+      const macd = calculateMACD(prices, this.config.macdFastPeriod, this.config.macdSlowPeriod, this.config.macdSignalPeriod);
       const bb = calculateBollingerBands(prices, this.config.bbPeriod, this.config.bbStdDev);
-      const trade = {
+      await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
         configId: this.config.configId,
@@ -921,62 +896,25 @@ var TradingEngine = class {
         takeProfit: takeProfit.toString(),
         status: "OPEN",
         rsiAtEntry: rsi.rsi.toString(),
-        macdAtEntry: JSON.stringify(macd),
-        bbAtEntry: JSON.stringify(bb),
+        macdAtEntry: macd,
+        bbAtEntry: bb,
         bybitOrderId: order.orderId
-      };
-      await this.db.insert(trades).values(trade);
-      this.positions.set(symbol, {
-        symbol,
-        side,
-        entryPrice,
-        quantity,
-        entryTime: /* @__PURE__ */ new Date(),
-        stopLoss,
-        takeProfit
       });
-      await this.logTrade("POSITION_OPENED", `Opened ${side} position on ${symbol}`, {
-        symbol,
-        side,
-        entryPrice,
-        quantity,
-        stopLoss,
-        takeProfit
-      });
-      console.log(
-        `\u2705 Opened ${side} position on ${symbol} at ${entryPrice} with quantity ${quantity}`
-      );
+      this.positions.set(symbol, { symbol, side, entryPrice, quantity, entryTime: /* @__PURE__ */ new Date(), stopLoss, takeProfit });
+      await this.logEvent("POSITION_OPENED", symbol, `Opened ${side} at ${entryPrice}`);
     } catch (error) {
-      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
-      console.error(`Error opening position on ${symbol}:`, errMsg);
-      await this.logTrade("ERROR", `Error opening position on ${symbol}: ${errMsg}`, {
-        symbol,
-        error: errMsg
-      });
+      await this.logEvent("ERROR", symbol, `Error opening position: ${this.errStr(error)}`);
     }
   }
   async closePosition(symbol, exitPrice) {
     try {
       const position = this.positions.get(symbol);
-      if (!position) {
-        console.log(`No position found for ${symbol}`);
-        return;
-      }
-      const closeSide = position.side === "BUY" ? "Sell" : "Buy";
-      await this.config.bybitClient.placeOrder(
-        symbol,
-        closeSide,
-        "Market",
-        position.quantity.toString()
-      );
+      if (!position) return;
+      const closeSide = position.side === "BUY" ? "SELL" : "BUY";
+      await this.config.binanceClient.placeOrder(symbol, closeSide, "MARKET", position.quantity.toFixed(3));
       const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity : (position.entryPrice - exitPrice) * position.quantity;
       const pnlPercent = (exitPrice - position.entryPrice) / position.entryPrice * 100;
-      const tradeRecord = await this.db.select().from(trades).where(
-        and(
-          eq(trades.symbol, symbol),
-          eq(trades.status, "OPEN")
-        )
-      ).limit(1);
+      const tradeRecord = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"))).limit(1);
       if (tradeRecord.length > 0) {
         await this.db.update(trades).set({
           exitPrice: exitPrice.toString(),
@@ -988,96 +926,61 @@ var TradingEngine = class {
         }).where(eq(trades.id, tradeRecord[0].id));
       }
       this.positions.delete(symbol);
-      await this.logTrade("POSITION_CLOSED", `Closed position on ${symbol}`, {
-        symbol,
-        exitPrice,
-        pnl,
-        pnlPercent
-      });
-      console.log(
-        `\u2705 Closed position on ${symbol} at ${exitPrice}. P&L: ${pnl} (${pnlPercent}%)`
-      );
+      await this.logEvent("POSITION_CLOSED", symbol, `Closed at ${exitPrice}. PnL: ${pnl.toFixed(2)}`);
     } catch (error) {
-      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
-      console.error(`Error closing position on ${symbol}:`, errMsg);
-      await this.logTrade("ERROR", `Error closing position on ${symbol}: ${errMsg}`, {
-        symbol,
-        error: errMsg
-      });
+      await this.logEvent("ERROR", symbol, `Error closing position: ${this.errStr(error)}`);
     }
   }
   async checkPositions() {
-    for (const [symbol, position] of this.positions) {
+    for (const [symbol, position] of Array.from(this.positions.entries())) {
       try {
-        const ticker = await this.config.bybitClient.getTicker(symbol);
+        const ticker = await this.config.binanceClient.getTicker(symbol);
         const currentPrice = parseFloat(ticker.lastPrice);
-        if (position.side === "BUY" && currentPrice <= position.stopLoss || position.side === "SELL" && currentPrice >= position.stopLoss) {
-          await this.closePosition(symbol, currentPrice);
-          continue;
-        }
-        if (position.side === "BUY" && currentPrice >= position.takeProfit || position.side === "SELL" && currentPrice <= position.takeProfit) {
-          await this.closePosition(symbol, currentPrice);
-          continue;
-        }
+        const slTriggered = position.side === "BUY" && currentPrice <= position.stopLoss || position.side === "SELL" && currentPrice >= position.stopLoss;
+        const tpTriggered = position.side === "BUY" && currentPrice >= position.takeProfit || position.side === "SELL" && currentPrice <= position.takeProfit;
+        if (slTriggered || tpTriggered) await this.closePosition(symbol, currentPrice);
       } catch (error) {
-        console.error(`Error checking position for ${symbol}:`, error);
+        console.error(`Error checking position ${symbol}:`, this.errStr(error));
       }
     }
   }
-  async calculatePositionSize(symbol, currentPrice) {
+  async calculatePositionSize(currentPrice) {
     try {
-      const balance = await this.config.bybitClient.getBalance();
-      const usdtBalance = balance.find((b) => b.coin === "USDT");
-      if (!usdtBalance) {
-        console.log("USDT balance not found");
-        return 0;
-      }
-      const availableBalance = parseFloat(usdtBalance.walletBalance);
-      const maxPositionValue = availableBalance * (this.config.maxPositionSize / 100);
-      const positionSize = maxPositionValue / currentPrice;
-      return Math.floor(positionSize * 100) / 100;
-    } catch (error) {
-      console.error("Error calculating position size:", error);
+      const balances = await this.config.binanceClient.getBalance();
+      const usdtBalance = balances.find((b) => b.coin === "USDT");
+      if (!usdtBalance) return 0;
+      const available = parseFloat(usdtBalance.walletBalance);
+      return Math.max(0, available * (this.config.maxPositionSize / 100) / currentPrice);
+    } catch {
       return 0;
     }
   }
   async saveCandles(symbol, klines) {
     try {
-      const candleRecords = klines.map((k) => ({
-        id: nanoid(),
-        symbol,
-        timeframe: this.config.timeframe,
-        timestamp: parseInt(k.startTime),
-        open: k.openPrice,
-        high: k.highPrice,
-        low: k.lowPrice,
-        close: k.closePrice,
-        volume: k.volume,
-        quoteAssetVolume: k.turnover
-      }));
-      await this.db.delete(candles).where(
-        and(
-          eq(candles.symbol, symbol),
-          eq(candles.timeframe, this.config.timeframe)
-        )
-      );
-      await this.db.insert(candles).values(candleRecords);
-    } catch (error) {
-      console.error("Error saving candles:", error);
+      for (const kline of klines.slice(-10)) {
+        await this.db.insert(candles).values({
+          id: nanoid(),
+          symbol,
+          timeframe: this.config.timeframe,
+          timestamp: parseInt(kline.startTime),
+          open: kline.openPrice,
+          high: kline.highPrice,
+          low: kline.lowPrice,
+          close: kline.closePrice,
+          volume: kline.volume,
+          quoteAssetVolume: kline.turnover
+        }).onConflictDoNothing();
+      }
+    } catch (_) {
     }
   }
   async saveIndicators(symbol, prices, volumes) {
     try {
       const rsi = calculateRSI(prices, this.config.rsiPeriod);
-      const macd = calculateMACD(
-        prices,
-        this.config.macdFastPeriod,
-        this.config.macdSlowPeriod,
-        this.config.macdSignalPeriod
-      );
+      const macd = calculateMACD(prices, this.config.macdFastPeriod, this.config.macdSlowPeriod, this.config.macdSignalPeriod);
       const bb = calculateBollingerBands(prices, this.config.bbPeriod, this.config.bbStdDev);
-      const volume = analyzeVolume(volumes);
-      const indicator = {
+      const vol = analyzeVolume(volumes);
+      await this.db.insert(indicators).values({
         id: nanoid(),
         symbol,
         timeframe: this.config.timeframe,
@@ -1089,60 +992,59 @@ var TradingEngine = class {
         bbUpper: bb.upper.toString(),
         bbMiddle: bb.middle.toString(),
         bbLower: bb.lower.toString(),
-        ema: "0",
-        volumeMA: volume.volumeMA.toString()
-      };
-      await this.db.insert(indicators).values(indicator);
-    } catch (error) {
-      console.error("Error saving indicators:", error);
+        volumeMA: vol.volumeMA.toString()
+      });
+    } catch (_) {
     }
   }
-  async logTrade(logType, message, details) {
+  async logEvent(type, symbol, message) {
     try {
       await this.db.insert(tradingLogs).values({
         id: nanoid(),
         userId: this.config.userId,
         configId: this.config.configId,
-        symbol: details.symbol || "SYSTEM",
-        logType,
+        symbol,
+        logType: type,
         message,
-        details: JSON.stringify(details)
+        details: null,
+        createdAt: /* @__PURE__ */ new Date()
       });
+      console.log(`[${type}] ${message}`);
     } catch (error) {
-      console.error("Error logging trade:", error);
+      console.error("Error logging event:", error);
     }
   }
-  async updateBotStatus(updates) {
+  async updateBotStatus(update) {
     try {
-      const existingStatus = await this.db.select().from(botStatus).where(eq(botStatus.userId, this.config.userId)).limit(1);
-      if (existingStatus.length > 0) {
-        await this.db.update(botStatus).set(updates).where(eq(botStatus.userId, this.config.userId));
-      } else {
+      const existing = await this.db.select().from(botStatus).where(eq(botStatus.userId, this.config.userId)).limit(1);
+      if (existing.length === 0) {
         await this.db.insert(botStatus).values({
           id: nanoid(),
           userId: this.config.userId,
           configId: this.config.configId,
-          ...updates
+          isRunning: update.isRunning ?? false,
+          startedAt: update.isRunning ? /* @__PURE__ */ new Date() : null,
+          lastHeartbeat: /* @__PURE__ */ new Date()
         });
+      } else {
+        await this.db.update(botStatus).set({
+          isRunning: update.isRunning ?? existing[0].isRunning,
+          startedAt: update.isRunning ? /* @__PURE__ */ new Date() : existing[0].startedAt,
+          lastHeartbeat: /* @__PURE__ */ new Date()
+        }).where(eq(botStatus.userId, this.config.userId));
       }
     } catch (error) {
       console.error("Error updating bot status:", error);
     }
   }
   timeframeToInterval(timeframe) {
-    const map = {
-      "1m": "1",
-      "5m": "5",
-      "15m": "15",
-      "30m": "30",
-      "1h": "60",
-      "4h": "240",
-      "1d": "D"
-    };
-    return map[timeframe] || "60";
+    return { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d" }[timeframe] || "1h";
   }
   sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((r) => setTimeout(r, ms));
+  }
+  errStr(e) {
+    return e instanceof Error ? e.message : typeof e === "object" && e !== null ? JSON.stringify(e) : String(e);
   }
   getPositions() {
     return Array.from(this.positions.values());
@@ -1156,7 +1058,7 @@ var TradingEngine = class {
 import { eq as eq2, and as and2, desc } from "drizzle-orm";
 import { nanoid as nanoid2 } from "nanoid";
 var tradingEngines = /* @__PURE__ */ new Map();
-var bybitKeysRouter = router({
+var binanceKeysRouter = router({
   saveKeys: protectedProcedure.input(
     z.object({
       apiKey: z.string().min(1),
@@ -1165,30 +1067,27 @@ var bybitKeysRouter = router({
     })
   ).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
-    const id = nanoid2();
     const userId = ctx.user?.id || "local-owner";
     await db2.delete(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId));
     await db2.insert(bybitApiKeys).values({
-      id,
+      id: nanoid2(),
       userId,
       apiKey: input.apiKey,
       apiSecret: input.apiSecret,
       testnet: input.testnet,
       isActive: true
     });
-    return { success: true, id };
+    return { success: true };
   }),
   getKeys: protectedProcedure.query(async ({ ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
     const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
-    if (keys.length === 0) {
-      return null;
-    }
+    if (keys.length === 0) return null;
     const key = keys[0];
     return {
       id: key.id,
-      apiKey: key.apiKey?.substring(0, 10) + "***",
+      apiKey: key.apiKey?.substring(0, 8) + "***",
       testnet: key.testnet,
       isActive: key.isActive
     };
@@ -1198,6 +1097,31 @@ var bybitKeysRouter = router({
     const userId = ctx.user?.id || "local-owner";
     await db2.delete(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId));
     return { success: true };
+  }),
+  testConnection: protectedProcedure.mutation(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) {
+      throw new Error("Chaves da API Binance n\xE3o configuradas");
+    }
+    const apiKey = keys[0];
+    const client2 = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false
+    });
+    try {
+      const balances = await client2.getBalance();
+      const usdtBalance = balances.find((b) => b.coin === "USDT");
+      return {
+        success: true,
+        balance: usdtBalance?.walletBalance ?? "0",
+        message: "Conex\xE3o com Binance Futures estabelecida com sucesso"
+      };
+    } catch (error) {
+      throw new Error(`Falha na conex\xE3o: ${error?.message || String(error)}`);
+    }
   })
 });
 var tradingConfigRouter = router({
@@ -1224,14 +1148,14 @@ var tradingConfigRouter = router({
     })
   ).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
-    const id = nanoid2();
     const userId = ctx.user?.id || "local-owner";
+    const id = nanoid2();
     await db2.insert(tradingConfigs).values({
       id,
       userId,
       name: input.name,
       description: input.description,
-      tradingPairs: JSON.stringify(input.tradingPairs),
+      tradingPairs: input.tradingPairs,
       maxPositionSize: input.maxPositionSize.toString(),
       maxDrawdown: input.maxDrawdown.toString(),
       stopLossPercent: input.stopLossPercent.toString(),
@@ -1257,25 +1181,18 @@ var tradingConfigRouter = router({
     const configs = await db2.select().from(tradingConfigs).where(eq2(tradingConfigs.userId, userId));
     return configs.map((c) => ({
       ...c,
-      tradingPairs: typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : c.tradingPairs
+      tradingPairs: Array.isArray(c.tradingPairs) ? c.tradingPairs : typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : []
     }));
   }),
   getById: protectedProcedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    const configs = await db2.select().from(tradingConfigs).where(
-      and2(
-        eq2(tradingConfigs.id, input.id),
-        eq2(tradingConfigs.userId, userId)
-      )
-    ).limit(1);
-    if (configs.length === 0) {
-      throw new Error("Configuration not found");
-    }
+    const configs = await db2.select().from(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId))).limit(1);
+    if (configs.length === 0) throw new Error("Configura\xE7\xE3o n\xE3o encontrada");
     const c = configs[0];
     return {
       ...c,
-      tradingPairs: typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : c.tradingPairs
+      tradingPairs: Array.isArray(c.tradingPairs) ? c.tradingPairs : typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : []
     };
   }),
   update: protectedProcedure.input(
@@ -1292,29 +1209,19 @@ var tradingConfigRouter = router({
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
     const updates = {};
-    if (input.name) updates.name = input.name;
-    if (input.description) updates.description = input.description;
-    if (input.tradingPairs) updates.tradingPairs = JSON.stringify(input.tradingPairs);
-    if (input.maxPositionSize) updates.maxPositionSize = input.maxPositionSize.toString();
-    if (input.stopLossPercent) updates.stopLossPercent = input.stopLossPercent.toString();
-    if (input.takeProfitPercent) updates.takeProfitPercent = input.takeProfitPercent.toString();
-    await db2.update(tradingConfigs).set(updates).where(
-      and2(
-        eq2(tradingConfigs.id, input.id),
-        eq2(tradingConfigs.userId, userId)
-      )
-    );
+    if (input.name !== void 0) updates.name = input.name;
+    if (input.description !== void 0) updates.description = input.description;
+    if (input.tradingPairs !== void 0) updates.tradingPairs = input.tradingPairs;
+    if (input.maxPositionSize !== void 0) updates.maxPositionSize = input.maxPositionSize.toString();
+    if (input.stopLossPercent !== void 0) updates.stopLossPercent = input.stopLossPercent.toString();
+    if (input.takeProfitPercent !== void 0) updates.takeProfitPercent = input.takeProfitPercent.toString();
+    await db2.update(tradingConfigs).set(updates).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId)));
     return { success: true };
   }),
   delete: protectedProcedure.input(z.object({ id: z.string() })).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    await db2.delete(tradingConfigs).where(
-      and2(
-        eq2(tradingConfigs.id, input.id),
-        eq2(tradingConfigs.userId, userId)
-      )
-    );
+    await db2.delete(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.id), eq2(tradingConfigs.userId, userId)));
     return { success: true };
   })
 });
@@ -1322,31 +1229,23 @@ var botControlRouter = router({
   start: protectedProcedure.input(z.object({ configId: z.string() })).mutation(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    const configs = await db2.select().from(tradingConfigs).where(
-      and2(
-        eq2(tradingConfigs.id, input.configId),
-        eq2(tradingConfigs.userId, userId)
-      )
-    ).limit(1);
-    if (configs.length === 0) {
-      throw new Error("Configuration not found");
-    }
+    const configs = await db2.select().from(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.configId), eq2(tradingConfigs.userId, userId))).limit(1);
+    if (configs.length === 0) throw new Error("Configura\xE7\xE3o n\xE3o encontrada");
     const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
-    if (keys.length === 0) {
-      throw new Error("Bybit API keys not configured");
-    }
+    if (keys.length === 0) throw new Error("Chaves da API Binance n\xE3o configuradas");
     const config = configs[0];
     const apiKey = keys[0];
-    const bybitClient = createBybitClient({
+    const binanceClient = createBinanceClient({
       apiKey: apiKey.apiKey,
       apiSecret: apiKey.apiSecret,
       testnet: apiKey.testnet ?? false
     });
+    const tradingPairs2 = Array.isArray(config.tradingPairs) ? config.tradingPairs : typeof config.tradingPairs === "string" ? JSON.parse(config.tradingPairs) : ["BTCUSDT"];
     const engine = new TradingEngine({
       userId,
       configId: input.configId,
-      bybitClient,
-      tradingPairs: typeof config.tradingPairs === "string" ? JSON.parse(config.tradingPairs) : config.tradingPairs,
+      binanceClient,
+      tradingPairs: tradingPairs2,
       maxPositionSize: parseFloat(config.maxPositionSize ?? "5"),
       maxDrawdown: parseFloat(config.maxDrawdown ?? "10"),
       stopLossPercent: parseFloat(config.stopLossPercent ?? "2"),
@@ -1370,9 +1269,7 @@ var botControlRouter = router({
   stop: protectedProcedure.mutation(async ({ ctx }) => {
     const userId = ctx.user?.id || "local-owner";
     const engine = tradingEngines.get(userId);
-    if (!engine) {
-      throw new Error("Trading bot not running");
-    }
+    if (!engine) throw new Error("Bot de trading n\xE3o est\xE1 em execu\xE7\xE3o");
     await engine.stop();
     tradingEngines.delete(userId);
     return { success: true };
@@ -1381,29 +1278,106 @@ var botControlRouter = router({
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
     const status = await db2.select().from(botStatus).where(eq2(botStatus.userId, userId)).limit(1);
+    const engineRunning = tradingEngines.has(userId);
     if (status.length === 0) {
-      return null;
+      return { isRunning: engineRunning, isPaused: false };
     }
-    return status[0];
+    return { ...status[0], isRunning: engineRunning || status[0].isRunning };
+  })
+});
+var marketDataRouter = router({
+  getTicker: protectedProcedure.input(z.object({ symbol: z.string() })).query(async ({ input }) => {
+    const { USDMClient: USDMClient2 } = await import("binance");
+    const client2 = new USDMClient2();
+    const ticker = await client2.get24hrChangeStatistics({ symbol: input.symbol });
+    const t2 = Array.isArray(ticker) ? ticker[0] : ticker;
+    return {
+      symbol: t2.symbol,
+      lastPrice: t2.lastPrice,
+      priceChangePercent: t2.priceChangePercent,
+      volume: t2.volume,
+      highPrice: t2.highPrice,
+      lowPrice: t2.lowPrice
+    };
+  }),
+  getKlines: protectedProcedure.input(
+    z.object({
+      symbol: z.string(),
+      interval: z.string().default("1h"),
+      limit: z.number().default(100)
+    })
+  ).query(async ({ input }) => {
+    const { USDMClient: USDMClient2 } = await import("binance");
+    const client2 = new USDMClient2();
+    const klines = await client2.getKlines({
+      symbol: input.symbol,
+      interval: input.interval,
+      limit: input.limit
+    });
+    return klines.map((k) => ({
+      time: k[0],
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5])
+    }));
+  }),
+  getBalance: protectedProcedure.query(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) {
+      return { balance: "0", available: "0", unrealizedPnl: "0" };
+    }
+    const apiKey = keys[0];
+    const client2 = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false
+    });
+    try {
+      const account = await client2.getAccountInfo();
+      return {
+        balance: account.totalWalletBalance,
+        available: account.availableBalance,
+        unrealizedPnl: account.totalUnrealizedProfit,
+        marginBalance: account.totalMarginBalance
+      };
+    } catch (error) {
+      console.error("Error fetching balance:", error?.message || error);
+      return { balance: "0", available: "0", unrealizedPnl: "0" };
+    }
+  }),
+  getPositions: protectedProcedure.query(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) return [];
+    const apiKey = keys[0];
+    const client2 = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false
+    });
+    try {
+      return await client2.getPositions();
+    } catch (error) {
+      console.error("Error fetching positions:", error?.message || error);
+      return [];
+    }
   })
 });
 var tradesRouter = router({
   getRecent: protectedProcedure.input(z.object({ limit: z.number().default(50) })).query(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    const tradeList = await db2.select().from(trades).where(eq2(trades.userId, userId)).orderBy(desc(trades.createdAt)).limit(input.limit);
-    return tradeList;
+    return await db2.select().from(trades).where(eq2(trades.userId, userId)).orderBy(desc(trades.createdAt)).limit(input.limit);
   }),
   getBySymbol: protectedProcedure.input(z.object({ symbol: z.string(), limit: z.number().default(50) })).query(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    const tradeList = await db2.select().from(trades).where(
-      and2(
-        eq2(trades.userId, userId),
-        eq2(trades.symbol, input.symbol)
-      )
-    ).orderBy(desc(trades.createdAt)).limit(input.limit);
-    return tradeList;
+    return await db2.select().from(trades).where(and2(eq2(trades.userId, userId), eq2(trades.symbol, input.symbol))).orderBy(desc(trades.createdAt)).limit(input.limit);
   }),
   getStats: protectedProcedure.query(async ({ ctx }) => {
     const db2 = getDatabase();
@@ -1412,10 +1386,7 @@ var tradesRouter = router({
     const closedTrades = tradeList.filter((t2) => t2.status === "CLOSED");
     const winningTrades = closedTrades.filter((t2) => parseFloat(t2.pnl || "0") > 0);
     const losingTrades = closedTrades.filter((t2) => parseFloat(t2.pnl || "0") < 0);
-    const totalPnl = closedTrades.reduce(
-      (sum, t2) => sum + parseFloat(t2.pnl || "0"),
-      0
-    );
+    const totalPnl = closedTrades.reduce((sum, t2) => sum + parseFloat(t2.pnl || "0"), 0);
     return {
       totalTrades: tradeList.length,
       openTrades: tradeList.filter((t2) => t2.status === "OPEN").length,
@@ -1432,14 +1403,16 @@ var logsRouter = router({
   getRecent: protectedProcedure.input(z.object({ limit: z.number().default(100) })).query(async ({ input, ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-    const logList = await db2.select().from(tradingLogs).where(eq2(tradingLogs.userId, userId)).orderBy(desc(tradingLogs.createdAt)).limit(input.limit);
-    return logList;
+    return await db2.select().from(tradingLogs).where(eq2(tradingLogs.userId, userId)).orderBy(desc(tradingLogs.createdAt)).limit(input.limit);
   })
 });
 var appRouter = router({
-  bybitKeys: bybitKeysRouter,
+  binanceKeys: binanceKeysRouter,
+  // Keep bybitKeys as alias for backward compatibility with any existing frontend calls
+  bybitKeys: binanceKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,
+  marketData: marketDataRouter,
   trades: tradesRouter,
   logs: logsRouter
 });

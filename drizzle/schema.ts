@@ -305,16 +305,10 @@ export const botStatus = pgTable(
     losingTrades: integer("losing_trades").default(0),
 
     totalPnl: numeric("total_pnl", { precision: 20, scale: 8 }).default("0"),
-    totalPnlPercent: numeric("total_pnl_percent", { precision: 5, scale: 2 }).default("0"),
 
-    currentBalance: numeric("current_balance", { precision: 20, scale: 8 }).default("0"),
-    initialBalance: numeric("initial_balance", { precision: 20, scale: 8 }).default("0"),
-
-    maxDrawdownPercent: numeric("max_drawdown_percent", { precision: 5, scale: 2 }).default("0"),
-    winRate: numeric("win_rate", { precision: 5, scale: 2 }).default("0"),
-
-    lastTradeTime: timestamp("last_trade_time"),
-    lastUpdateTime: timestamp("last_update_time").defaultNow(),
+    startedAt: timestamp("started_at"),
+    stoppedAt: timestamp("stopped_at"),
+    lastHeartbeat: timestamp("last_heartbeat"),
 
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow(),
