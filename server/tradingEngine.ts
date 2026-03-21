@@ -76,6 +76,10 @@ export class TradingEngine {
   private cycleCount: number = 0;
   private initialBalance: number = 0;
 
+  // [CREDIT GUARD] Track consecutive AI 402/credit errors
+  private consecutiveAIErrors: number = 0;
+  private static readonly MAX_CONSECUTIVE_AI_ERRORS = 3; // Close all after 3 consecutive failures
+
   // [FIX 5.8] Cache for contract info and tickers
   private contractInfoCache: Map<string, { data: any; cachedAt: number }> = new Map();
   private allTickersCache: { data: any[] | null; cachedAt: number } = { data: null, cachedAt: 0 };
@@ -508,6 +512,9 @@ Responda APENAS com um JSON array:
         max_tokens: 2000,
       });
 
+      // [CREDIT GUARD] Reset error counter on success
+      this.consecutiveAIErrors = 0;
+
       const content = response.choices[0]?.message?.content ?? "[]";
       console.log(`[AI] Raw response: ${content.substring(0, 300)}`);
       const jsonMatch = content.match(/\[[\s\S]*\]/);
@@ -519,7 +526,11 @@ Responda APENAS com um JSON array:
       console.log(`[AI] Got ${decisions.length} decisions: ${decisions.map(d => `${d.action} ${d.symbol} conf:${d.confidence}`).join(', ')}`);
       return decisions;
     } catch (error) {
-      await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${this.errStr(error)}`);
+      const errMsg = this.errStr(error);
+      await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${errMsg}`);
+
+      // [CREDIT GUARD] Detect 402 / credit exhaustion errors
+      await this.handleAIError(errMsg);
       return [];
     }
   }
@@ -584,13 +595,55 @@ Responda APENAS com JSON:
         max_tokens: 500,
       });
 
+      // [CREDIT GUARD] Reset error counter on success
+      this.consecutiveAIErrors = 0;
+
       const content = response.choices[0]?.message?.content ?? '{"action":"HOLD"}';
       const jsonMatch = content.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "Parse error" };
       return JSON.parse(jsonMatch[0]) as AIDecision;
     } catch (error) {
-      await this.logEvent("ERROR", "AI", `AI position management failed: ${this.errStr(error)}`);
+      const errMsg = this.errStr(error);
+      await this.logEvent("ERROR", "AI", `AI position management failed: ${errMsg}`);
+
+      // [CREDIT GUARD] Detect 402 / credit exhaustion errors
+      await this.handleAIError(errMsg);
       return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "AI error - holding" };
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // [CREDIT GUARD] Detect AI credit exhaustion and trigger emergency close
+  // --------------------------------------------------------------------------
+
+  private async handleAIError(errMsg: string): Promise<void> {
+    const isCreditError = errMsg.includes("402") ||
+      errMsg.toLowerCase().includes("insufficient credits") ||
+      errMsg.toLowerCase().includes("credit") ||
+      errMsg.toLowerCase().includes("quota") ||
+      errMsg.toLowerCase().includes("billing");
+
+    if (isCreditError) {
+      this.consecutiveAIErrors++;
+      await this.logEvent("WARNING", "AI",
+        `[CREDIT GUARD] AI credit error #${this.consecutiveAIErrors}/${TradingEngine.MAX_CONSECUTIVE_AI_ERRORS}: ${errMsg}`);
+
+      if (this.consecutiveAIErrors >= TradingEngine.MAX_CONSECUTIVE_AI_ERRORS) {
+        await this.logEvent("CRITICAL", "SYSTEM",
+          `[CREDIT GUARD] 🚨 AI credits EXHAUSTED after ${this.consecutiveAIErrors} consecutive errors. ` +
+          `EMERGENCY CLOSING ALL ${this.positions.size} POSITIONS to prevent unmanaged exposure.`);
+
+        // Close all positions immediately
+        await this.closeAllPositions("AI_CREDITS_EXHAUSTED");
+
+        // Stop the bot — it cannot operate safely without AI
+        await this.logEvent("CRITICAL", "SYSTEM",
+          `[CREDIT GUARD] Bot STOPPED. Recarregue os créditos da API de IA e reinicie o bot manualmente.`);
+        await this.stop();
+      }
+    } else {
+      // Non-credit error: reset counter (transient failure)
+      this.consecutiveAIErrors = 0;
     }
   }
 
