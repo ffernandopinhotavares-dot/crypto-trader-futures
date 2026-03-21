@@ -483,8 +483,8 @@ Responda APENAS com JSON:
         takeProfit: "0",
         status: "OPEN",
         rsiAtEntry: String(decision.confidence),
-        macdAtEntry: `lev:${decision.leverage}x`,
-        bbAtEntry: decision.reasoning,
+        macdAtEntry: JSON.stringify({ leverage: decision.leverage }),
+        bbAtEntry: JSON.stringify({ reasoning: decision.reasoning }),
         bybitOrderId: order.orderId,
       });
 
@@ -612,6 +612,23 @@ Responda APENAS com JSON:
     } catch (_) {}
   }
 
+  // Map engine log types to DB enum values
+  private mapLogType(type: string): string {
+    const mapping: Record<string, string> = {
+      "BOT_START": "BOT_START",
+      "BOT_STOP": "BOT_STOP",
+      "CYCLE_START": "INFO",
+      "RISK_STOP": "ERROR",
+      "POSITION_OPENED": "POSITION_OPENED",
+      "POSITION_CLOSED": "POSITION_CLOSED",
+      "ERROR": "ERROR",
+      "SIGNAL_GENERATED": "SIGNAL_GENERATED",
+      "ORDER_PLACED": "ORDER_PLACED",
+      "ORDER_FILLED": "ORDER_FILLED",
+    };
+    return mapping[type] || "INFO";
+  }
+
   private async logEvent(type: string, symbol: string, message: string): Promise<void> {
     try {
       await this.db.insert(tradingLogs).values({
@@ -619,7 +636,7 @@ Responda APENAS com JSON:
         userId: this.config.userId,
         configId: this.config.configId,
         symbol,
-        logType: type as any,
+        logType: this.mapLogType(type) as any,
         message,
         details: null,
         createdAt: new Date(),
