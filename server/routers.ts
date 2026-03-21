@@ -1,7 +1,7 @@
 import { router, protectedProcedure } from "./_core/trpc";
 import { z } from "zod";
 import { getDatabase } from "./db";
-import { createBinanceClient } from "./binance";
+import { createGateioClient, GateioClient } from "./gateio";
 import { TradingEngine } from "./tradingEngine";
 import {
   bybitApiKeys,
@@ -12,15 +12,16 @@ import {
 } from "../drizzle/schema";
 import { eq, and, desc } from "drizzle-orm";
 import { nanoid } from "nanoid";
+import GateApi from "gate-api";
 
 // Store active trading engines
 const tradingEngines = new Map<string, TradingEngine>();
 
 // ============================================================================
-// Binance API Keys Router (using existing bybit_api_keys table)
+// Gate.io API Keys Router (using existing bybit_api_keys table for storage)
 // ============================================================================
 
-const binanceKeysRouter = router({
+const gateioKeysRouter = router({
   saveKeys: protectedProcedure
     .input(
       z.object({
@@ -36,7 +37,7 @@ const binanceKeysRouter = router({
       // Delete existing keys for this user
       await db.delete(bybitApiKeys).where(eq(bybitApiKeys.userId, userId));
 
-      // Insert new Binance keys (reusing bybit_api_keys table)
+      // Insert new Gate.io keys (reusing bybit_api_keys table)
       await db.insert(bybitApiKeys).values({
         id: nanoid(),
         userId,
@@ -88,24 +89,18 @@ const binanceKeysRouter = router({
       .limit(1);
 
     if (keys.length === 0) {
-      throw new Error("Chaves da API Binance não configuradas");
+      throw new Error("Chaves da API Gate.io não configuradas");
     }
 
     const apiKey = keys[0];
-    const client = createBinanceClient({
+    const client = createGateioClient({
       apiKey: apiKey.apiKey,
       apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false,
     });
 
     try {
-      const balances = await client.getBalance();
-      const usdtBalance = balances.find((b) => b.coin === "USDT");
-      return {
-        success: true,
-        balance: usdtBalance?.walletBalance ?? "0",
-        message: "Conexão com Binance Futures estabelecida com sucesso",
-      };
+      const result = await client.testConnection();
+      return result;
     } catch (error: any) {
       throw new Error(`Falha na conexão: ${error?.message || String(error)}`);
     }
@@ -138,13 +133,13 @@ const tradingConfigRouter = router({
         id,
         userId,
         name: input.name,
-        description: input.description ?? `Estratégia AI ${input.aggressiveness}`,
-        tradingPairs: ["AUTO"], // AI selects pairs dynamically
+        description: `${input.aggressiveness}|${input.description ?? "Estratégia AI Autônoma"}`,
+        tradingPairs: ["AUTO"],
         maxPositionSize: input.maxRiskPerTrade.toString(),
         maxDrawdown: input.maxDrawdown.toString(),
-        stopLossPercent: "0", // AI manages dynamically
-        takeProfitPercent: "0", // AI manages dynamically
-        rsiPeriod: input.maxOpenPositions, // reuse field for maxOpenPositions
+        stopLossPercent: "0",
+        takeProfitPercent: "0",
+        rsiPeriod: input.maxOpenPositions,
         rsiOverbought: 70,
         rsiOversold: 30,
         macdFastPeriod: 12,
@@ -157,11 +152,6 @@ const tradingConfigRouter = router({
         timeframe: input.timeframe,
         isActive: false,
       });
-
-      // Store aggressiveness in description field
-      await db.update(tradingConfigs).set({
-        description: `${input.aggressiveness}|${input.description ?? "Estratégia AI Autônoma"}`,
-      }).where(eq(tradingConfigs.id, id));
 
       return { success: true, id };
     }),
@@ -176,7 +166,6 @@ const tradingConfigRouter = router({
       .where(eq(tradingConfigs.userId, userId));
 
     return configs.map((c: any) => {
-      // Parse aggressiveness from description
       const descParts = (c.description ?? "moderate|").split("|");
       const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
       const description = descParts.slice(1).join("|") || "Estratégia AI Autônoma";
@@ -250,7 +239,6 @@ const tradingConfigRouter = router({
       if (input.maxOpenPositions !== undefined) updates.rsiPeriod = input.maxOpenPositions;
       if (input.timeframe !== undefined) updates.timeframe = input.timeframe;
 
-      // Update aggressiveness in description
       if (input.aggressiveness !== undefined) {
         const existing = await db.select().from(tradingConfigs)
           .where(and(eq(tradingConfigs.id, input.id), eq(tradingConfigs.userId, userId)))
@@ -284,7 +272,7 @@ const tradingConfigRouter = router({
 });
 
 // ============================================================================
-// Bot Control Router — Autonomous AI
+// Bot Control Router — Autonomous AI (Gate.io)
 // ============================================================================
 
 const botControlRouter = router({
@@ -310,16 +298,15 @@ const botControlRouter = router({
         .where(eq(bybitApiKeys.userId, userId))
         .limit(1);
 
-      if (keys.length === 0) throw new Error("Chaves da API Binance não configuradas");
+      if (keys.length === 0) throw new Error("Chaves da API Gate.io não configuradas");
 
       const config = configs[0];
       const apiKey = keys[0];
 
-      // Create Binance client
-      const binanceClient = createBinanceClient({
+      // Create Gate.io client
+      const gateioClient = createGateioClient({
         apiKey: apiKey.apiKey,
         apiSecret: apiKey.apiSecret,
-        testnet: apiKey.testnet ?? false,
       });
 
       // Parse aggressiveness from description
@@ -330,7 +317,7 @@ const botControlRouter = router({
       const engine = new TradingEngine({
         userId,
         configId: input.configId,
-        binanceClient,
+        gateioClient,
         maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
         maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
         maxOpenPositions: config.rsiPeriod ?? 10,
@@ -377,24 +364,25 @@ const botControlRouter = router({
 });
 
 // ============================================================================
-// Market Data Router (public Binance data, no auth required)
+// Market Data Router (public Gate.io data, no auth required)
 // ============================================================================
 
 const marketDataRouter = router({
   getTicker: protectedProcedure
     .input(z.object({ symbol: z.string() }))
     .query(async ({ input }) => {
-      const { USDMClient } = await import("binance");
-      const client = new USDMClient();
-      const ticker = await client.get24hrChangeStatistics({ symbol: input.symbol });
-      const t = Array.isArray(ticker) ? ticker[0] : ticker;
+      const client = new GateApi.FuturesApi();
+      const result = await client.listFuturesTickers("usdt", { contract: input.symbol });
+      const tickers = result.body;
+      if (!tickers || tickers.length === 0) throw new Error("Ticker not found");
+      const t = tickers[0] as any;
       return {
-        symbol: (t as any).symbol,
-        lastPrice: (t as any).lastPrice,
-        priceChangePercent: (t as any).priceChangePercent,
-        volume: (t as any).volume,
-        highPrice: (t as any).highPrice,
-        lowPrice: (t as any).lowPrice,
+        symbol: t.contract || input.symbol,
+        lastPrice: t.last || "0",
+        priceChangePercent: t.change_percentage || "0",
+        volume: t.volume_24h_quote || "0",
+        highPrice: t.high_24h || "0",
+        lowPrice: t.low_24h || "0",
       };
     }),
 
@@ -407,20 +395,18 @@ const marketDataRouter = router({
       })
     )
     .query(async ({ input }) => {
-      const { USDMClient } = await import("binance");
-      const client = new USDMClient();
-      const klines = await client.getKlines({
-        symbol: input.symbol,
+      const client = new GateApi.FuturesApi();
+      const result = await client.listFuturesCandlesticks("usdt", input.symbol, {
         interval: input.interval as any,
         limit: input.limit,
       });
-      return (klines as any[]).map((k: any) => ({
-        time: k[0],
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
+      return (result.body as any[]).map((c: any) => ({
+        time: c.t ? c.t * 1000 : 0,
+        open: parseFloat(c.o || "0"),
+        high: parseFloat(c.h || "0"),
+        low: parseFloat(c.l || "0"),
+        close: parseFloat(c.c || "0"),
+        volume: parseFloat(c.v || "0"),
       }));
     }),
 
@@ -439,19 +425,18 @@ const marketDataRouter = router({
     }
 
     const apiKey = keys[0];
-    const client = createBinanceClient({
+    const client = createGateioClient({
       apiKey: apiKey.apiKey,
       apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false,
     });
 
     try {
-      const account = await client.getAccountInfo();
+      const balance = await client.getBalance();
       return {
-        balance: account.totalWalletBalance,
-        available: account.availableBalance,
-        unrealizedPnl: account.totalUnrealizedProfit,
-        marginBalance: account.totalMarginBalance,
+        balance: balance.totalBalance,
+        available: balance.availableBalance,
+        unrealizedPnl: balance.unrealizedPnl,
+        marginBalance: balance.marginBalance,
       };
     } catch (error: any) {
       console.error("Error fetching balance:", error?.message || error);
@@ -472,10 +457,9 @@ const marketDataRouter = router({
     if (keys.length === 0) return [];
 
     const apiKey = keys[0];
-    const client = createBinanceClient({
+    const client = createGateioClient({
       apiKey: apiKey.apiKey,
       apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false,
     });
 
     try {
@@ -569,9 +553,10 @@ const logsRouter = router({
 // ============================================================================
 
 export const appRouter = router({
-  binanceKeys: binanceKeysRouter,
-  // Keep bybitKeys as alias for backward compatibility
-  bybitKeys: binanceKeysRouter,
+  gateioKeys: gateioKeysRouter,
+  // Backward compatibility aliases
+  binanceKeys: gateioKeysRouter,
+  bybitKeys: gateioKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,
   marketData: marketDataRouter,

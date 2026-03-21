@@ -1,4 +1,4 @@
-import { BinanceClient, BinanceKline } from "./binance";
+import { GateioClient, GateioCandle } from "./gateio";
 import {
   calculateRSI,
   calculateMACD,
@@ -30,7 +30,7 @@ export interface TradePosition {
 export interface TradingEngineConfig {
   userId: string;
   configId: string;
-  binanceClient: BinanceClient;
+  gateioClient: GateioClient;
   // Autonomous config — no fixed pairs, no fixed SL/TP
   maxRiskPerTrade: number;     // max % of balance per trade (default 5)
   maxDrawdown: number;         // max total drawdown % before stopping (default 15)
@@ -64,7 +64,7 @@ interface AIDecision {
 }
 
 // ============================================================================
-// Trading Engine — Autonomous AI-Driven
+// Trading Engine — Autonomous AI-Driven (Gate.io Futures)
 // ============================================================================
 
 export class TradingEngine {
@@ -88,12 +88,11 @@ export class TradingEngine {
 
     // Record initial balance
     try {
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      this.initialBalance = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      this.initialBalance = parseFloat(balance.totalBalance);
     } catch { this.initialBalance = 0; }
 
-    console.log(`🚀 AI Trading engine started for user ${this.config.userId}`);
+    console.log(`AI Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
     await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}%`);
     this.mainLoop();
@@ -102,7 +101,7 @@ export class TradingEngine {
   async stop(): Promise<void> {
     if (!this.isRunning) return;
     this.isRunning = false;
-    console.log(`⛔ AI Trading engine stopped for user ${this.config.userId}`);
+    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: false });
     await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped");
   }
@@ -156,20 +155,13 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // Get top volume USDT pairs from Binance Futures
-      const allInstruments = await this.config.binanceClient.getAllInstruments();
-      const symbols = allInstruments
-        .filter((i) => i.status === "TRADING" && i.quoteAsset === "USDT")
-        .map((i) => i.symbol)
-        .slice(0, 50); // top 50
+      // Get top volume USDT pairs from Gate.io Futures
+      const topPairs = await this.config.gateioClient.getTopPairs(20);
 
-      // Get 24h tickers for all to find most active
       const snapshots: MarketSnapshot[] = [];
-      const batchSymbols = symbols.slice(0, 20); // analyze top 20 to save API calls
-
-      for (const symbol of batchSymbols) {
+      for (const pair of topPairs) {
         try {
-          const snapshot = await this.getMarketSnapshot(symbol);
+          const snapshot = await this.getMarketSnapshot(pair.symbol);
           if (snapshot) snapshots.push(snapshot);
         } catch { /* skip symbols with errors */ }
       }
@@ -182,7 +174,7 @@ export class TradingEngine {
       for (const decision of decisions) {
         if (!this.isRunning) break;
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
-        if (decision.confidence < 60) continue; // minimum confidence threshold
+        if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue; // already in position
         if (this.positions.size >= this.config.maxOpenPositions) break;
 
@@ -195,6 +187,12 @@ export class TradingEngine {
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
     }
+  }
+
+  private getMinConfidence(): number {
+    return this.config.aggressiveness === "conservative" ? 75
+      : this.config.aggressiveness === "moderate" ? 65
+      : 55;
   }
 
   // --------------------------------------------------------------------------
@@ -227,9 +225,8 @@ export class TradingEngine {
   // --------------------------------------------------------------------------
 
   private async askAIForOpportunities(snapshots: MarketSnapshot[]): Promise<AIDecision[]> {
-    const balances = await this.config.binanceClient.getBalance();
-    const usdt = balances.find((b) => b.coin === "USDT");
-    const availableBalance = parseFloat(usdt?.walletBalance ?? "0");
+    const balance = await this.config.gateioClient.getBalance();
+    const availableBalance = parseFloat(balance.availableBalance);
 
     const marketSummary = snapshots.map((s) => ({
       symbol: s.symbol,
@@ -255,6 +252,9 @@ COMPORTAMENTO:
 - Ajuste capital e alavancagem dinamicamente.
 - Prefira abrir MUITAS posições de valores BAIXOS alavancados para diversificar.
 
+EXCHANGE: Gate.io Futures (USDT-M)
+- Símbolos usam formato: BTC_USDT, ETH_USDT (com underscore)
+
 PERFIL DE RISCO: ${this.config.aggressiveness}
 - Conservative: alavancagem 1-5x, confiança mínima 75%, posições menores
 - Moderate: alavancagem 3-10x, confiança mínima 65%, posições médias
@@ -265,13 +265,12 @@ REGRAS:
 - Máximo ${this.config.maxOpenPositions} posições simultâneas (atualmente ${this.positions.size} abertas)
 - Saldo disponível: ${availableBalance.toFixed(2)} USDT
 - Considere funding rate (negativo favorece longs, positivo favorece shorts)
-- Alta volatilidade = menor alavancagem
 - Sempre considere risco de liquidação
 
 Responda APENAS com um JSON array de decisões. Cada decisão:
 {
   "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
-  "symbol": "BTCUSDT",
+  "symbol": "BTC_USDT",
   "confidence": 75,
   "leverage": 5,
   "positionSizePercent": 3,
@@ -361,13 +360,13 @@ Responda APENAS com JSON:
 
   private async getMarketSnapshot(symbol: string): Promise<MarketSnapshot | null> {
     try {
-      const klines = await this.config.binanceClient.getKlines(
-        symbol, this.timeframeToInterval(this.config.timeframe), 200
+      const gateCandles = await this.config.gateioClient.getCandles(
+        symbol, this.config.timeframe, 200
       );
-      if (klines.length < 50) return null;
+      if (gateCandles.length < 50) return null;
 
-      const prices = klines.map((k) => parseFloat(k.closePrice));
-      const volumes = klines.map((k) => parseFloat(k.volume));
+      const prices = gateCandles.map((k) => k.close);
+      const volumes = gateCandles.map((k) => k.volume);
       const currentPrice = prices[prices.length - 1];
 
       const rsi = calculateRSI(prices, 14);
@@ -377,33 +376,26 @@ Responda APENAS com JSON:
       const volat = analyzeVolatility(prices);
       const ema50 = calculateEMAValue(prices, 50);
 
-      // Get 24h change
-      const ticker = await this.config.binanceClient.getTicker(symbol);
-      const change24h = parseFloat(ticker.lowPrice) !== 0
-        ? ((currentPrice - parseFloat(ticker.lowPrice)) / parseFloat(ticker.lowPrice)) * 100
-        : 0;
-
-      // Get funding rate
-      let fundingRate = 0;
-      try {
-        const fr = await this.config.binanceClient.getFundingRate(symbol);
-        fundingRate = parseFloat(fr.fundingRate);
-      } catch { /* skip */ }
+      // Get ticker for 24h change and funding rate
+      const ticker = await this.config.gateioClient.getTicker(symbol);
+      const change24h = parseFloat(ticker.priceChangePercent);
+      const fundingRate = parseFloat(ticker.fundingRate);
+      const volume24h = parseFloat(ticker.volume24h);
 
       // Determine trend
       let trend: "BULLISH" | "BEARISH" | "SIDEWAYS" = "SIDEWAYS";
       if (currentPrice > ema50 && macd.bullish && rsi.rsi > 50) trend = "BULLISH";
-      else if (currentPrice < ema50 && macd.bearish && rsi.rsi < 50) trend = "BEARISH";
+      else if (currentPrice < ema50 && !macd.bullish && rsi.rsi < 50) trend = "BEARISH";
 
-      // Save candles and indicators
-      await this.saveCandles(symbol, klines);
+      // Save candles and indicators to DB
+      await this.saveCandles(symbol, gateCandles);
       await this.saveIndicators(symbol, prices, volumes);
 
       return {
         symbol,
         price: currentPrice,
         change24h,
-        volume24h: parseFloat(ticker.volume),
+        volume24h,
         rsi: rsi.rsi,
         macd: { macdLine: macd.macdLine, signalLine: macd.signalLine, histogram: macd.histogram, bullish: macd.bullish },
         bb: { upper: bb.upper, middle: bb.middle, lower: bb.lower, position: bb.position },
@@ -419,7 +411,7 @@ Responda APENAS com JSON:
   }
 
   // --------------------------------------------------------------------------
-  // Trade Execution
+  // Trade Execution (Gate.io Futures)
   // --------------------------------------------------------------------------
 
   private async executeDecision(decision: AIDecision): Promise<void> {
@@ -427,54 +419,54 @@ Responda APENAS com JSON:
 
     try {
       // Get balance and calculate position size
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      const available = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      const available = parseFloat(balance.availableBalance);
 
       // Cap position size by maxRiskPerTrade
       const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
       const notionalValue = available * (sizePercent / 100) * decision.leverage;
 
       // Get current price
-      const ticker = await this.config.binanceClient.getTicker(decision.symbol);
+      const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
 
-      // Get instrument info for lot size
-      const instruments = await this.config.binanceClient.getInstruments(decision.symbol);
-      const instrument = instruments[0];
-      let stepSize = 0.001;
-      if (instrument?.filters) {
-        const lotFilter = instrument.filters.find((f: any) => f.filterType === "LOT_SIZE");
-        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
-      }
-
-      const rawQty = notionalValue / currentPrice;
-      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
-      const quantity = Math.floor(rawQty / stepSize) * stepSize;
-      if (quantity <= 0) return;
+      // Get contract info for quantity calculation
+      // Gate.io uses contract size (quanto_multiplier) — size is in number of contracts
+      const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
+      const quantoMultiplier = parseFloat(contractInfo.quanto_multiplier || "0.001");
+      const contractValue = currentPrice * quantoMultiplier; // value of 1 contract in USDT
+      const rawContracts = notionalValue / contractValue;
+      const contracts = Math.floor(rawContracts);
+      if (contracts <= 0) return;
 
       // Set leverage
-      await this.config.binanceClient.setLeverage(decision.symbol, decision.leverage);
+      try {
+        await this.config.gateioClient.setLeverage(decision.symbol, decision.leverage);
+      } catch (e) {
+        // Leverage may already be set or not supported at that level
+        console.log(`Leverage set warning for ${decision.symbol}:`, this.errStr(e));
+      }
 
-      // Place order
-      const order = await this.config.binanceClient.placeOrder(
-        decision.symbol, side, "MARKET", quantity.toFixed(precision)
-      );
+      // Place market order
+      const order = await this.config.gateioClient.placeOrder({
+        symbol: decision.symbol,
+        side,
+        size: contracts,
+      });
 
       // Record position in memory
       this.positions.set(decision.symbol, {
         symbol: decision.symbol,
         side,
         entryPrice: currentPrice,
-        quantity,
+        quantity: contracts,
         entryTime: new Date(),
         leverage: decision.leverage,
         confidence: decision.confidence,
       });
 
       // Record trade in DB
-      const rsi = calculateRSI([currentPrice], 14).rsi.toString();
       await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
@@ -482,7 +474,7 @@ Responda APENAS com JSON:
         symbol: decision.symbol,
         side,
         entryPrice: currentPrice.toString(),
-        quantity: quantity.toString(),
+        quantity: contracts.toString(),
         entryTime: new Date(),
         stopLoss: "0", // AI manages exits dynamically
         takeProfit: "0",
@@ -496,7 +488,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${quantity.toFixed(precision)} @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
+        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
@@ -508,19 +500,8 @@ Responda APENAS com JSON:
       const position = this.positions.get(symbol);
       if (!position) return;
 
-      const closeSide = position.side === "BUY" ? "SELL" : "BUY";
-
-      // Get instrument info for precision
-      const instruments = await this.config.binanceClient.getInstruments(symbol);
-      const instrument = instruments[0];
-      let stepSize = 0.001;
-      if (instrument?.filters) {
-        const lotFilter = instrument.filters.find((f: any) => f.filterType === "LOT_SIZE");
-        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
-      }
-      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
-
-      await this.config.binanceClient.placeOrder(symbol, closeSide, "MARKET", position.quantity.toFixed(precision));
+      // Close position via Gate.io
+      await this.config.gateioClient.closePosition(symbol);
 
       const pnl = position.side === "BUY"
         ? (exitPrice - position.entryPrice) * position.quantity
@@ -559,7 +540,7 @@ Responda APENAS com JSON:
   private async closeAllPositions(reason: string): Promise<void> {
     for (const [symbol] of Array.from(this.positions.entries())) {
       try {
-        const ticker = await this.config.binanceClient.getTicker(symbol);
+        const ticker = await this.config.gateioClient.getTicker(symbol);
         await this.closePosition(symbol, parseFloat(ticker.lastPrice), reason);
       } catch (error) {
         await this.logEvent("ERROR", symbol, `Failed to close: ${this.errStr(error)}`);
@@ -574,9 +555,8 @@ Responda APENAS com JSON:
   private async isDrawdownExceeded(): Promise<boolean> {
     if (this.initialBalance <= 0) return false;
     try {
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      const currentBalance = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      const currentBalance = parseFloat(balance.totalBalance);
       const drawdown = ((this.initialBalance - currentBalance) / this.initialBalance) * 100;
       return drawdown >= this.config.maxDrawdown;
     } catch { return false; }
@@ -586,20 +566,20 @@ Responda APENAS com JSON:
   // Data Persistence
   // --------------------------------------------------------------------------
 
-  private async saveCandles(symbol: string, klines: BinanceKline[]): Promise<void> {
+  private async saveCandles(symbol: string, gateCandles: GateioCandle[]): Promise<void> {
     try {
-      for (const kline of klines.slice(-10)) {
+      for (const c of gateCandles.slice(-10)) {
         await this.db.insert(candles).values({
           id: nanoid(),
           symbol,
           timeframe: this.config.timeframe,
-          timestamp: parseInt(kline.startTime),
-          open: kline.openPrice,
-          high: kline.highPrice,
-          low: kline.lowPrice,
-          close: kline.closePrice,
-          volume: kline.volume,
-          quoteAssetVolume: kline.turnover,
+          timestamp: c.time,
+          open: c.open.toString(),
+          high: c.high.toString(),
+          low: c.low.toString(),
+          close: c.close.toString(),
+          volume: c.volume.toString(),
+          quoteAssetVolume: "0",
         }).onConflictDoNothing();
       }
     } catch (_) {}
@@ -674,10 +654,6 @@ Responda APENAS com JSON:
   // --------------------------------------------------------------------------
   // Utilities
   // --------------------------------------------------------------------------
-
-  private timeframeToInterval(timeframe: string): string {
-    return ({ "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d" } as Record<string, string>)[timeframe] || "15m";
-  }
 
   private sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
   private errStr(e: unknown): string { return e instanceof Error ? e.message : typeof e === "object" && e !== null ? JSON.stringify(e) : String(e); }

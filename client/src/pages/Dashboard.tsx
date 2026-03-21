@@ -46,7 +46,7 @@ function BalanceBar({ balance }: { balance: any }) {
           fontSize: "11px", color: "#00ff8888", fontFamily: "Courier New, monospace",
           letterSpacing: "1px", textTransform: "uppercase",
         }}>
-          SALDO BINANCE FUTURES (AO VIVO)
+          SALDO GATE.IO FUTURES (AO VIVO)
         </span>
       </div>
       <div style={{

@@ -368,230 +368,168 @@ var protectedProcedure = t.procedure;
 // server/routers.ts
 import { z } from "zod";
 
-// server/binance.ts
-import { USDMClient } from "binance";
-var BinanceClient = class {
-  client;
+// server/gateio.ts
+import GateApi from "gate-api";
+var GateioClient = class _GateioClient {
+  futuresApi;
+  settle = "usdt";
   constructor(config) {
-    this.client = new USDMClient({
-      api_key: config.apiKey,
-      api_secret: config.apiSecret,
-      ...config.testnet ? { baseUrl: "https://testnet.binancefuture.com" } : {}
-    });
+    const client2 = new GateApi.ApiClient();
+    client2.setApiKeySecret(config.apiKey, config.apiSecret);
+    this.futuresApi = new GateApi.FuturesApi(client2);
   }
-  /**
-   * Get account balance (USDT futures)
-   */
-  async getBalance() {
-    const balances = await this.client.getBalance();
-    return balances.map((b) => ({
-      coin: b.asset,
-      walletBalance: b.balance
+  // ========== Public Methods (no auth needed) ==========
+  static createPublicClient() {
+    return new _GateioClient({ apiKey: "", apiSecret: "" });
+  }
+  async getTopPairs(limit = 20) {
+    const result = await this.futuresApi.listFuturesTickers(this.settle);
+    const tickers = result.body;
+    const sorted = tickers.filter((t2) => t2.volume_24h_quote && parseFloat(t2.volume_24h_quote) > 0).sort((a, b) => parseFloat(b.volume_24h_quote || "0") - parseFloat(a.volume_24h_quote || "0")).slice(0, limit);
+    return sorted.map((t2) => ({
+      symbol: t2.contract || "",
+      lastPrice: t2.last || "0",
+      priceChangePercent: t2.change_percentage || "0",
+      volume24h: t2.volume_24h_quote || "0",
+      highPrice: t2.high_24h || "0",
+      lowPrice: t2.low_24h || "0",
+      fundingRate: t2.funding_rate || "0"
     }));
   }
-  /**
-   * Get account info (includes balance, unrealized PnL, positions count)
-   */
-  async getAccountInfo() {
-    const account = await this.client.getAccountInformation();
-    const positions = account.positions.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
-      symbol: p.symbol,
-      positionSide: p.positionSide,
-      positionAmt: p.positionAmt,
-      entryPrice: p.entryPrice,
-      markPrice: p.markPrice ?? "0",
-      unrealizedProfit: p.unrealizedProfit,
-      leverage: p.leverage,
-      notional: p.notional ?? "0"
-    }));
-    return {
-      totalWalletBalance: account.totalWalletBalance,
-      availableBalance: account.availableBalance,
-      totalMarginBalance: account.totalMarginBalance,
-      totalUnrealizedProfit: account.totalUnrealizedProfit,
-      positions
-    };
-  }
-  /**
-   * Get open positions
-   */
-  async getPositions(symbol) {
-    const positions = await this.client.getPositions(symbol ? { symbol } : void 0);
-    return positions.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
-      symbol: p.symbol,
-      positionSide: p.positionSide,
-      positionAmt: p.positionAmt,
-      entryPrice: p.entryPrice,
-      markPrice: p.markPrice ?? "0",
-      unrealizedProfit: p.unrealizedProfit,
-      leverage: p.leverage,
-      notional: p.notional ?? "0"
-    }));
-  }
-  /**
-   * Place order
-   */
-  async placeOrder(symbol, side, orderType, qty, price) {
-    const params = {
-      symbol,
-      side,
-      type: orderType,
-      quantity: qty
-    };
-    if (orderType === "LIMIT" && price) {
-      params.price = price;
-      params.timeInForce = "GTC";
-    }
-    const response = await this.client.submitNewOrder(params);
-    return { orderId: String(response.orderId) };
-  }
-  /**
-   * Cancel order
-   */
-  async cancelOrder(symbol, orderId) {
-    await this.client.cancelOrder({
-      symbol,
-      orderId: parseInt(orderId)
-    });
-  }
-  /**
-   * Get order history
-   */
-  async getOrderHistory(symbol, limit = 50) {
-    const params = { limit };
-    if (symbol) params.symbol = symbol;
-    const orders = await this.client.getAllOrders(params);
-    return orders.map((o) => ({
-      orderId: String(o.orderId),
-      symbol: o.symbol,
-      side: o.side,
-      type: o.type,
-      price: o.price,
-      origQty: o.origQty,
-      status: o.status,
-      time: o.time,
-      updateTime: o.updateTime
-    }));
-  }
-  /**
-   * Get klines (candlestick data)
-   */
-  async getKlines(symbol, interval, limit = 200, startTime) {
-    const params = {
-      symbol,
-      interval,
-      limit
-    };
-    if (startTime) params.startTime = startTime;
-    const klines = await this.client.getKlines(params);
-    return klines.map((k) => ({
-      startTime: String(k[0]),
-      openPrice: String(k[1]),
-      highPrice: String(k[2]),
-      lowPrice: String(k[3]),
-      closePrice: String(k[4]),
-      volume: String(k[5]),
-      turnover: String(k[7])
-      // quoteAssetVolume
-    }));
-  }
-  /**
-   * Get ticker (current price and stats)
-   */
   async getTicker(symbol) {
-    const ticker = await this.client.get24hrChangeStatistics({ symbol });
-    const t2 = Array.isArray(ticker) ? ticker[0] : ticker;
+    const result = await this.futuresApi.listFuturesTickers(this.settle, {
+      contract: symbol
+    });
+    const tickers = result.body;
+    if (!tickers || tickers.length === 0) {
+      throw new Error(`Ticker not found for ${symbol}`);
+    }
+    const t2 = tickers[0];
     return {
-      symbol: t2.symbol,
-      lastPrice: t2.lastPrice,
-      highPrice: t2.highPrice,
-      lowPrice: t2.lowPrice,
-      prevClosePrice: t2.prevClosePrice,
-      volume: t2.volume,
-      quoteVolume: t2.quoteVolume,
-      bidPrice: t2.bidPrice ?? t2.lastPrice,
-      askPrice: t2.askPrice ?? t2.lastPrice
+      symbol: t2.contract || symbol,
+      lastPrice: t2.last || "0",
+      priceChangePercent: t2.change_percentage || "0",
+      volume24h: t2.volume_24h_quote || "0",
+      highPrice: t2.high_24h || "0",
+      lowPrice: t2.low_24h || "0",
+      fundingRate: t2.funding_rate || "0"
     };
   }
-  /**
-   * Get exchange info (instruments)
-   */
-  async getInstruments(symbol) {
-    const info = await this.client.getExchangeInfo();
-    let symbols = info.symbols;
-    if (symbol) {
-      symbols = symbols.filter((s) => s.symbol === symbol);
-    }
-    return symbols.map((s) => ({
-      symbol: s.symbol,
-      baseAsset: s.baseAsset,
-      quoteAsset: s.quoteAsset,
-      filters: s.filters,
-      status: s.status
+  async getCandles(symbol, interval = "15m", limit = 100) {
+    const result = await this.futuresApi.listFuturesCandlesticks(
+      this.settle,
+      symbol,
+      { interval, limit }
+    );
+    const candles2 = result.body;
+    return candles2.map((c) => ({
+      time: c.t ? c.t * 1e3 : 0,
+      open: parseFloat(c.o || "0"),
+      high: parseFloat(c.h || "0"),
+      low: parseFloat(c.l || "0"),
+      close: parseFloat(c.c || "0"),
+      volume: parseFloat(c.v || "0")
     }));
   }
-  /**
-   * Get all USDT perpetual trading pairs
-   */
-  async getAllInstruments() {
-    const info = await this.client.getExchangeInfo();
-    return info.symbols.filter((s) => s.quoteAsset === "USDT" && s.status === "TRADING").map((s) => ({
-      symbol: s.symbol,
-      baseAsset: s.baseAsset,
-      quoteAsset: s.quoteAsset,
-      filters: s.filters,
-      status: s.status
+  async getContractInfo(symbol) {
+    const result = await this.futuresApi.getFuturesContract(this.settle, symbol);
+    return result.body;
+  }
+  // ========== Private Methods (auth required) ==========
+  async getBalance() {
+    const result = await this.futuresApi.listFuturesAccounts(this.settle);
+    const account = result.body;
+    return {
+      totalBalance: account.total || "0",
+      availableBalance: account.available || "0",
+      unrealizedPnl: account.unrealised_pnl || "0",
+      marginBalance: String(
+        parseFloat(account.total || "0") + parseFloat(account.unrealised_pnl || "0")
+      )
+    };
+  }
+  async getPositions() {
+    const result = await this.futuresApi.listPositions(this.settle, {
+      holding: true
+    });
+    const positions = result.body;
+    return positions.map((p) => ({
+      symbol: p.contract || "",
+      side: p.size > 0 ? "LONG" : "SHORT",
+      size: String(Math.abs(p.size || 0)),
+      entryPrice: p.entry_price || "0",
+      markPrice: p.mark_price || "0",
+      unrealizedPnl: p.unrealised_pnl || "0",
+      leverage: p.leverage || "0",
+      marginMode: p.mode || "single"
     }));
   }
-  /**
-   * Set leverage
-   */
   async setLeverage(symbol, leverage) {
-    await this.client.setLeverage({ symbol, leverage });
+    await this.futuresApi.updatePositionLeverage(this.settle, symbol, String(leverage), {
+      crossLeverageLimit: String(leverage)
+    });
   }
-  /**
-   * Place order with stop loss and take profit (using STOP_MARKET and TAKE_PROFIT_MARKET)
-   */
-  async setStopLossTakeProfit(symbol, side, stopLoss, takeProfit) {
-    const closeSide = side === "BUY" ? "SELL" : "BUY";
-    if (stopLoss) {
-      await this.client.submitNewOrder({
-        symbol,
-        side: closeSide,
-        type: "STOP_MARKET",
-        stopPrice: stopLoss,
-        closePosition: "true"
-      });
+  async placeOrder(params) {
+    const sizeValue = params.side === "BUY" ? Math.abs(params.size) : -Math.abs(params.size);
+    const order = {
+      contract: params.symbol,
+      size: sizeValue,
+      price: params.price ? String(params.price) : "0",
+      // 0 = market order
+      tif: params.price ? "gtc" : "ioc",
+      // ioc for market, gtc for limit
+      reduce_only: params.reduceOnly || false
+    };
+    const result = await this.futuresApi.createFuturesOrder(this.settle, order);
+    const o = result.body;
+    return {
+      orderId: String(o.id || ""),
+      symbol: o.contract || params.symbol,
+      side: params.side,
+      size: Math.abs(o.size || params.size),
+      price: o.fill_price || o.price || "0",
+      status: o.status || "unknown"
+    };
+  }
+  async closePosition(symbol) {
+    const positions = await this.getPositions();
+    const pos = positions.find((p) => p.symbol === symbol);
+    if (!pos || parseFloat(pos.size) === 0) return null;
+    const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+    return await this.placeOrder({
+      symbol,
+      side: closeSide,
+      size: Math.abs(parseFloat(pos.size)),
+      reduceOnly: true
+    });
+  }
+  async closeAllPositions() {
+    const positions = await this.getPositions();
+    for (const pos of positions) {
+      if (parseFloat(pos.size) > 0) {
+        try {
+          await this.closePosition(pos.symbol);
+        } catch (err) {
+          console.error(`Error closing position ${pos.symbol}:`, err);
+        }
+      }
     }
-    if (takeProfit) {
-      await this.client.submitNewOrder({
-        symbol,
-        side: closeSide,
-        type: "TAKE_PROFIT_MARKET",
-        stopPrice: takeProfit,
-        closePosition: "true"
-      });
+  }
+  async testConnection() {
+    try {
+      const balance = await this.getBalance();
+      return {
+        success: true,
+        balance: balance.totalBalance,
+        message: "Conex\xE3o com Gate.io Futures estabelecida com sucesso"
+      };
+    } catch (error) {
+      throw new Error(`Falha na conex\xE3o: ${error?.message || String(error)}`);
     }
-  }
-  /**
-   * Get funding rate
-   */
-  async getFundingRate(symbol) {
-    const rates = await this.client.getFundingRateHistory({ symbol, limit: 1 });
-    const r = Array.isArray(rates) ? rates[0] : rates;
-    return { fundingRate: String(r?.fundingRate ?? "0") };
-  }
-  /**
-   * Get current mark price
-   */
-  async getMarkPrice(symbol) {
-    const price = await this.client.getMarkPrice({ symbol });
-    const p = Array.isArray(price) ? price[0] : price;
-    return String(p.markPrice ?? "0");
   }
 };
-function createBinanceClient(config) {
-  return new BinanceClient(config);
+function createGateioClient(config) {
+  return new GateioClient(config);
 }
 
 // server/indicators.ts
@@ -772,13 +710,12 @@ var TradingEngine = class {
     if (this.isRunning) return;
     this.isRunning = true;
     try {
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      this.initialBalance = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      this.initialBalance = parseFloat(balance.totalBalance);
     } catch {
       this.initialBalance = 0;
     }
-    console.log(`\u{1F680} AI Trading engine started for user ${this.config.userId}`);
+    console.log(`AI Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
     await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}%`);
     this.mainLoop();
@@ -786,7 +723,7 @@ var TradingEngine = class {
   async stop() {
     if (!this.isRunning) return;
     this.isRunning = false;
-    console.log(`\u26D4 AI Trading engine stopped for user ${this.config.userId}`);
+    console.log(`AI Trading engine stopped for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: false });
     await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped");
   }
@@ -824,13 +761,11 @@ var TradingEngine = class {
   // --------------------------------------------------------------------------
   async scanAndTrade() {
     try {
-      const allInstruments = await this.config.binanceClient.getAllInstruments();
-      const symbols = allInstruments.filter((i) => i.status === "TRADING" && i.quoteAsset === "USDT").map((i) => i.symbol).slice(0, 50);
+      const topPairs = await this.config.gateioClient.getTopPairs(20);
       const snapshots = [];
-      const batchSymbols = symbols.slice(0, 20);
-      for (const symbol of batchSymbols) {
+      for (const pair of topPairs) {
         try {
-          const snapshot = await this.getMarketSnapshot(symbol);
+          const snapshot = await this.getMarketSnapshot(pair.symbol);
           if (snapshot) snapshots.push(snapshot);
         } catch {
         }
@@ -840,7 +775,7 @@ var TradingEngine = class {
       for (const decision of decisions) {
         if (!this.isRunning) break;
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
-        if (decision.confidence < 60) continue;
+        if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue;
         if (this.positions.size >= this.config.maxOpenPositions) break;
         try {
@@ -852,6 +787,9 @@ var TradingEngine = class {
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
     }
+  }
+  getMinConfidence() {
+    return this.config.aggressiveness === "conservative" ? 75 : this.config.aggressiveness === "moderate" ? 65 : 55;
   }
   // --------------------------------------------------------------------------
   // Position Monitoring — AI decides when to close
@@ -875,9 +813,8 @@ var TradingEngine = class {
   // AI Decision Engine
   // --------------------------------------------------------------------------
   async askAIForOpportunities(snapshots) {
-    const balances = await this.config.binanceClient.getBalance();
-    const usdt = balances.find((b) => b.coin === "USDT");
-    const availableBalance = parseFloat(usdt?.walletBalance ?? "0");
+    const balance = await this.config.gateioClient.getBalance();
+    const availableBalance = parseFloat(balance.availableBalance);
     const marketSummary = snapshots.map((s) => ({
       symbol: s.symbol,
       price: s.price,
@@ -901,6 +838,9 @@ COMPORTAMENTO:
 - Ajuste capital e alavancagem dinamicamente.
 - Prefira abrir MUITAS posi\xE7\xF5es de valores BAIXOS alavancados para diversificar.
 
+EXCHANGE: Gate.io Futures (USDT-M)
+- S\xEDmbolos usam formato: BTC_USDT, ETH_USDT (com underscore)
+
 PERFIL DE RISCO: ${this.config.aggressiveness}
 - Conservative: alavancagem 1-5x, confian\xE7a m\xEDnima 75%, posi\xE7\xF5es menores
 - Moderate: alavancagem 3-10x, confian\xE7a m\xEDnima 65%, posi\xE7\xF5es m\xE9dias
@@ -911,13 +851,12 @@ REGRAS:
 - M\xE1ximo ${this.config.maxOpenPositions} posi\xE7\xF5es simult\xE2neas (atualmente ${this.positions.size} abertas)
 - Saldo dispon\xEDvel: ${availableBalance.toFixed(2)} USDT
 - Considere funding rate (negativo favorece longs, positivo favorece shorts)
-- Alta volatilidade = menor alavancagem
 - Sempre considere risco de liquida\xE7\xE3o
 
 Responda APENAS com um JSON array de decis\xF5es. Cada decis\xE3o:
 {
   "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
-  "symbol": "BTCUSDT",
+  "symbol": "BTC_USDT",
   "confidence": 75,
   "leverage": 5,
   "positionSizePercent": 3,
@@ -996,14 +935,14 @@ Responda APENAS com JSON:
   // --------------------------------------------------------------------------
   async getMarketSnapshot(symbol) {
     try {
-      const klines = await this.config.binanceClient.getKlines(
+      const gateCandles = await this.config.gateioClient.getCandles(
         symbol,
-        this.timeframeToInterval(this.config.timeframe),
+        this.config.timeframe,
         200
       );
-      if (klines.length < 50) return null;
-      const prices = klines.map((k) => parseFloat(k.closePrice));
-      const volumes = klines.map((k) => parseFloat(k.volume));
+      if (gateCandles.length < 50) return null;
+      const prices = gateCandles.map((k) => k.close);
+      const volumes = gateCandles.map((k) => k.volume);
       const currentPrice = prices[prices.length - 1];
       const rsi = calculateRSI(prices, 14);
       const macd = calculateMACD(prices, 12, 26, 9);
@@ -1011,24 +950,20 @@ Responda APENAS com JSON:
       const vol = analyzeVolume(volumes);
       const volat = analyzeVolatility(prices);
       const ema50 = calculateEMAValue(prices, 50);
-      const ticker = await this.config.binanceClient.getTicker(symbol);
-      const change24h = parseFloat(ticker.lowPrice) !== 0 ? (currentPrice - parseFloat(ticker.lowPrice)) / parseFloat(ticker.lowPrice) * 100 : 0;
-      let fundingRate = 0;
-      try {
-        const fr = await this.config.binanceClient.getFundingRate(symbol);
-        fundingRate = parseFloat(fr.fundingRate);
-      } catch {
-      }
+      const ticker = await this.config.gateioClient.getTicker(symbol);
+      const change24h = parseFloat(ticker.priceChangePercent);
+      const fundingRate = parseFloat(ticker.fundingRate);
+      const volume24h = parseFloat(ticker.volume24h);
       let trend = "SIDEWAYS";
       if (currentPrice > ema50 && macd.bullish && rsi.rsi > 50) trend = "BULLISH";
-      else if (currentPrice < ema50 && macd.bearish && rsi.rsi < 50) trend = "BEARISH";
-      await this.saveCandles(symbol, klines);
+      else if (currentPrice < ema50 && !macd.bullish && rsi.rsi < 50) trend = "BEARISH";
+      await this.saveCandles(symbol, gateCandles);
       await this.saveIndicators(symbol, prices, volumes);
       return {
         symbol,
         price: currentPrice,
         change24h,
-        volume24h: parseFloat(ticker.volume),
+        volume24h,
         rsi: rsi.rsi,
         macd: { macdLine: macd.macdLine, signalLine: macd.signalLine, histogram: macd.histogram, bullish: macd.bullish },
         bb: { upper: bb.upper, middle: bb.middle, lower: bb.lower, position: bb.position },
@@ -1043,47 +978,43 @@ Responda APENAS com JSON:
     }
   }
   // --------------------------------------------------------------------------
-  // Trade Execution
+  // Trade Execution (Gate.io Futures)
   // --------------------------------------------------------------------------
   async executeDecision(decision) {
     const side = decision.action === "OPEN_LONG" ? "BUY" : "SELL";
     try {
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      const available = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      const available = parseFloat(balance.availableBalance);
       const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
       const notionalValue = available * (sizePercent / 100) * decision.leverage;
-      const ticker = await this.config.binanceClient.getTicker(decision.symbol);
+      const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
-      const instruments = await this.config.binanceClient.getInstruments(decision.symbol);
-      const instrument = instruments[0];
-      let stepSize = 1e-3;
-      if (instrument?.filters) {
-        const lotFilter = instrument.filters.find((f) => f.filterType === "LOT_SIZE");
-        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
+      const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
+      const quantoMultiplier = parseFloat(contractInfo.quanto_multiplier || "0.001");
+      const contractValue = currentPrice * quantoMultiplier;
+      const rawContracts = notionalValue / contractValue;
+      const contracts = Math.floor(rawContracts);
+      if (contracts <= 0) return;
+      try {
+        await this.config.gateioClient.setLeverage(decision.symbol, decision.leverage);
+      } catch (e) {
+        console.log(`Leverage set warning for ${decision.symbol}:`, this.errStr(e));
       }
-      const rawQty = notionalValue / currentPrice;
-      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
-      const quantity = Math.floor(rawQty / stepSize) * stepSize;
-      if (quantity <= 0) return;
-      await this.config.binanceClient.setLeverage(decision.symbol, decision.leverage);
-      const order = await this.config.binanceClient.placeOrder(
-        decision.symbol,
+      const order = await this.config.gateioClient.placeOrder({
+        symbol: decision.symbol,
         side,
-        "MARKET",
-        quantity.toFixed(precision)
-      );
+        size: contracts
+      });
       this.positions.set(decision.symbol, {
         symbol: decision.symbol,
         side,
         entryPrice: currentPrice,
-        quantity,
+        quantity: contracts,
         entryTime: /* @__PURE__ */ new Date(),
         leverage: decision.leverage,
         confidence: decision.confidence
       });
-      const rsi = calculateRSI([currentPrice], 14).rsi.toString();
       await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
@@ -1091,7 +1022,7 @@ Responda APENAS com JSON:
         symbol: decision.symbol,
         side,
         entryPrice: currentPrice.toString(),
-        quantity: quantity.toString(),
+        quantity: contracts.toString(),
         entryTime: /* @__PURE__ */ new Date(),
         stopLoss: "0",
         // AI manages exits dynamically
@@ -1105,7 +1036,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${quantity.toFixed(precision)} @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
+        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
@@ -1115,16 +1046,7 @@ Responda APENAS com JSON:
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
-      const closeSide = position.side === "BUY" ? "SELL" : "BUY";
-      const instruments = await this.config.binanceClient.getInstruments(symbol);
-      const instrument = instruments[0];
-      let stepSize = 1e-3;
-      if (instrument?.filters) {
-        const lotFilter = instrument.filters.find((f) => f.filterType === "LOT_SIZE");
-        if (lotFilter) stepSize = parseFloat(lotFilter.stepSize);
-      }
-      const precision = stepSize < 1 ? Math.ceil(-Math.log10(stepSize)) : 0;
-      await this.config.binanceClient.placeOrder(symbol, closeSide, "MARKET", position.quantity.toFixed(precision));
+      await this.config.gateioClient.closePosition(symbol);
       const pnl = position.side === "BUY" ? (exitPrice - position.entryPrice) * position.quantity : (position.entryPrice - exitPrice) * position.quantity;
       const pnlPercent = position.side === "BUY" ? (exitPrice - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - exitPrice) / position.entryPrice * 100;
       const tradeRecord = await this.db.select().from(trades).where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId))).limit(1);
@@ -1151,7 +1073,7 @@ Responda APENAS com JSON:
   async closeAllPositions(reason) {
     for (const [symbol] of Array.from(this.positions.entries())) {
       try {
-        const ticker = await this.config.binanceClient.getTicker(symbol);
+        const ticker = await this.config.gateioClient.getTicker(symbol);
         await this.closePosition(symbol, parseFloat(ticker.lastPrice), reason);
       } catch (error) {
         await this.logEvent("ERROR", symbol, `Failed to close: ${this.errStr(error)}`);
@@ -1164,9 +1086,8 @@ Responda APENAS com JSON:
   async isDrawdownExceeded() {
     if (this.initialBalance <= 0) return false;
     try {
-      const balances = await this.config.binanceClient.getBalance();
-      const usdt = balances.find((b) => b.coin === "USDT");
-      const currentBalance = parseFloat(usdt?.walletBalance ?? "0");
+      const balance = await this.config.gateioClient.getBalance();
+      const currentBalance = parseFloat(balance.totalBalance);
       const drawdown = (this.initialBalance - currentBalance) / this.initialBalance * 100;
       return drawdown >= this.config.maxDrawdown;
     } catch {
@@ -1176,20 +1097,20 @@ Responda APENAS com JSON:
   // --------------------------------------------------------------------------
   // Data Persistence
   // --------------------------------------------------------------------------
-  async saveCandles(symbol, klines) {
+  async saveCandles(symbol, gateCandles) {
     try {
-      for (const kline of klines.slice(-10)) {
+      for (const c of gateCandles.slice(-10)) {
         await this.db.insert(candles).values({
           id: nanoid(),
           symbol,
           timeframe: this.config.timeframe,
-          timestamp: parseInt(kline.startTime),
-          open: kline.openPrice,
-          high: kline.highPrice,
-          low: kline.lowPrice,
-          close: kline.closePrice,
-          volume: kline.volume,
-          quoteAssetVolume: kline.turnover
+          timestamp: c.time,
+          open: c.open.toString(),
+          high: c.high.toString(),
+          low: c.low.toString(),
+          close: c.close.toString(),
+          volume: c.volume.toString(),
+          quoteAssetVolume: "0"
         }).onConflictDoNothing();
       }
     } catch (_) {
@@ -1261,9 +1182,6 @@ Responda APENAS com JSON:
   // --------------------------------------------------------------------------
   // Utilities
   // --------------------------------------------------------------------------
-  timeframeToInterval(timeframe) {
-    return { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d" }[timeframe] || "15m";
-  }
   sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
   }
@@ -1281,8 +1199,9 @@ Responda APENAS com JSON:
 // server/routers.ts
 import { eq as eq2, and as and2, desc } from "drizzle-orm";
 import { nanoid as nanoid2 } from "nanoid";
+import GateApi2 from "gate-api";
 var tradingEngines = /* @__PURE__ */ new Map();
-var binanceKeysRouter = router({
+var gateioKeysRouter = router({
   saveKeys: protectedProcedure.input(
     z.object({
       apiKey: z.string().min(1),
@@ -1327,22 +1246,16 @@ var binanceKeysRouter = router({
     const userId = ctx.user?.id || "local-owner";
     const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
     if (keys.length === 0) {
-      throw new Error("Chaves da API Binance n\xE3o configuradas");
+      throw new Error("Chaves da API Gate.io n\xE3o configuradas");
     }
     const apiKey = keys[0];
-    const client2 = createBinanceClient({
+    const client2 = createGateioClient({
       apiKey: apiKey.apiKey,
-      apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false
+      apiSecret: apiKey.apiSecret
     });
     try {
-      const balances = await client2.getBalance();
-      const usdtBalance = balances.find((b) => b.coin === "USDT");
-      return {
-        success: true,
-        balance: usdtBalance?.walletBalance ?? "0",
-        message: "Conex\xE3o com Binance Futures estabelecida com sucesso"
-      };
+      const result = await client2.testConnection();
+      return result;
     } catch (error) {
       throw new Error(`Falha na conex\xE3o: ${error?.message || String(error)}`);
     }
@@ -1367,17 +1280,13 @@ var tradingConfigRouter = router({
       id,
       userId,
       name: input.name,
-      description: input.description ?? `Estrat\xE9gia AI ${input.aggressiveness}`,
+      description: `${input.aggressiveness}|${input.description ?? "Estrat\xE9gia AI Aut\xF4noma"}`,
       tradingPairs: ["AUTO"],
-      // AI selects pairs dynamically
       maxPositionSize: input.maxRiskPerTrade.toString(),
       maxDrawdown: input.maxDrawdown.toString(),
       stopLossPercent: "0",
-      // AI manages dynamically
       takeProfitPercent: "0",
-      // AI manages dynamically
       rsiPeriod: input.maxOpenPositions,
-      // reuse field for maxOpenPositions
       rsiOverbought: 70,
       rsiOversold: 30,
       macdFastPeriod: 12,
@@ -1390,9 +1299,6 @@ var tradingConfigRouter = router({
       timeframe: input.timeframe,
       isActive: false
     });
-    await db2.update(tradingConfigs).set({
-      description: `${input.aggressiveness}|${input.description ?? "Estrat\xE9gia AI Aut\xF4noma"}`
-    }).where(eq2(tradingConfigs.id, id));
     return { success: true, id };
   }),
   getAll: protectedProcedure.query(async ({ ctx }) => {
@@ -1480,20 +1386,19 @@ var botControlRouter = router({
     const configs = await db2.select().from(tradingConfigs).where(and2(eq2(tradingConfigs.id, input.configId), eq2(tradingConfigs.userId, userId))).limit(1);
     if (configs.length === 0) throw new Error("Configura\xE7\xE3o n\xE3o encontrada");
     const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
-    if (keys.length === 0) throw new Error("Chaves da API Binance n\xE3o configuradas");
+    if (keys.length === 0) throw new Error("Chaves da API Gate.io n\xE3o configuradas");
     const config = configs[0];
     const apiKey = keys[0];
-    const binanceClient = createBinanceClient({
+    const gateioClient = createGateioClient({
       apiKey: apiKey.apiKey,
-      apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false
+      apiSecret: apiKey.apiSecret
     });
     const descParts = (config.description ?? "moderate|").split("|");
     const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
     const engine = new TradingEngine({
       userId,
       configId: input.configId,
-      binanceClient,
+      gateioClient,
       maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
       maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
       maxOpenPositions: config.rsiPeriod ?? 10,
@@ -1525,17 +1430,18 @@ var botControlRouter = router({
 });
 var marketDataRouter = router({
   getTicker: protectedProcedure.input(z.object({ symbol: z.string() })).query(async ({ input }) => {
-    const { USDMClient: USDMClient2 } = await import("binance");
-    const client2 = new USDMClient2();
-    const ticker = await client2.get24hrChangeStatistics({ symbol: input.symbol });
-    const t2 = Array.isArray(ticker) ? ticker[0] : ticker;
+    const client2 = new GateApi2.FuturesApi();
+    const result = await client2.listFuturesTickers("usdt", { contract: input.symbol });
+    const tickers = result.body;
+    if (!tickers || tickers.length === 0) throw new Error("Ticker not found");
+    const t2 = tickers[0];
     return {
-      symbol: t2.symbol,
-      lastPrice: t2.lastPrice,
-      priceChangePercent: t2.priceChangePercent,
-      volume: t2.volume,
-      highPrice: t2.highPrice,
-      lowPrice: t2.lowPrice
+      symbol: t2.contract || input.symbol,
+      lastPrice: t2.last || "0",
+      priceChangePercent: t2.change_percentage || "0",
+      volume: t2.volume_24h_quote || "0",
+      highPrice: t2.high_24h || "0",
+      lowPrice: t2.low_24h || "0"
     };
   }),
   getKlines: protectedProcedure.input(
@@ -1545,20 +1451,18 @@ var marketDataRouter = router({
       limit: z.number().default(100)
     })
   ).query(async ({ input }) => {
-    const { USDMClient: USDMClient2 } = await import("binance");
-    const client2 = new USDMClient2();
-    const klines = await client2.getKlines({
-      symbol: input.symbol,
+    const client2 = new GateApi2.FuturesApi();
+    const result = await client2.listFuturesCandlesticks("usdt", input.symbol, {
       interval: input.interval,
       limit: input.limit
     });
-    return klines.map((k) => ({
-      time: k[0],
-      open: parseFloat(k[1]),
-      high: parseFloat(k[2]),
-      low: parseFloat(k[3]),
-      close: parseFloat(k[4]),
-      volume: parseFloat(k[5])
+    return result.body.map((c) => ({
+      time: c.t ? c.t * 1e3 : 0,
+      open: parseFloat(c.o || "0"),
+      high: parseFloat(c.h || "0"),
+      low: parseFloat(c.l || "0"),
+      close: parseFloat(c.c || "0"),
+      volume: parseFloat(c.v || "0")
     }));
   }),
   getBalance: protectedProcedure.query(async ({ ctx }) => {
@@ -1569,18 +1473,17 @@ var marketDataRouter = router({
       return { balance: "0", available: "0", unrealizedPnl: "0" };
     }
     const apiKey = keys[0];
-    const client2 = createBinanceClient({
+    const client2 = createGateioClient({
       apiKey: apiKey.apiKey,
-      apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false
+      apiSecret: apiKey.apiSecret
     });
     try {
-      const account = await client2.getAccountInfo();
+      const balance = await client2.getBalance();
       return {
-        balance: account.totalWalletBalance,
-        available: account.availableBalance,
-        unrealizedPnl: account.totalUnrealizedProfit,
-        marginBalance: account.totalMarginBalance
+        balance: balance.totalBalance,
+        available: balance.availableBalance,
+        unrealizedPnl: balance.unrealizedPnl,
+        marginBalance: balance.marginBalance
       };
     } catch (error) {
       console.error("Error fetching balance:", error?.message || error);
@@ -1593,10 +1496,9 @@ var marketDataRouter = router({
     const keys = await db2.select().from(bybitApiKeys).where(eq2(bybitApiKeys.userId, userId)).limit(1);
     if (keys.length === 0) return [];
     const apiKey = keys[0];
-    const client2 = createBinanceClient({
+    const client2 = createGateioClient({
       apiKey: apiKey.apiKey,
-      apiSecret: apiKey.apiSecret,
-      testnet: apiKey.testnet ?? false
+      apiSecret: apiKey.apiSecret
     });
     try {
       return await client2.getPositions();
@@ -1645,9 +1547,10 @@ var logsRouter = router({
   })
 });
 var appRouter = router({
-  binanceKeys: binanceKeysRouter,
-  // Keep bybitKeys as alias for backward compatibility
-  bybitKeys: binanceKeysRouter,
+  gateioKeys: gateioKeysRouter,
+  // Backward compatibility aliases
+  binanceKeys: gateioKeysRouter,
+  bybitKeys: gateioKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,
   marketData: marketDataRouter,

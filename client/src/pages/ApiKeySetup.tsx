@@ -6,10 +6,9 @@ import { toast } from "sonner";
 export function ApiKeySetup() {
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [testnet, setTestnet] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
 
-  const { mutate: saveKeys, isPending } = trpc.binanceKeys.saveKeys.useMutation({
+  const { mutate: saveKeys, isPending } = trpc.gateioKeys.saveKeys.useMutation({
     onSuccess: () => {
       toast.success("Chaves salvas com sucesso!");
       setTimeout(() => window.location.reload(), 800);
@@ -23,7 +22,7 @@ export function ApiKeySetup() {
       toast.error("Preencha a API Key e o API Secret");
       return;
     }
-    saveKeys({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), testnet });
+    saveKeys({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), testnet: false });
   };
 
   const inputStyle: React.CSSProperties = {
@@ -50,7 +49,7 @@ export function ApiKeySetup() {
             </span>
           </div>
           <p style={{ fontSize: "12px", color: "#00ff8844" }}>
-            Configure sua API Binance Futures para começar a operar
+            Configure sua API Gate.io Futures para começar a operar
           </p>
         </div>
 
@@ -67,7 +66,7 @@ export function ApiKeySetup() {
           <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "24px" }}>
             <Key size={16} style={{ color: "#00ff8866" }} />
             <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>
-              Configurar API Binance Futures
+              Configurar API Gate.io Futures
             </h2>
           </div>
 
@@ -75,12 +74,12 @@ export function ApiKeySetup() {
           <div style={{
             display: "flex", alignItems: "center", gap: "6px",
             marginBottom: "20px", padding: "8px 12px",
-            background: "#F0B90B10", border: "1px solid #F0B90B30",
+            background: "#17B89710", border: "1px solid #17B89730",
             borderRadius: "6px",
           }}>
-            <CheckCircle size={13} style={{ color: "#F0B90B" }} />
-            <span style={{ fontSize: "11px", color: "#F0B90B99" }}>
-              Binance Futures (USD-M) — disponível no Brasil
+            <CheckCircle size={13} style={{ color: "#17B897" }} />
+            <span style={{ fontSize: "11px", color: "#17B89799" }}>
+              Gate.io Futures (USDT-M) — sem bloqueio geográfico
             </span>
           </div>
 
@@ -93,7 +92,7 @@ export function ApiKeySetup() {
               type="text"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Cole sua Binance API Key aqui"
+              placeholder="Cole sua Gate.io API Key aqui"
               style={inputStyle}
               onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
               onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
@@ -102,7 +101,7 @@ export function ApiKeySetup() {
           </div>
 
           {/* API Secret */}
-          <div style={{ marginBottom: "16px" }}>
+          <div style={{ marginBottom: "24px" }}>
             <label style={{ display: "block", fontSize: "11px", color: "#00ff8866", marginBottom: "6px" }}>
               API SECRET
             </label>
@@ -111,7 +110,7 @@ export function ApiKeySetup() {
                 type={showSecret ? "text" : "password"}
                 value={apiSecret}
                 onChange={(e) => setApiSecret(e.target.value)}
-                placeholder="Cole seu Binance API Secret aqui"
+                placeholder="Cole seu Gate.io API Secret aqui"
                 style={{ ...inputStyle, paddingRight: "40px" }}
                 onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
                 onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
@@ -132,34 +131,6 @@ export function ApiKeySetup() {
             </div>
           </div>
 
-          {/* Testnet toggle */}
-          <div style={{ marginBottom: "24px" }}>
-            <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}>
-              <div
-                onClick={() => setTestnet(!testnet)}
-                style={{
-                  width: "36px", height: "20px", borderRadius: "10px",
-                  background: testnet ? "#00ff8830" : "#ffffff10",
-                  border: `1px solid ${testnet ? "#00ff8850" : "#ffffff15"}`,
-                  position: "relative", transition: "all 0.2s",
-                  cursor: "pointer", flexShrink: 0,
-                }}
-              >
-                <div style={{
-                  width: "14px", height: "14px", borderRadius: "50%",
-                  background: testnet ? "#00ff88" : "#ffffff44",
-                  position: "absolute", top: "2px",
-                  left: testnet ? "18px" : "2px",
-                  transition: "left 0.2s",
-                }} />
-              </div>
-              <div>
-                <p style={{ fontSize: "12px", color: "#00ff8877" }}>Usar Testnet</p>
-                <p style={{ fontSize: "10px", color: "#00ff8833" }}>Recomendado para testes iniciais</p>
-              </div>
-            </label>
-          </div>
-
           {/* Save button */}
           <button
             type="submit"
@@ -174,13 +145,13 @@ export function ApiKeySetup() {
               letterSpacing: "0.5px",
             }}
           >
-            {isPending ? "Salvando..." : "Salvar Chaves Binance"}
+            {isPending ? "Salvando..." : "Salvar Chaves Gate.io"}
           </button>
 
-          {/* Link to Binance */}
+          {/* Link to Gate.io */}
           <div style={{ marginTop: "16px", textAlign: "center" }}>
             <a
-              href="https://www.binance.com/pt-BR/my/settings/api-management"
+              href="https://www.gate.io/myaccount/api_key_manage"
               target="_blank"
               rel="noopener noreferrer"
               style={{
@@ -190,7 +161,7 @@ export function ApiKeySetup() {
               }}
             >
               <ExternalLink size={11} />
-              Criar API Key na Binance
+              Criar API Key na Gate.io
             </a>
           </div>
         </form>
@@ -202,19 +173,19 @@ export function ApiKeySetup() {
           borderRadius: "6px",
         }}>
           <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "6px", letterSpacing: "0.5px" }}>
-            PERMISSÕES RECOMENDADAS NA BINANCE
+            PERMISSÕES RECOMENDADAS NA GATE.IO
           </p>
           {[
-            "Leitura de conta (Read)",
-            "Negociação de Futuros (Futures Trading)",
-            "NÃO habilitar: Saques ou Transferências",
+            "Leitura de conta (Spot/Margin/Futures Account Read)",
+            "Negociação de Futuros (Futures Trade)",
+            "NÃO habilitar: Saques (Withdraw)",
           ].map((p, i) => (
             <p key={p} style={{ fontSize: "11px", color: i === 2 ? "#ff444466" : "#00ff8866", marginBottom: "2px" }}>
               {i === 2 ? "✗" : "✓"} {p}
             </p>
           ))}
           <p style={{ fontSize: "10px", color: "#00ff8833", marginTop: "8px" }}>
-            Restrinja o IP ao servidor: 50.31.196.137
+            Recomendado: restrinja o IP ao servidor do bot
           </p>
         </div>
       </div>

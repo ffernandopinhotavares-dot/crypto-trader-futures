@@ -17,8 +17,8 @@ function NeonCard({ children, style }: { children: React.ReactNode; style?: Reac
 }
 
 export function SettingsPage() {
-  const { data: apiKeys, refetch } = trpc.binanceKeys.getKeys.useQuery();
-  const { mutate: deleteKeys } = trpc.binanceKeys.deleteKeys.useMutation({
+  const { data: apiKeys, refetch } = trpc.gateioKeys.getKeys.useQuery();
+  const { mutate: deleteKeys } = trpc.gateioKeys.deleteKeys.useMutation({
     onSuccess: () => {
       toast.success("Chaves removidas. Recarregue a página para configurar novas chaves.");
       refetch();
@@ -38,7 +38,7 @@ export function SettingsPage() {
         <NeonCard>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
             <Key size={15} style={{ color: "#00ff8866" }} />
-            <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>Chaves API Binance Futures</h2>
+            <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>Chaves API Gate.io Futures</h2>
           </div>
 
           {apiKeys ? (
@@ -48,14 +48,14 @@ export function SettingsPage() {
                 <p style={{ fontSize: "13px", color: "#00ff88aa" }}>{apiKeys.apiKey}</p>
               </div>
               <div style={{ marginBottom: "16px" }}>
-                <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "4px" }}>MODO</p>
+                <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "4px" }}>STATUS</p>
                 <span style={{
                   padding: "2px 10px", borderRadius: "4px", fontSize: "11px",
-                  background: apiKeys.testnet ? "#ffaa0015" : "#00ff8815",
-                  color: apiKeys.testnet ? "#ffaa00" : "#00ff88",
-                  border: `1px solid ${apiKeys.testnet ? "#ffaa0030" : "#00ff8830"}`,
+                  background: "#00ff8815",
+                  color: "#00ff88",
+                  border: "1px solid #00ff8830",
                 }}>
-                  {apiKeys.testnet ? "TESTNET" : "● MAINNET (AO VIVO)"}
+                  MAINNET (AO VIVO)
                 </span>
               </div>
               <button
@@ -84,9 +84,10 @@ export function SettingsPage() {
         <NeonCard>
           <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88", marginBottom: "16px" }}>Sobre</h2>
           {[
-            ["Versão", "1.0.0"],
-            ["Plataforma", "Binance Futures (USD-M)"],
-            ["Indicadores", "RSI, MACD, BB, EMA, Volume"],
+            ["Versão", "2.0.0"],
+            ["Exchange", "Gate.io Futures (USDT-M)"],
+            ["Motor", "AI Autônomo (Gemini 2.5 Flash)"],
+            ["Indicadores", "RSI, MACD, BB, EMA, Volume, Volatilidade"],
             ["Atualizado em", "21 de Março de 2026"],
           ].map(([label, value]) => (
             <div key={label} style={{ marginBottom: "10px" }}>

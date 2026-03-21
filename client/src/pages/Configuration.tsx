@@ -136,7 +136,7 @@ export function ConfigurationPage() {
               Como funciona a estratégia autônoma
             </p>
             <p style={{ fontSize: "11px", color: "#00ff8866", lineHeight: "1.6" }}>
-              A IA analisa continuamente os top 20 pares de futuros da Binance usando RSI, MACD, Bollinger Bands,
+              A IA analisa continuamente os top 20 pares de futuros da Gate.io usando RSI, MACD, Bollinger Bands,
               volume, volatilidade, funding rate e tendência. Com base nesses dados, ela decide de forma autônoma:
               quais pares operar, quando abrir/fechar posições, qual alavancagem usar e quanto capital alocar.
               Não há stop-loss ou take-profit fixos — a IA gerencia saídas dinamicamente baseada em probabilidade.
