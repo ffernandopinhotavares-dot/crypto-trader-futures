@@ -846,12 +846,14 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 - Moderate: alavancagem 3-10x, confian\xE7a m\xEDnima 65%, posi\xE7\xF5es m\xE9dias
 - Aggressive: alavancagem 5-20x, confian\xE7a m\xEDnima 55%, posi\xE7\xF5es maiores
 
-REGRAS:
-- M\xE1ximo ${this.config.maxRiskPerTrade}% do saldo por opera\xE7\xE3o
-- M\xE1ximo ${this.config.maxOpenPositions} posi\xE7\xF5es simult\xE2neas (atualmente ${this.positions.size} abertas)
+REGRAS OBRIGAT\xD3RIAS:
+- CADA posi\xE7\xE3o deve ter valor nocional de no M\xC1XIMO $10 USDT (antes da alavancagem)
+- Abra MUITAS posi\xE7\xF5es pequenas para diversificar (at\xE9 ${this.config.maxOpenPositions} simult\xE2neas, atualmente ${this.positions.size} abertas)
 - Saldo dispon\xEDvel: ${availableBalance.toFixed(2)} USDT
+- positionSizePercent deve resultar em ~$5-10 USDT por trade (calcule: ${availableBalance.toFixed(2)} * percent/100 = valor base)
 - Considere funding rate (negativo favorece longs, positivo favorece shorts)
 - Sempre considere risco de liquida\xE7\xE3o
+- PRIORIZE abrir v\xE1rias posi\xE7\xF5es diferentes em vez de poucas grandes
 
 Responda APENAS com um JSON array de decis\xF5es. Cada decis\xE3o:
 {
@@ -863,7 +865,7 @@ Responda APENAS com um JSON array de decis\xF5es. Cada decis\xE3o:
   "reasoning": "breve explica\xE7\xE3o"
 }
 
-Retorne no m\xE1ximo 5 oportunidades, ordenadas por confian\xE7a. Se n\xE3o houver boas oportunidades, retorne array vazio [].`;
+Retorne no m\xE1ximo 10 oportunidades, ordenadas por confian\xE7a. Se n\xE3o houver boas oportunidades, retorne array vazio []. PRIORIZE diversifica\xE7\xE3o: escolha pares DIFERENTES.`;
     try {
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
@@ -986,7 +988,8 @@ Responda APENAS com JSON:
       const balance = await this.config.gateioClient.getBalance();
       const available = parseFloat(balance.availableBalance);
       const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
-      const notionalValue = available * (sizePercent / 100) * decision.leverage;
+      const baseValue = Math.min(available * (sizePercent / 100), 10);
+      const notionalValue = baseValue * decision.leverage;
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
@@ -1200,7 +1203,6 @@ Responda APENAS com JSON:
 import { eq as eq2, and as and2, desc } from "drizzle-orm";
 import { nanoid as nanoid2 } from "nanoid";
 import GateApi2 from "gate-api";
-var tradingEngines = /* @__PURE__ */ new Map();
 var gateioKeysRouter = router({
   saveKeys: protectedProcedure.input(
     z.object({
@@ -1568,9 +1570,11 @@ function createContext(opts) {
 }
 
 // server/_core/index.ts
+import { eq as eq3 } from "drizzle-orm";
 import path from "path";
 var app = express();
 var PORT = process.env.PORT || 3e3;
+var tradingEngines = /* @__PURE__ */ new Map();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -1582,6 +1586,56 @@ app.use((req, res, next) => {
   }
   next();
 });
+async function autoRestartBot() {
+  try {
+    const db2 = getDatabase();
+    const runningBots = await db2.select().from(botStatus).where(eq3(botStatus.isRunning, true)).limit(1);
+    if (runningBots.length === 0) {
+      console.log("\u2139\uFE0F No active bot found to auto-restart");
+      return;
+    }
+    const bot = runningBots[0];
+    const userId = bot.userId;
+    const configId = bot.configId;
+    if (!configId) {
+      console.log("\u2139\uFE0F Bot has no configId, skipping auto-restart");
+      return;
+    }
+    const keys = await db2.select().from(bybitApiKeys).where(eq3(bybitApiKeys.userId, userId)).limit(1);
+    if (keys.length === 0) {
+      console.log("\u26A0\uFE0F No API keys found, cannot auto-restart bot");
+      return;
+    }
+    const configs = await db2.select().from(tradingConfigs).where(eq3(tradingConfigs.id, configId)).limit(1);
+    if (configs.length === 0) {
+      console.log("\u26A0\uFE0F Config not found, cannot auto-restart bot");
+      return;
+    }
+    const config = configs[0];
+    const apiKey = keys[0];
+    const gateioClient = createGateioClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret
+    });
+    const descParts = (config.description ?? "moderate|").split("|");
+    const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+    const engine = new TradingEngine({
+      userId,
+      configId,
+      gateioClient,
+      maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
+      maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
+      maxOpenPositions: config.rsiPeriod ?? 10,
+      timeframe: config.timeframe ?? "15m",
+      aggressiveness
+    });
+    await engine.start();
+    tradingEngines.set(userId, engine);
+    console.log(`\u{1F916} Bot auto-restarted for user ${userId} with config ${configId} (${aggressiveness})`);
+  } catch (error) {
+    console.error("\u26A0\uFE0F Failed to auto-restart bot:", error);
+  }
+}
 async function startServer() {
   try {
     console.log("\u{1F527} Initializing database...");
@@ -1603,9 +1657,15 @@ async function startServer() {
     app.listen(Number(PORT), "0.0.0.0", () => {
       console.log(`\u2705 Server running on http://0.0.0.0:${PORT}`);
     });
+    setTimeout(() => {
+      autoRestartBot().catch((e) => console.error("Auto-restart error:", e));
+    }, 3e3);
   } catch (error) {
     console.error("\u274C Failed to start server:", error);
     process.exit(1);
   }
 }
 startServer();
+export {
+  tradingEngines
+};

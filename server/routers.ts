@@ -14,8 +14,8 @@ import { eq, and, desc } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import GateApi from "gate-api";
 
-// Store active trading engines
-const tradingEngines = new Map<string, TradingEngine>();
+// Import shared trading engines map from index.ts
+import { tradingEngines } from "./_core/index";
 
 // ============================================================================
 // Gate.io API Keys Router (using existing bybit_api_keys table for storage)

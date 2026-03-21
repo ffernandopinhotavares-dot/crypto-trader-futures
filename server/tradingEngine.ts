@@ -260,12 +260,14 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 - Moderate: alavancagem 3-10x, confiança mínima 65%, posições médias
 - Aggressive: alavancagem 5-20x, confiança mínima 55%, posições maiores
 
-REGRAS:
-- Máximo ${this.config.maxRiskPerTrade}% do saldo por operação
-- Máximo ${this.config.maxOpenPositions} posições simultâneas (atualmente ${this.positions.size} abertas)
+REGRAS OBRIGATÓRIAS:
+- CADA posição deve ter valor nocional de no MÁXIMO $10 USDT (antes da alavancagem)
+- Abra MUITAS posições pequenas para diversificar (até ${this.config.maxOpenPositions} simultâneas, atualmente ${this.positions.size} abertas)
 - Saldo disponível: ${availableBalance.toFixed(2)} USDT
+- positionSizePercent deve resultar em ~$5-10 USDT por trade (calcule: ${availableBalance.toFixed(2)} * percent/100 = valor base)
 - Considere funding rate (negativo favorece longs, positivo favorece shorts)
 - Sempre considere risco de liquidação
+- PRIORIZE abrir várias posições diferentes em vez de poucas grandes
 
 Responda APENAS com um JSON array de decisões. Cada decisão:
 {
@@ -277,7 +279,7 @@ Responda APENAS com um JSON array de decisões. Cada decisão:
   "reasoning": "breve explicação"
 }
 
-Retorne no máximo 5 oportunidades, ordenadas por confiança. Se não houver boas oportunidades, retorne array vazio [].`;
+Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver boas oportunidades, retorne array vazio []. PRIORIZE diversificação: escolha pares DIFERENTES.`;
 
     try {
       const response = await this.openai.chat.completions.create({
@@ -422,9 +424,10 @@ Responda APENAS com JSON:
       const balance = await this.config.gateioClient.getBalance();
       const available = parseFloat(balance.availableBalance);
 
-      // Cap position size by maxRiskPerTrade
+      // Cap position size: max $10 USDT per position (before leverage)
       const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
-      const notionalValue = available * (sizePercent / 100) * decision.leverage;
+      const baseValue = Math.min(available * (sizePercent / 100), 10); // hard cap at $10
+      const notionalValue = baseValue * decision.leverage;
 
       // Get current price
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
