@@ -334,11 +334,13 @@ async function initializeDatabase() {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL environment variable is not set");
   }
+  const isInternalFlyDb = databaseUrl.includes(".internal") || databaseUrl.includes(".flycast");
+  const sslConfig = isInternalFlyDb ? false : process.env.NODE_ENV === "production" ? "require" : void 0;
   client = postgres(databaseUrl, {
     max: 10,
     idle_timeout: 20,
-    connect_timeout: 10,
-    ssl: process.env.NODE_ENV === "production" ? "require" : void 0
+    connect_timeout: 30,
+    ssl: sslConfig
   });
   db = drizzle(client, { schema: schema_exports });
   await client`SELECT 1`;
@@ -816,9 +818,10 @@ var TradingEngine = class {
         await this.checkPositions();
         await this.sleep(5 * 60 * 1e3);
       } catch (error) {
-        console.error("Error in trading loop:", error);
-        await this.logTrade("ERROR", `Trading loop error: ${error}`, {
-          error: String(error)
+        const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
+        console.error("Error in trading loop:", errMsg);
+        await this.logTrade("ERROR", `Trading loop error: ${errMsg}`, {
+          error: errMsg
         });
       }
     }
@@ -873,10 +876,11 @@ var TradingEngine = class {
         await this.closePosition(symbol, currentPrice);
       }
     } catch (error) {
-      console.error(`Error analyzing ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error analyzing ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
+      console.error(`Error analyzing ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error analyzing ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error)
+        error: errMsg
       });
     }
   }
@@ -943,10 +947,11 @@ var TradingEngine = class {
         `\u2705 Opened ${side} position on ${symbol} at ${entryPrice} with quantity ${quantity}`
       );
     } catch (error) {
-      console.error(`Error opening position on ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error opening position on ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
+      console.error(`Error opening position on ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error opening position on ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error)
+        error: errMsg
       });
     }
   }
@@ -993,10 +998,11 @@ var TradingEngine = class {
         `\u2705 Closed position on ${symbol} at ${exitPrice}. P&L: ${pnl} (${pnlPercent}%)`
       );
     } catch (error) {
-      console.error(`Error closing position on ${symbol}:`, error);
-      await this.logTrade("ERROR", `Error closing position on ${symbol}: ${error}`, {
+      const errMsg = error instanceof Error ? error.message : typeof error === "object" && error !== null ? JSON.stringify(error) : String(error);
+      console.error(`Error closing position on ${symbol}:`, errMsg);
+      await this.logTrade("ERROR", `Error closing position on ${symbol}: ${errMsg}`, {
         symbol,
-        error: String(error)
+        error: errMsg
       });
     }
   }

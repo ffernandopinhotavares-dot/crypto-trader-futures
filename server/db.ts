@@ -15,11 +15,15 @@ export async function initializeDatabase() {
     throw new Error("DATABASE_URL environment variable is not set");
   }
 
+  // Fly.io internal postgres uses .internal hostname and doesn't require SSL
+  const isInternalFlyDb = databaseUrl.includes('.internal') || databaseUrl.includes('.flycast');
+  const sslConfig = isInternalFlyDb ? false : (process.env.NODE_ENV === 'production' ? 'require' : undefined);
+
   client = postgres(databaseUrl, {
     max: 10,
     idle_timeout: 20,
-    connect_timeout: 10,
-    ssl: process.env.NODE_ENV === "production" ? "require" : undefined,
+    connect_timeout: 30,
+    ssl: sslConfig,
   });
 
   db = drizzle(client, { schema });
