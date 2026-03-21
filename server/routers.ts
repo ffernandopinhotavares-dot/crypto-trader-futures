@@ -623,6 +623,168 @@ const logsRouter = router({
 });
 
 // ============================================================================
+// Maintenance Router — Fix historical data issues
+// ============================================================================
+
+const maintenanceRouter = router({
+  /**
+   * Recalculate PnL for all closed trades that have incorrect or missing PnL values.
+   * This fixes the historical bug where quantoMultiplier was calculated as 1/entryPrice.
+   * It fetches the correct quantoMultiplier from Gate.io for each symbol and recalculates.
+   */
+  fixHistoricalPnl: protectedProcedure.mutation(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    // Get all closed trades for this user
+    const closedTrades = await db.select().from(trades)
+      .where(and(eq(trades.userId, userId), eq(trades.status, "CLOSED")));
+
+    // Create a public Gate.io client for contract info
+    const publicClient = createGateioClient({ apiKey: "", apiSecret: "" });
+
+    // Cache quantoMultiplier per symbol
+    const qmCache: Record<string, number> = {};
+
+    let fixed = 0;
+    let skipped = 0;
+    let errors = 0;
+    const details: Array<{ id: string; symbol: string; oldPnl: string; newPnl: string; reason: string }> = [];
+
+    for (const t of closedTrades) {
+      try {
+        // Skip trades without exit price (truly unknown)
+        if (!t.exitPrice || parseFloat(t.exitPrice) === 0) {
+          skipped++;
+          continue;
+        }
+
+        const entryPrice = parseFloat(t.entryPrice || "0");
+        const exitPrice = parseFloat(t.exitPrice || "0");
+        const quantity = parseFloat(t.quantity || "0");
+
+        if (entryPrice <= 0 || exitPrice <= 0 || quantity <= 0) {
+          skipped++;
+          continue;
+        }
+
+        // Get quantoMultiplier (from cache or API)
+        if (!qmCache[t.symbol]) {
+          try {
+            const contractInfo = await publicClient.getContractInfo(t.symbol);
+            qmCache[t.symbol] = parseFloat(
+              contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1"
+            );
+            // Rate limiting delay
+            await new Promise(r => setTimeout(r, 150));
+          } catch {
+            qmCache[t.symbol] = 1; // safe default
+          }
+        }
+
+        const qm = qmCache[t.symbol];
+
+        // Recalculate PnL
+        const correctPnl = t.side === "BUY"
+          ? (exitPrice - entryPrice) * quantity * qm
+          : (entryPrice - exitPrice) * quantity * qm;
+        const correctPnlPercent = t.side === "BUY"
+          ? ((exitPrice - entryPrice) / entryPrice) * 100
+          : ((entryPrice - exitPrice) / entryPrice) * 100;
+
+        const oldPnl = parseFloat(t.pnl || "0");
+
+        // Check if PnL needs fixing (more than 10% difference or null)
+        const needsFix = !t.pnl
+          || Math.abs(oldPnl) === 0
+          || (correctPnl !== 0 && Math.abs((oldPnl - correctPnl) / correctPnl) > 0.1);
+
+        if (needsFix) {
+          await db.update(trades).set({
+            pnl: correctPnl.toFixed(8),
+            pnlPercent: Math.max(-999.99, Math.min(999.99, correctPnlPercent)).toFixed(2),
+            stopLoss: qm.toString(), // Store correct QM for future reference
+          }).where(eq(trades.id, t.id));
+
+          details.push({
+            id: t.id,
+            symbol: t.symbol,
+            oldPnl: (t.pnl || "null"),
+            newPnl: correctPnl.toFixed(8),
+            reason: `QM=${qm}, entry=${entryPrice}, exit=${exitPrice}, qty=${quantity}`,
+          });
+          fixed++;
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        errors++;
+      }
+    }
+
+    // Recalculate bot_status counters from corrected trade data
+    try {
+      const allTrades = await db.select().from(trades)
+        .where(and(eq(trades.userId, userId), eq(trades.status, "CLOSED")));
+
+      const totalTrades = allTrades.length;
+      const winningTrades = allTrades.filter(t => parseFloat(t.pnl || "0") > 0).length;
+      const losingTrades = allTrades.filter(t => parseFloat(t.pnl || "0") <= 0).length;
+      const totalPnl = allTrades.reduce((sum, t) => sum + parseFloat(t.pnl || "0"), 0);
+
+      await db.update(botStatus).set({
+        totalTrades,
+        winningTrades,
+        losingTrades,
+        totalPnl: totalPnl.toFixed(8),
+      }).where(eq(botStatus.userId, userId));
+    } catch (e) {
+      console.error("Error recalculating bot stats:", e);
+    }
+
+    return {
+      totalProcessed: closedTrades.length,
+      fixed,
+      skipped,
+      errors,
+      details: details.slice(0, 50), // limit response size
+    };
+  }),
+
+  /**
+   * Reset bot statistics (totalTrades, winningTrades, losingTrades, totalPnl)
+   * by recalculating from actual trade records in the database.
+   */
+  recalculateStats: protectedProcedure.mutation(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    const allTrades = await db.select().from(trades)
+      .where(and(eq(trades.userId, userId), eq(trades.status, "CLOSED")));
+
+    const totalTrades = allTrades.length;
+    const winningTrades = allTrades.filter(t => parseFloat(t.pnl || "0") > 0).length;
+    const losingTrades = allTrades.filter(t => parseFloat(t.pnl || "0") <= 0).length;
+    const totalPnl = allTrades.reduce((sum, t) => sum + parseFloat(t.pnl || "0"), 0);
+
+    await db.update(botStatus).set({
+      totalTrades,
+      winningTrades,
+      losingTrades,
+      totalPnl: totalPnl.toFixed(8),
+    }).where(eq(botStatus.userId, userId));
+
+    return {
+      totalTrades,
+      winningTrades,
+      losingTrades,
+      totalPnl: parseFloat(totalPnl.toFixed(8)),
+      winRate: totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0,
+    };
+  }),
+});
+
+// ============================================================================
 // Main Router
 // ============================================================================
 
@@ -636,6 +798,7 @@ export const appRouter = router({
   marketData: marketDataRouter,
   trades: tradesRouter,
   logs: logsRouter,
+  maintenance: maintenanceRouter,
 });
 
 export type AppRouter = typeof appRouter;

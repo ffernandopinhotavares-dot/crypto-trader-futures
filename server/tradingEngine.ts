@@ -200,7 +200,7 @@ export class TradingEngine {
     while (this.isRunning) {
       try {
         this.cycleCount++;
-        await this.logEvent("CYCLE_START", "SYSTEM", `Cycle #${this.cycleCount} started`);
+        await this.logEvent("CYCLE_START", "SYSTEM", `Cycle #${this.cycleCount} started | Positions: ${this.positions.size}`);
 
         // 1. Check drawdown protection
         if (await this.isDrawdownExceeded()) {
@@ -211,11 +211,17 @@ export class TradingEngine {
         }
 
         // 2. Monitor existing positions — ask AI if we should close any
+        // [FIX 5.3+] Monitor every cycle, but scanAndTrade only every 2 cycles
+        // This gives positions more time to develop while still checking for exits
         await this.monitorPositions();
 
-        // 3. Scan market for new opportunities (only if we have room)
-        if (this.positions.size < this.config.maxOpenPositions) {
+        // 3. Scan market for new opportunities only every 2nd cycle
+        // This reduces API calls and gives the AI time to evaluate existing positions
+        const shouldScan = this.cycleCount % 2 === 1; // scan on odd cycles (1, 3, 5...)
+        if (shouldScan && this.positions.size < this.config.maxOpenPositions) {
           await this.scanAndTrade();
+        } else if (!shouldScan) {
+          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} (scan every 2 cycles)`);
         }
 
         // 4. Update heartbeat
