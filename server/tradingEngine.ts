@@ -215,13 +215,13 @@ export class TradingEngine {
         // This gives positions more time to develop while still checking for exits
         await this.monitorPositions();
 
-        // 3. Scan market for new opportunities only every 2nd cycle
-        // This reduces API calls and gives the AI time to evaluate existing positions
-        const shouldScan = this.cycleCount % 2 === 1; // scan on odd cycles (1, 3, 5...)
-        if (shouldScan && this.positions.size < this.config.maxOpenPositions) {
+        // 3. Scan market for new opportunities every cycle when there is capital available
+        // Always scan if there are open slots AND available capital to deploy
+        const hasOpenSlots = this.positions.size < this.config.maxOpenPositions;
+        if (hasOpenSlots) {
           await this.scanAndTrade();
-        } else if (!shouldScan) {
-          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} (scan every 2 cycles)`);
+        } else {
+          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} — max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
         }
 
         // 4. Update heartbeat
@@ -247,8 +247,8 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // [FIX 5.8] Use cached top pairs
-      const topPairs = await this.getCachedTopPairs(20);
+      // Scan more pairs to maximise opportunity discovery
+      const topPairs = await this.getCachedTopPairs(50);
       console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map((p: any) => p.symbol).join(', ')}...`);
 
       const snapshots: MarketSnapshot[] = [];
@@ -277,26 +277,42 @@ export class TradingEngine {
         return;
       }
 
-      // Ask AI to pick the best opportunities
+      // Ask AI to recommend ALL viable opportunities (not just the best one)
       const decisions = await this.askAIForOpportunities(snapshots);
 
+      let openedCount = 0;
       for (const decision of decisions) {
         if (!this.isRunning) break;
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue; // already in position
-        if (this.positions.size >= this.config.maxOpenPositions) break;
+
+        // Check capital availability dynamically before each trade
+        const balance = await this.config.gateioClient.getBalance();
+        const available = parseFloat(balance.availableBalance);
+        if (available < 1.0) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: available balance too low ($${available.toFixed(2)} USDT)`);
+          break;
+        }
+        if (this.positions.size >= this.config.maxOpenPositions) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
+          break;
+        }
 
         // [FIX 5.6] Cap leverage at 10x regardless of AI decision
         decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
 
         try {
           await this.executeDecision(decision);
+          openedCount++;
           // [FIX 5.8] Rate limiting delay between executions
           await this.sleep(TradingEngine.API_DELAY_MS * 2);
         } catch (error) {
           await this.logEvent("ERROR", decision.symbol, `Failed to execute: ${this.errStr(error)}`);
         }
+      }
+      if (openedCount > 0) {
+        await this.logEvent("INFO", "SYSTEM", `[SCAN] Opened ${openedCount} new positions this cycle | Total open: ${this.positions.size}`);
       }
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
@@ -390,19 +406,26 @@ export class TradingEngine {
     // [FIX 5.6] Updated max leverage in prompt
     const maxLev = this.getMaxLeverage();
 
-    const systemPrompt = `Você é um agente de trading algorítmico avançado especializado em criptoativos (futuros), com foco em maximização de retorno ajustado ao risco.
+    // Calculate how many more positions we can open
+    const openSlots = this.config.maxOpenPositions - this.positions.size;
+    const maxNewPositions = Math.min(openSlots, Math.floor(availableBalance / 10) + 1); // each position uses ~$10
+
+    const systemPrompt = `Você é um agente de trading algorítmico avançado especializado em criptoativos (futuros), com foco em MAXIMIZAR o número de posições abertas usando TODO o capital disponível.
+
+OBJETIVO PRINCIPAL: Identificar TODOS os trades viáveis nos dados fornecidos e recomendar TODOS eles. Não filtre demais — se um trade tem evidência técnica suficiente, recomende-o.
 
 COMPORTAMENTO:
 - Tome decisões baseadas em EVIDÊNCIA TÉCNICA CLARA, não em intuição.
-- Só abra posições quando houver CONFLUÊNCIA de pelo menos 2 indicadores.
-- Prefira abrir MUITAS posições de valores BAIXOS alavancados para diversificar.
-- NUNCA abra posição se a evidência for ambígua ou fraca.
+- Abra posição quando houver CONFLUÊNCIA de pelo menos 2 indicadores.
+- MAXIMIZE o número de posições: prefira recomendar mais trades com confiança moderada do que poucos com confiança alta.
+- Cada posição usa EXATAMENTE $10 USDT de capital base (o sistema aplica isso automaticamente).
+- NÃO calcule positionSizePercent — use sempre 100 (o sistema ignora esse campo e usa $10 fixo).
 
-CRITÉRIOS QUANTITATIVOS OBRIGATÓRIOS:
-- LONG: RSI < 40 OU (RSI 40-60 + MACD bullish + acima EMA50 + volume_ratio > 1.2)
-- SHORT: RSI > 60 OU (RSI 40-60 + MACD bearish + abaixo EMA50 + volume_ratio > 1.2)
-- Volatilidade mínima: 0.5% (pares muito estáveis não geram lucro)
-- Volume ratio mínimo: 0.8 (liquidez insuficiente = risco de slippage)
+CRITÉRIOS QUANTITATIVOS:
+- LONG: RSI < 45 OU (RSI 45-55 + MACD bullish + acima EMA50) OU (volume_ratio > 1.5 + tendência BULLISH)
+- SHORT: RSI > 55 OU (RSI 45-55 + MACD bearish + abaixo EMA50) OU (volume_ratio > 1.5 + tendência BEARISH)
+- Volatilidade mínima: 0.3% (pares muito estáveis não geram lucro)
+- Volume ratio mínimo: 0.7 (liquidez insuficiente = risco de slippage)
 - Funding rate: negativo favorece longs, positivo favorece shorts
 
 EXCHANGE: Gate.io Futures (USDT-M)
@@ -412,26 +435,30 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 - Alavancagem máxima: ${maxLev}x
 - Confiança mínima: ${minConf}%
 
-REGRAS OBRIGATÓRIAS:
-- CADA posição deve ter valor nocional de no MÁXIMO $10 USDT (antes da alavancagem)
-- Abra MUITAS posições pequenas para diversificar (até ${this.config.maxOpenPositions} simultâneas, atualmente ${this.positions.size} abertas)
+CAPITAL DISPONÍVEL:
 - Saldo disponível: ${availableBalance.toFixed(2)} USDT
-- positionSizePercent deve resultar em ~$5-10 USDT por trade (calcule: ${availableBalance.toFixed(2)} * percent/100 = valor base)
-- Considere funding rate (negativo favorece longs, positivo favorece shorts)
-- Sempre considere risco de liquidação
-- PRIORIZE abrir várias posições diferentes em vez de poucas grandes
+- Slots disponíveis: ${openSlots} (posições abertas: ${this.positions.size}/${this.config.maxOpenPositions})
+- Posições que podem ser abertas agora: até ${maxNewPositions}
+- CADA posição usa $10 USDT fixo (o sistema calcula os contratos automaticamente)
 
-Responda APENAS com um JSON array de decisões. Cada decisão:
-{
-  "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
-  "symbol": "BTC_USDT",
-  "confidence": 75,
-  "leverage": ${maxLev},
-  "positionSizePercent": 3,
-  "reasoning": "breve explicação com indicadores que justificam"
-}
+REGRAS:
+- Retorne TODOS os trades viáveis que encontrar, até ${maxNewPositions} oportunidades
+- Ordene por confiança (maior primeiro)
+- NUNCA repita o mesmo símbolo
+- Só inclua trades com confiança >= ${minConf}%
+- Se não houver boas oportunidades, retorne array vazio []
 
-Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver boas oportunidades, retorne array vazio []. PRIORIZE diversificação: escolha pares DIFERENTES. Só inclua trades com confiança >= ${minConf}%.`;
+Responda APENAS com um JSON array:
+[
+  {
+    "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
+    "symbol": "BTC_USDT",
+    "confidence": 75,
+    "leverage": ${maxLev},
+    "positionSizePercent": 100,
+    "reasoning": "RSI=38 oversold + MACD bullish + acima EMA50 + volume_ratio=1.8"
+  }
+]`;
 
     try {
       const response = await this.openai.chat.completions.create({
@@ -648,9 +675,9 @@ Responda APENAS com JSON:
       const balance = await this.config.gateioClient.getBalance();
       const available = parseFloat(balance.availableBalance);
 
-      // Cap position size: max $10 USDT per position (before leverage)
-      const sizePercent = Math.min(decision.positionSizePercent, this.config.maxRiskPerTrade);
-      const baseValue = Math.min(available * (sizePercent / 100), 10); // hard cap at $10
+      // Always use exactly $10 per position (or available balance if less)
+      // This maximises capital deployment: every position uses the full $10 slot
+      const baseValue = Math.min(available, 10); // hard cap at $10, use all available if < $10
       const notionalValue = baseValue * decision.leverage;
 
       // Get current price
