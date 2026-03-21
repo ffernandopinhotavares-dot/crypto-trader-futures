@@ -371,222 +371,198 @@ var protectedProcedure = t.procedure;
 import { z } from "zod";
 
 // server/bybit.ts
-import axios from "axios";
-import crypto from "crypto";
+import { RestClientV5 } from "bybit-api";
 var BybitClient = class {
-  apiKey;
-  apiSecret;
-  baseUrl;
   client;
   constructor(config) {
-    this.apiKey = config.apiKey;
-    this.apiSecret = config.apiSecret;
-    this.baseUrl = config.testnet ? "https://api-testnet.bybit.com" : "https://api.bybit.com";
-    this.client = axios.create({
-      baseURL: this.baseUrl,
-      timeout: 1e4
+    this.client = new RestClientV5({
+      key: config.apiKey,
+      secret: config.apiSecret,
+      testnet: config.testnet ?? false,
+      // Use the NL/EU endpoint which avoids CloudFront geo-blocking on US servers
+      // This is the recommended approach for servers hosted in regions that face 403 errors
+      baseUrl: config.testnet ? "https://api-testnet.bybit.com" : "https://api.bytick.com",
+      recv_window: 1e4
     });
-  }
-  /**
-   * Generate signature for request
-   */
-  generateSignature(timestamp2, method, path2, body) {
-    const message = `${timestamp2}${method}${path2}${body}`;
-    return crypto.createHmac("sha256", this.apiSecret).update(message).digest("hex");
-  }
-  /**
-   * Make authenticated request
-   */
-  async request(method, path2, data) {
-    const timestamp2 = Date.now().toString();
-    const body = method === "GET" ? "" : JSON.stringify(data || {});
-    const signature = this.generateSignature(timestamp2, method, path2, body);
-    const headers = {
-      "X-BAPI-SIGN": signature,
-      "X-BAPI-API-KEY": this.apiKey,
-      "X-BAPI-TIMESTAMP": timestamp2,
-      "Content-Type": "application/json"
-    };
-    try {
-      const response = await this.client({
-        method,
-        url: path2,
-        data: method === "POST" ? data : void 0,
-        headers
-      });
-      return response.data;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        throw new Error(
-          `Bybit API Error: ${error.response?.status} - ${JSON.stringify(
-            error.response?.data
-          )}`
-        );
-      }
-      throw error;
-    }
   }
   /**
    * Get account balance
    */
   async getBalance() {
-    const response = await this.request("GET", "/v5/account/wallet-balance");
-    return response.result.list[0].coin;
+    const response = await this.client.getWalletBalance({
+      accountType: "UNIFIED"
+    });
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
+    return response.result.list[0]?.coin ?? [];
   }
   /**
    * Get open positions
    */
   async getPositions(symbol) {
-    const params = new URLSearchParams();
-    params.append("settleCoin", "USDT");
-    if (symbol) {
-      params.append("symbol", symbol);
+    const params = {
+      category: "linear",
+      settleCoin: "USDT"
+    };
+    if (symbol) params.symbol = symbol;
+    const response = await this.client.getPositionInfo(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
     }
-    const response = await this.request(
-      "GET",
-      `/v5/position/list?${params.toString()}`
-    );
     return response.result.list;
   }
   /**
    * Place order
    */
   async placeOrder(symbol, side, orderType, qty, price) {
-    const data = {
+    const params = {
       category: "linear",
       symbol,
       side,
       orderType,
       qty,
-      price: orderType === "Limit" ? price : void 0,
       timeInForce: "GTC"
     };
-    const response = await this.request("POST", "/v5/order/create", data);
+    if (orderType === "Limit" && price) {
+      params.price = price;
+    }
+    const response = await this.client.submitOrder(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
     return response.result;
   }
   /**
    * Cancel order
    */
   async cancelOrder(symbol, orderId) {
-    await this.request("POST", "/v5/order/cancel", {
+    const response = await this.client.cancelOrder({
       category: "linear",
       symbol,
       orderId
     });
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
   }
   /**
    * Get order history
    */
   async getOrderHistory(symbol, limit = 50) {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    params.append("limit", limit.toString());
-    if (symbol) {
-      params.append("symbol", symbol);
+    const params = {
+      category: "linear",
+      limit
+    };
+    if (symbol) params.symbol = symbol;
+    const response = await this.client.getHistoricOrders(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
     }
-    const response = await this.request(
-      "GET",
-      `/v5/order/history?${params.toString()}`
-    );
     return response.result.list;
   }
   /**
    * Get klines (candlestick data)
    */
   async getKlines(symbol, interval, limit = 200, startTime) {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    params.append("symbol", symbol);
-    params.append("interval", interval);
-    params.append("limit", limit.toString());
-    if (startTime) {
-      params.append("start", startTime.toString());
+    const params = {
+      category: "linear",
+      symbol,
+      interval,
+      limit
+    };
+    if (startTime) params.start = startTime;
+    const response = await this.client.getKline(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
     }
-    const response = await this.request(
-      "GET",
-      `/v5/market/kline?${params.toString()}`
-    );
-    return response.result.list;
+    return response.result.list.map((k) => ({
+      startTime: k[0],
+      openPrice: k[1],
+      highPrice: k[2],
+      lowPrice: k[3],
+      closePrice: k[4],
+      volume: k[5],
+      turnover: k[6]
+    }));
   }
   /**
    * Get ticker (current price and stats)
    */
   async getTicker(symbol) {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    params.append("symbol", symbol);
-    const response = await this.request(
-      "GET",
-      `/v5/market/tickers?${params.toString()}`
-    );
+    const response = await this.client.getTickers({
+      category: "linear",
+      symbol
+    });
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
     return response.result.list[0];
   }
   /**
    * Get instrument info
    */
   async getInstruments(symbol) {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    if (symbol) {
-      params.append("symbol", symbol);
+    const params = { category: "linear" };
+    if (symbol) params.symbol = symbol;
+    const response = await this.client.getInstrumentsInfo(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
     }
-    const response = await this.request(
-      "GET",
-      `/v5/market/instruments-info?${params.toString()}`
-    );
     return response.result.list;
   }
   /**
    * Get all trading pairs
    */
   async getAllInstruments() {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    const response = await this.request(
-      "GET",
-      `/v5/market/instruments-info?${params.toString()}`
-    );
+    const response = await this.client.getInstrumentsInfo({ category: "linear" });
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
     return response.result.list;
   }
   /**
    * Set leverage
    */
   async setLeverage(symbol, leverage) {
-    await this.request("POST", "/v5/position/set-leverage", {
+    const response = await this.client.setLeverage({
       category: "linear",
       symbol,
       buyLeverage: leverage.toString(),
       sellLeverage: leverage.toString()
     });
+    if (response.retCode !== 0 && response.retCode !== 110043) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
   }
   /**
    * Set stop loss and take profit
    */
   async setStopLossTakeProfit(symbol, side, stopLoss, takeProfit) {
-    const data = {
+    const params = {
       category: "linear",
       symbol,
       side
     };
-    if (stopLoss) {
-      data.stopLoss = stopLoss;
+    if (stopLoss) params.stopLoss = stopLoss;
+    if (takeProfit) params.takeProfit = takeProfit;
+    const response = await this.client.setTPSLMode(params);
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
     }
-    if (takeProfit) {
-      data.takeProfit = takeProfit;
-    }
-    await this.request("POST", "/v5/position/trading-stop", data);
   }
   /**
    * Get funding rate
    */
   async getFundingRate(symbol) {
-    const params = new URLSearchParams();
-    params.append("category", "linear");
-    params.append("symbol", symbol);
-    const response = await this.request(
-      "GET",
-      `/v5/market/funding/history?${params.toString()}`
-    );
+    const response = await this.client.getFundingRateHistory({
+      category: "linear",
+      symbol,
+      limit: 1
+    });
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API Error: ${response.retMsg}`);
+    }
     return response.result.list[0];
   }
 };
