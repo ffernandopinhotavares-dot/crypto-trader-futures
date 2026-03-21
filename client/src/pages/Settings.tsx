@@ -17,8 +17,8 @@ function NeonCard({ children, style }: { children: React.ReactNode; style?: Reac
 }
 
 export function SettingsPage() {
-  const { data: apiKeys, refetch } = trpc.bybitKeys.getKeys.useQuery();
-  const { mutate: deleteKeys } = trpc.bybitKeys.deleteKeys.useMutation({
+  const { data: apiKeys, refetch } = trpc.binanceKeys.getKeys.useQuery();
+  const { mutate: deleteKeys } = trpc.binanceKeys.deleteKeys.useMutation({
     onSuccess: () => {
       toast.success("Chaves removidas. Recarregue a página para configurar novas chaves.");
       refetch();
@@ -38,7 +38,7 @@ export function SettingsPage() {
         <NeonCard>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
             <Key size={15} style={{ color: "#00ff8866" }} />
-            <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>Chaves API Bybit</h2>
+            <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>Chaves API Binance Futures</h2>
           </div>
 
           {apiKeys ? (
@@ -85,9 +85,9 @@ export function SettingsPage() {
           <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88", marginBottom: "16px" }}>Sobre</h2>
           {[
             ["Versão", "1.0.0"],
-            ["Plataforma", "Bybit Futures"],
+            ["Plataforma", "Binance Futures (USD-M)"],
             ["Indicadores", "RSI, MACD, BB, EMA, Volume"],
-            ["Atualizado em", "20 de Março de 2026"],
+            ["Atualizado em", "21 de Março de 2026"],
           ].map(([label, value]) => (
             <div key={label} style={{ marginBottom: "10px" }}>
               <p style={{ fontSize: "10px", color: "#00ff8844" }}>{label}</p>

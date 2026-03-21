@@ -28,7 +28,7 @@ export function DashboardLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const currentTime = useCurrentTime();
 
-  const { data: apiKeys, isLoading } = trpc.bybitKeys.getKeys.useQuery();
+  const { data: apiKeys, isLoading } = trpc.binanceKeys.getKeys.useQuery();
   const { data: botStatus } = trpc.botControl.getStatus.useQuery(undefined, {
     refetchInterval: 5000,
   });
