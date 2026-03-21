@@ -76,12 +76,14 @@ export class TradingEngine {
   private cycleCount: number = 0;
   private initialBalance: number = 0;
 
-  // [FIX 5.8] Cache for contract info and top pairs
+  // [FIX 5.8] Cache for contract info and tickers
   private contractInfoCache: Map<string, { data: any; cachedAt: number }> = new Map();
-  private topPairsCache: { data: any[] | null; cachedAt: number } = { data: null, cachedAt: 0 };
+  private allTickersCache: { data: any[] | null; cachedAt: number } = { data: null, cachedAt: 0 };
   private static readonly CONTRACT_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-  private static readonly TOP_PAIRS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  private static readonly ALL_TICKERS_CACHE_TTL = 3 * 60 * 1000; // 3 minutes (full market scan)
   private static readonly API_DELAY_MS = 100; // 100ms between API calls
+  private static readonly SNAPSHOT_BATCH_SIZE = 15; // parallel candle fetches per batch
+  private static readonly AI_BATCH_SIZE = 50; // pairs per AI call
 
   private get db() { return getDatabase(); }
 
@@ -247,41 +249,84 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // Scan more pairs to maximise opportunity discovery
-      const topPairs = await this.getCachedTopPairs(50);
-      console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map((p: any) => p.symbol).join(', ')}...`);
+      // ================================================================
+      // STAGE 1: Fetch ALL tickers in a single API call, pre-filter by volume
+      // ================================================================
+      const allTickers = await this.getCachedAllTickers();
+      // Exclude pairs already in position
+      const candidateTickers = allTickers.filter(t => !this.positions.has(t.symbol));
+      await this.logEvent("INFO", "SYSTEM",
+        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$50k) | ${candidateTickers.length} candidates (excl. open positions)`);
 
-      const snapshots: MarketSnapshot[] = [];
-      let snapshotErrors = 0;
-      for (const pair of topPairs) {
-        try {
-          const snapshot = await this.getMarketSnapshot(pair.symbol);
-          if (snapshot) {
-            snapshots.push(snapshot);
-          } else {
-            snapshotErrors++;
-          }
-        } catch (err) {
-          snapshotErrors++;
-          console.error(`[SCAN] Snapshot error for ${pair.symbol}: ${this.errStr(err)}`);
-        }
-        // [FIX 5.8] Rate limiting delay between API calls
-        await this.sleep(TradingEngine.API_DELAY_MS);
-      }
-
-      console.log(`[SCAN] Got ${snapshots.length} snapshots, ${snapshotErrors} errors`);
-
-      if (snapshots.length === 0) {
-        console.log(`[SCAN] No valid snapshots — skipping AI analysis`);
-        await this.logEvent("ERROR", "SYSTEM", `Scan: 0 valid snapshots from ${topPairs.length} pairs (${snapshotErrors} errors)`);
+      if (candidateTickers.length === 0) {
+        await this.logEvent("INFO", "SYSTEM", `[SCAN] No candidates — all pairs already in position or below volume threshold`);
         return;
       }
 
-      // Ask AI to recommend ALL viable opportunities (not just the best one)
-      const decisions = await this.askAIForOpportunities(snapshots);
+      // ================================================================
+      // STAGE 2: Fetch candles in parallel batches, build market snapshots
+      // ================================================================
+      const snapshots: MarketSnapshot[] = [];
+      let snapshotErrors = 0;
+      const batchSize = TradingEngine.SNAPSHOT_BATCH_SIZE;
 
+      for (let i = 0; i < candidateTickers.length; i += batchSize) {
+        if (!this.isRunning) break;
+        const batch = candidateTickers.slice(i, i + batchSize);
+
+        // Fetch candles for this batch in parallel
+        const batchResults = await Promise.allSettled(
+          batch.map(ticker => this.getMarketSnapshot(ticker.symbol))
+        );
+
+        for (const result of batchResults) {
+          if (result.status === "fulfilled" && result.value) {
+            snapshots.push(result.value);
+          } else {
+            snapshotErrors++;
+          }
+        }
+
+        // Small delay between batches to respect rate limits
+        if (i + batchSize < candidateTickers.length) {
+          await this.sleep(TradingEngine.API_DELAY_MS * 3);
+        }
+      }
+
+      await this.logEvent("INFO", "SYSTEM",
+        `[SCAN] Stage 2: ${snapshots.length} snapshots built | ${snapshotErrors} errors | from ${candidateTickers.length} candidates`);
+
+      if (snapshots.length === 0) {
+        await this.logEvent("ERROR", "SYSTEM", `[SCAN] 0 valid snapshots — skipping AI analysis`);
+        return;
+      }
+
+      // ================================================================
+      // STAGE 3: Send snapshots to AI in batches of AI_BATCH_SIZE
+      // Collect ALL recommendations across all batches, then execute
+      // ================================================================
+      const allDecisions: AIDecision[] = [];
+      const aiBatchSize = TradingEngine.AI_BATCH_SIZE;
+
+      for (let i = 0; i < snapshots.length; i += aiBatchSize) {
+        if (!this.isRunning) break;
+        const snapshotBatch = snapshots.slice(i, i + aiBatchSize);
+        const batchDecisions = await this.askAIForOpportunities(snapshotBatch);
+        allDecisions.push(...batchDecisions);
+        await this.logEvent("INFO", "SYSTEM",
+          `[SCAN] Stage 3 AI batch ${Math.floor(i/aiBatchSize)+1}/${Math.ceil(snapshots.length/aiBatchSize)}: ${batchDecisions.length} recommendations`);
+      }
+
+      // Sort all decisions by confidence (highest first)
+      allDecisions.sort((a, b) => b.confidence - a.confidence);
+      await this.logEvent("INFO", "SYSTEM",
+        `[SCAN] Stage 3 complete: ${allDecisions.length} total recommendations from ${Math.ceil(snapshots.length/aiBatchSize)} AI calls`);
+
+      // ================================================================
+      // EXECUTE: Open all viable positions
+      // ================================================================
       let openedCount = 0;
-      for (const decision of decisions) {
+      for (const decision of allDecisions) {
         if (!this.isRunning) break;
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
         if (decision.confidence < this.getMinConfidence()) continue;
@@ -305,15 +350,15 @@ export class TradingEngine {
         try {
           await this.executeDecision(decision);
           openedCount++;
-          // [FIX 5.8] Rate limiting delay between executions
           await this.sleep(TradingEngine.API_DELAY_MS * 2);
         } catch (error) {
           await this.logEvent("ERROR", decision.symbol, `Failed to execute: ${this.errStr(error)}`);
         }
       }
-      if (openedCount > 0) {
-        await this.logEvent("INFO", "SYSTEM", `[SCAN] Opened ${openedCount} new positions this cycle | Total open: ${this.positions.size}`);
-      }
+
+      await this.logEvent("INFO", "SYSTEM",
+        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size}/${this.config.maxOpenPositions}`);
+
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
     }
@@ -650,14 +695,18 @@ Responda APENAS com JSON:
     return contractInfo;
   }
 
-  private async getCachedTopPairs(limit: number): Promise<any[]> {
-    if (this.topPairsCache.data && (Date.now() - this.topPairsCache.cachedAt) < TradingEngine.TOP_PAIRS_CACHE_TTL) {
-      return this.topPairsCache.data;
+  /**
+   * Returns all tickers with volume > $50k, cached for 3 minutes.
+   * Single API call covers all 650+ Gate.io futures pairs.
+   */
+  private async getCachedAllTickers(): Promise<any[]> {
+    if (this.allTickersCache.data && (Date.now() - this.allTickersCache.cachedAt) < TradingEngine.ALL_TICKERS_CACHE_TTL) {
+      return this.allTickersCache.data;
     }
 
-    const topPairs = await this.config.gateioClient.getTopPairs(limit);
-    this.topPairsCache = { data: topPairs, cachedAt: Date.now() };
-    return topPairs;
+    const tickers = await this.config.gateioClient.getAllTickers(50000);
+    this.allTickersCache = { data: tickers, cachedAt: Date.now() };
+    return tickers;
   }
 
   // --------------------------------------------------------------------------

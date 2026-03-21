@@ -118,6 +118,33 @@ export class GateioClient {
     }));
   }
 
+  /**
+   * Returns ALL available futures tickers (no limit), pre-filtered by minimum volume.
+   * Used for full-market scanning across all 650+ pairs.
+   * @param minVolume24hUsd Minimum 24h volume in USD to include (default $50,000)
+   */
+  async getAllTickers(minVolume24hUsd: number = 50000): Promise<GateioTicker[]> {
+    const result = await this.futuresApi.listFuturesTickers(this.settle);
+    const tickers = result.body as any[];
+
+    return tickers
+      .filter((t: any) => {
+        const vol = parseFloat(t.volume24hQuote || "0");
+        const price = parseFloat(t.last || "0");
+        return vol >= minVolume24hUsd && price > 0 && t.contract;
+      })
+      .sort((a: any, b: any) => parseFloat(b.volume24hQuote || "0") - parseFloat(a.volume24hQuote || "0"))
+      .map((t: any) => ({
+        symbol: t.contract || "",
+        lastPrice: t.last || "0",
+        priceChangePercent: t.changePercentage || "0",
+        volume24h: t.volume24hQuote || "0",
+        highPrice: t.high24h || "0",
+        lowPrice: t.low24h || "0",
+        fundingRate: t.fundingRate || "0",
+      }));
+  }
+
   async getTicker(symbol: string): Promise<GateioTicker> {
     const result = await this.futuresApi.listFuturesTickers(this.settle, {
       contract: symbol,
