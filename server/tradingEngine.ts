@@ -25,6 +25,7 @@ export interface TradePosition {
   entryTime: Date;
   leverage: number;
   confidence: number; // 0-100 confidence at entry
+  quantoMultiplier: number; // [FIX 5.1] cached at entry for correct PnL calculation
 }
 
 export interface TradingEngineConfig {
@@ -75,6 +76,13 @@ export class TradingEngine {
   private cycleCount: number = 0;
   private initialBalance: number = 0;
 
+  // [FIX 5.8] Cache for contract info and top pairs
+  private contractInfoCache: Map<string, { data: any; cachedAt: number }> = new Map();
+  private topPairsCache: { data: any[] | null; cachedAt: number } = { data: null, cachedAt: 0 };
+  private static readonly CONTRACT_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+  private static readonly TOP_PAIRS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  private static readonly API_DELAY_MS = 100; // 100ms between API calls
+
   private get db() { return getDatabase(); }
 
   constructor(config: TradingEngineConfig) {
@@ -92,9 +100,12 @@ export class TradingEngine {
       this.initialBalance = parseFloat(balance.totalBalance);
     } catch { this.initialBalance = 0; }
 
+    // [FIX 5.7] Sync existing exchange positions into memory
+    await this.syncPositionsFromExchange();
+
     console.log(`AI Trading engine started for user ${this.config.userId}`);
     await this.updateBotStatus({ isRunning: true });
-    await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}%`);
+    await this.logEvent("BOT_START", "SYSTEM", `AI Trading bot started | Profile: ${this.config.aggressiveness} | Max risk/trade: ${this.config.maxRiskPerTrade}% | Synced ${this.positions.size} positions from exchange`);
     this.mainLoop();
   }
 
@@ -113,11 +124,23 @@ export class TradingEngine {
       if (result.errors.length > 0) {
         await this.logEvent("ERROR", "SYSTEM", `Failed to close ${result.errors.length} positions: ${result.errors.join("; ")}`);
       }
-      // Also update in-memory positions and DB trades
-      for (const [symbol] of Array.from(this.positions.entries())) {
+      // [FIX 5.9] Update in-memory positions and DB trades with better fallback
+      for (const [symbol, position] of Array.from(this.positions.entries())) {
         try {
-          const ticker = await this.config.gateioClient.getTicker(symbol);
-          const exitPrice = parseFloat(ticker.lastPrice);
+          let exitPrice: number;
+          try {
+            const ticker = await this.config.gateioClient.getTicker(symbol);
+            exitPrice = parseFloat(ticker.lastPrice);
+          } catch {
+            // [FIX 5.9] Fallback: use markPrice from exchange positions or entryPrice
+            try {
+              const exchangePositions = await this.config.gateioClient.getPositions();
+              const pos = exchangePositions.find(p => p.symbol === symbol);
+              exitPrice = pos ? parseFloat(pos.markPrice) : position.entryPrice;
+            } catch {
+              exitPrice = position.entryPrice; // last resort
+            }
+          }
           await this.closePositionRecord(symbol, exitPrice, "BOT_STOPPED");
         } catch (e) {
           console.error(`Error updating trade record for ${symbol}:`, e);
@@ -131,6 +154,42 @@ export class TradingEngine {
     await this.updateBotStatus({ isRunning: false });
     await this.logEvent("BOT_STOP", "SYSTEM", "AI Trading bot stopped. All positions closed.");
     console.log(`AI Trading engine stopped for user ${this.config.userId}`);
+  }
+
+  // --------------------------------------------------------------------------
+  // [FIX 5.7] Sync positions from exchange into memory on start/restart
+  // --------------------------------------------------------------------------
+
+  private async syncPositionsFromExchange(): Promise<void> {
+    try {
+      const exchangePositions = await this.config.gateioClient.getPositions();
+      for (const pos of exchangePositions) {
+        const absSize = Math.abs(parseFloat(pos.size));
+        if (absSize > 0 && !this.positions.has(pos.symbol)) {
+          const side: "BUY" | "SELL" = pos.side === "LONG" ? "BUY" : "SELL";
+          const leverage = parseFloat(pos.leverage) || 10;
+          const entryPrice = parseFloat(pos.entryPrice) || 0;
+
+          // Try to get quantoMultiplier from cache/API
+          const qm = await this.getCachedContractMultiplier(pos.symbol);
+
+          this.positions.set(pos.symbol, {
+            symbol: pos.symbol,
+            side,
+            entryPrice,
+            quantity: absSize,
+            entryTime: new Date(), // approximate — real entry time unknown after restart
+            leverage,
+            confidence: 50, // unknown for restored positions
+            quantoMultiplier: qm,
+          });
+
+          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm}`);
+        }
+      }
+    } catch (error) {
+      console.error("[SYNC] Error syncing positions from exchange:", this.errStr(error));
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -162,10 +221,10 @@ export class TradingEngine {
         // 4. Update heartbeat
         await this.updateBotStatus({ isRunning: true });
 
-        // Wait between cycles (2 min for aggressive, 5 min for moderate, 10 min for conservative)
-        const waitMs = this.config.aggressiveness === "aggressive" ? 2 * 60 * 1000
-          : this.config.aggressiveness === "moderate" ? 5 * 60 * 1000
-          : 10 * 60 * 1000;
+        // [FIX 5.3] Increased cycle intervals: 5 min aggressive, 10 min moderate, 15 min conservative
+        const waitMs = this.config.aggressiveness === "aggressive" ? 5 * 60 * 1000
+          : this.config.aggressiveness === "moderate" ? 10 * 60 * 1000
+          : 15 * 60 * 1000;
         await this.sleep(waitMs);
       } catch (error) {
         const msg = this.errStr(error);
@@ -182,9 +241,9 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // Get top volume USDT pairs from Gate.io Futures
-      const topPairs = await this.config.gateioClient.getTopPairs(20);
-      console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map(p => p.symbol).join(', ')}...`);
+      // [FIX 5.8] Use cached top pairs
+      const topPairs = await this.getCachedTopPairs(20);
+      console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map((p: any) => p.symbol).join(', ')}...`);
 
       const snapshots: MarketSnapshot[] = [];
       let snapshotErrors = 0;
@@ -200,6 +259,8 @@ export class TradingEngine {
           snapshotErrors++;
           console.error(`[SCAN] Snapshot error for ${pair.symbol}: ${this.errStr(err)}`);
         }
+        // [FIX 5.8] Rate limiting delay between API calls
+        await this.sleep(TradingEngine.API_DELAY_MS);
       }
 
       console.log(`[SCAN] Got ${snapshots.length} snapshots, ${snapshotErrors} errors`);
@@ -220,8 +281,13 @@ export class TradingEngine {
         if (this.positions.has(decision.symbol)) continue; // already in position
         if (this.positions.size >= this.config.maxOpenPositions) break;
 
+        // [FIX 5.6] Cap leverage at 10x regardless of AI decision
+        decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
+
         try {
           await this.executeDecision(decision);
+          // [FIX 5.8] Rate limiting delay between executions
+          await this.sleep(TradingEngine.API_DELAY_MS * 2);
         } catch (error) {
           await this.logEvent("ERROR", decision.symbol, `Failed to execute: ${this.errStr(error)}`);
         }
@@ -231,10 +297,18 @@ export class TradingEngine {
     }
   }
 
+  // [FIX 5.5] Increased minimum confidence thresholds
   private getMinConfidence(): number {
-    return this.config.aggressiveness === "conservative" ? 75
-      : this.config.aggressiveness === "moderate" ? 65
-      : 55;
+    return this.config.aggressiveness === "conservative" ? 80
+      : this.config.aggressiveness === "moderate" ? 75
+      : 70;
+  }
+
+  // [FIX 5.6] Maximum leverage limits
+  private getMaxLeverage(): number {
+    return this.config.aggressiveness === "conservative" ? 5
+      : this.config.aggressiveness === "moderate" ? 8
+      : 10;
   }
 
   // --------------------------------------------------------------------------
@@ -244,6 +318,15 @@ export class TradingEngine {
   private async monitorPositions(): Promise<void> {
     for (const [symbol, position] of Array.from(this.positions.entries())) {
       try {
+        // [FIX 5.4] Cooldown: skip positions opened less than 1 candle ago
+        const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1000 * 60);
+        const minHoldMinutes = this.getMinHoldMinutes();
+
+        if (holdTimeMinutes < minHoldMinutes) {
+          console.log(`[MONITOR] ${symbol}: skipping (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
+          continue;
+        }
+
         const snapshot = await this.getMarketSnapshot(symbol);
         if (!snapshot) continue;
 
@@ -256,10 +339,21 @@ export class TradingEngine {
         if (decision.action === "CLOSE") {
           await this.closePosition(symbol, snapshot.price, decision.reasoning);
         }
+
+        // [FIX 5.8] Rate limiting delay
+        await this.sleep(TradingEngine.API_DELAY_MS);
       } catch (error) {
         console.error(`Error monitoring ${symbol}:`, this.errStr(error));
       }
     }
+  }
+
+  // [FIX 5.4] Minimum hold time based on timeframe
+  private getMinHoldMinutes(): number {
+    const tfMinutes: Record<string, number> = {
+      "1m": 2, "5m": 10, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440,
+    };
+    return tfMinutes[this.config.timeframe] || 15;
   }
 
   // --------------------------------------------------------------------------
@@ -285,22 +379,32 @@ export class TradingEngine {
       above_ema50: s.price > s.ema50,
     }));
 
+    // [FIX 5.5] Updated minimum confidence in prompt
+    const minConf = this.getMinConfidence();
+    // [FIX 5.6] Updated max leverage in prompt
+    const maxLev = this.getMaxLeverage();
+
     const systemPrompt = `Você é um agente de trading algorítmico avançado especializado em criptoativos (futuros), com foco em maximização de retorno ajustado ao risco.
 
 COMPORTAMENTO:
-- Tome decisões dinâmicas e autônomas baseadas em probabilidade, contexto de mercado e gestão de risco.
-- Corte prejuízos rapidamente quando a probabilidade piorar.
-- Garanta lucros quando houver sinais de reversão.
-- Ajuste capital e alavancagem dinamicamente.
+- Tome decisões baseadas em EVIDÊNCIA TÉCNICA CLARA, não em intuição.
+- Só abra posições quando houver CONFLUÊNCIA de pelo menos 2 indicadores.
 - Prefira abrir MUITAS posições de valores BAIXOS alavancados para diversificar.
+- NUNCA abra posição se a evidência for ambígua ou fraca.
+
+CRITÉRIOS QUANTITATIVOS OBRIGATÓRIOS:
+- LONG: RSI < 40 OU (RSI 40-60 + MACD bullish + acima EMA50 + volume_ratio > 1.2)
+- SHORT: RSI > 60 OU (RSI 40-60 + MACD bearish + abaixo EMA50 + volume_ratio > 1.2)
+- Volatilidade mínima: 0.5% (pares muito estáveis não geram lucro)
+- Volume ratio mínimo: 0.8 (liquidez insuficiente = risco de slippage)
+- Funding rate: negativo favorece longs, positivo favorece shorts
 
 EXCHANGE: Gate.io Futures (USDT-M)
 - Símbolos usam formato: BTC_USDT, ETH_USDT (com underscore)
 
 PERFIL DE RISCO: ${this.config.aggressiveness}
-- Conservative: alavancagem 1-5x, confiança mínima 75%, posições menores
-- Moderate: alavancagem 3-10x, confiança mínima 65%, posições médias
-- Aggressive: alavancagem 5-20x, confiança mínima 55%, posições maiores
+- Alavancagem máxima: ${maxLev}x
+- Confiança mínima: ${minConf}%
 
 REGRAS OBRIGATÓRIAS:
 - CADA posição deve ter valor nocional de no MÁXIMO $10 USDT (antes da alavancagem)
@@ -316,12 +420,12 @@ Responda APENAS com um JSON array de decisões. Cada decisão:
   "action": "OPEN_LONG" | "OPEN_SHORT" | "SKIP",
   "symbol": "BTC_USDT",
   "confidence": 75,
-  "leverage": 5,
+  "leverage": ${maxLev},
   "positionSizePercent": 3,
-  "reasoning": "breve explicação"
+  "reasoning": "breve explicação com indicadores que justificam"
 }
 
-Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver boas oportunidades, retorne array vazio []. PRIORIZE diversificação: escolha pares DIFERENTES.`;
+Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver boas oportunidades, retorne array vazio []. PRIORIZE diversificação: escolha pares DIFERENTES. Só inclua trades com confiança >= ${minConf}%.`;
 
     try {
       const response = await this.openai.chat.completions.create({
@@ -350,6 +454,7 @@ Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver bo
     }
   }
 
+  // [FIX 5.2] Completely rewritten position management prompt
   private async askAIForPositionManagement(
     position: TradePosition,
     snapshot: MarketSnapshot,
@@ -364,7 +469,6 @@ Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver bo
 - Current: ${snapshot.price}
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
-- Confiança na entrada: ${position.confidence}%
 - Tempo aberta: ${holdTime.toFixed(0)} minutos
 
 Indicadores atuais:
@@ -375,19 +479,35 @@ Indicadores atuais:
 - Volume ratio: ${snapshot.volumeAnalysis.volumeRatio}
 - Tendência: ${snapshot.trend}
 
-Decida: CLOSE ou HOLD?
-- Se P&L positivo e sinais de reversão → CLOSE (proteger lucro)
-- Se P&L negativo e probabilidade de recuperação baixa → CLOSE (cortar prejuízo)
-- Se tendência continua favorável → HOLD
+REGRAS DE DECISÃO (siga rigorosamente):
 
+1. ZONA DE TOLERÂNCIA AO RUÍDO:
+   - Se |P&L| < 1.0%, a posição está na zona de ruído normal de mercado.
+   - Na zona de ruído, SÓ feche se houver REVERSÃO CLARA de tendência (RSI inverteu + MACD cruzou contra a posição).
+   - NÃO feche apenas porque o P&L é levemente negativo.
+
+2. POSIÇÃO LUCRATIVA (P&L > +1%):
+   - HOLD se a tendência continua favorável (LONG + BULLISH, ou SHORT + BEARISH).
+   - CLOSE apenas se houver sinais CLAROS de reversão: RSI extremo (>75 para LONG, <25 para SHORT) + MACD cruzando contra + BB position extrema.
+
+3. POSIÇÃO COM PREJUÍZO (P&L < -1%):
+   - CLOSE se a tendência virou contra a posição (LONG + BEARISH, ou SHORT + BULLISH).
+   - HOLD se a tendência ainda é favorável e o RSI sugere recuperação.
+
+4. STOP LOSS AUTOMÁTICO:
+   - CLOSE imediatamente se P&L < -3% (proteção de capital).
+
+5. NUNCA use a "confiança na entrada" como razão para fechar. Foque APENAS nos indicadores ATUAIS.
+
+Decida: CLOSE ou HOLD?
 Responda APENAS com JSON:
-{"action": "CLOSE" ou "HOLD", "symbol": "${position.symbol}", "confidence": 0, "leverage": 0, "positionSizePercent": 0, "reasoning": "explicação"}`;
+{"action": "CLOSE" ou "HOLD", "symbol": "${position.symbol}", "confidence": 0, "leverage": 0, "positionSizePercent": 0, "reasoning": "explicação baseada nos indicadores atuais"}`;
 
     try {
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: [
-          { role: "system", content: "Você é um gestor de risco de trading de futuros cripto. Seja decisivo. Priorize proteger capital e garantir lucros." },
+          { role: "system", content: "Você é um gestor de risco de trading de futuros cripto. Siga as REGRAS DE DECISÃO fornecidas rigorosamente. Não feche posições por ruído de mercado. Deixe os trades se desenvolverem." },
           { role: "user", content: prompt },
         ],
         temperature: 0.2,
@@ -462,11 +582,60 @@ Responda APENAS com JSON:
   }
 
   // --------------------------------------------------------------------------
+  // [FIX 5.8] Cached API calls
+  // --------------------------------------------------------------------------
+
+  private async getCachedContractMultiplier(symbol: string): Promise<number> {
+    const cached = this.contractInfoCache.get(symbol);
+    if (cached && (Date.now() - cached.cachedAt) < TradingEngine.CONTRACT_CACHE_TTL) {
+      const qm = parseFloat(cached.data.quantoMultiplier || cached.data.quanto_multiplier || "1");
+      return qm;
+    }
+
+    try {
+      const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+      this.contractInfoCache.set(symbol, { data: contractInfo, cachedAt: Date.now() });
+      return parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
+    } catch (error) {
+      console.error(`[CACHE] Failed to get contract info for ${symbol}: ${this.errStr(error)}`);
+      // Return cached value even if expired, or default to 1
+      if (cached) {
+        return parseFloat(cached.data.quantoMultiplier || cached.data.quanto_multiplier || "1");
+      }
+      return 1; // Safe default — better than 1/entryPrice
+    }
+  }
+
+  private async getCachedContractInfo(symbol: string): Promise<any> {
+    const cached = this.contractInfoCache.get(symbol);
+    if (cached && (Date.now() - cached.cachedAt) < TradingEngine.CONTRACT_CACHE_TTL) {
+      return cached.data;
+    }
+
+    const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
+    this.contractInfoCache.set(symbol, { data: contractInfo, cachedAt: Date.now() });
+    return contractInfo;
+  }
+
+  private async getCachedTopPairs(limit: number): Promise<any[]> {
+    if (this.topPairsCache.data && (Date.now() - this.topPairsCache.cachedAt) < TradingEngine.TOP_PAIRS_CACHE_TTL) {
+      return this.topPairsCache.data;
+    }
+
+    const topPairs = await this.config.gateioClient.getTopPairs(limit);
+    this.topPairsCache = { data: topPairs, cachedAt: Date.now() };
+    return topPairs;
+  }
+
+  // --------------------------------------------------------------------------
   // Trade Execution (Gate.io Futures)
   // --------------------------------------------------------------------------
 
   private async executeDecision(decision: AIDecision): Promise<void> {
     const side: "BUY" | "SELL" = decision.action === "OPEN_LONG" ? "BUY" : "SELL";
+
+    // [FIX 5.6] Enforce max leverage
+    decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
 
     try {
       // Get balance and calculate position size
@@ -483,9 +652,8 @@ Responda APENAS com JSON:
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
 
-      // Get contract info for quantity calculation
-      // Gate.io uses contract size (quanto_multiplier) — size is in number of contracts
-      const contractInfo = await this.config.gateioClient.getContractInfo(decision.symbol);
+      // [FIX 5.1 + 5.8] Get contract info from cache for quantity calculation
+      const contractInfo = await this.getCachedContractInfo(decision.symbol);
       const quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "0.001");
       console.log(`[EXEC] ${decision.symbol}: base=$${baseValue.toFixed(2)}, notional=$${notionalValue.toFixed(2)}, price=${currentPrice}, qm=${quantoMultiplier}`);
       const contractValue = currentPrice * quantoMultiplier; // value of 1 contract in USDT
@@ -508,7 +676,7 @@ Responda APENAS com JSON:
         size: contracts,
       });
 
-      // Record position in memory
+      // [FIX 5.1] Record position in memory WITH quantoMultiplier
       this.positions.set(decision.symbol, {
         symbol: decision.symbol,
         side,
@@ -517,9 +685,10 @@ Responda APENAS com JSON:
         entryTime: new Date(),
         leverage: decision.leverage,
         confidence: decision.confidence,
+        quantoMultiplier, // [FIX 5.1] cached for correct PnL calculation
       });
 
-      // Record trade in DB
+      // [FIX 5.1] Record trade in DB — store quantoMultiplier in stopLoss field (repurposed)
       await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
@@ -529,7 +698,7 @@ Responda APENAS com JSON:
         entryPrice: currentPrice.toString(),
         quantity: contracts.toString(),
         entryTime: new Date(),
-        stopLoss: "0", // AI manages exits dynamically
+        stopLoss: quantoMultiplier.toString(), // [FIX 5.1] Store quantoMultiplier here
         takeProfit: "0",
         status: "OPEN",
         rsiAtEntry: String(decision.confidence),
@@ -541,7 +710,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | ${decision.reasoning}`
+        `${side} ${contracts} contracts @ ${currentPrice} | Lev: ${decision.leverage}x | Conf: ${decision.confidence}% | QM: ${quantoMultiplier} | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
@@ -568,25 +737,35 @@ Responda APENAS com JSON:
   }
 
   /**
-   * Update DB trade record and in-memory position (does NOT close on exchange)
-   * Used by stop() after closeAllPositions() already closed on exchange
+   * [FIX 5.1] Update DB trade record and in-memory position
+   * Uses cached quantoMultiplier from position for correct PnL calculation
    */
   private async closePositionRecord(symbol: string, exitPrice: number, reason: string): Promise<void> {
     try {
       const position = this.positions.get(symbol);
       if (!position) return;
 
-      // Get quantoMultiplier for correct P&L calculation
-      // quantity is in CONTRACTS, not in asset units
-      // P&L = (exitPrice - entryPrice) * contracts * quantoMultiplier
-      let quantoMultiplier = 1;
-      try {
-        const contractInfo = await this.config.gateioClient.getContractInfo(symbol);
-        quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "1");
-      } catch {
-        // If we can't get contract info, estimate from entry price
-        // For most USDT contracts, quantoMultiplier makes 1 contract ≈ $1 at current price
-        quantoMultiplier = 1 / position.entryPrice;
+      // [FIX 5.1] Use quantoMultiplier from position (cached at entry)
+      // Fallback: try to get from DB trade record, then from API cache, then default to 1
+      let quantoMultiplier = position.quantoMultiplier;
+      if (!quantoMultiplier || quantoMultiplier <= 0) {
+        // Try to read from DB trade record (stored in stopLoss field)
+        try {
+          const tradeRecord = await this.db.select().from(trades)
+            .where(and(eq(trades.symbol, symbol), eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId)))
+            .limit(1);
+          if (tradeRecord.length > 0 && tradeRecord[0].stopLoss) {
+            const dbQm = parseFloat(tradeRecord[0].stopLoss);
+            if (dbQm > 0 && dbQm !== 0) {
+              quantoMultiplier = dbQm;
+            }
+          }
+        } catch { /* ignore */ }
+
+        // Still no good value? Try API cache
+        if (!quantoMultiplier || quantoMultiplier <= 0) {
+          quantoMultiplier = await this.getCachedContractMultiplier(symbol);
+        }
       }
 
       const pnl = position.side === "BUY"
@@ -639,7 +818,7 @@ Responda APENAS com JSON:
       await this.logEvent(
         "POSITION_CLOSED",
         symbol,
-        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | ${reason}`
+        `Closed @ ${exitPrice} | P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT (${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(2)}%) | QM: ${quantoMultiplier} | ${reason}`
       );
     } catch (error) {
       await this.logEvent("ERROR", symbol, `Record close error: ${this.errStr(error)}`);
@@ -651,6 +830,8 @@ Responda APENAS com JSON:
       try {
         const ticker = await this.config.gateioClient.getTicker(symbol);
         await this.closePosition(symbol, parseFloat(ticker.lastPrice), reason);
+        // [FIX 5.8] Rate limiting delay
+        await this.sleep(TradingEngine.API_DELAY_MS);
       } catch (error) {
         await this.logEvent("ERROR", symbol, `Failed to close: ${this.errStr(error)}`);
       }

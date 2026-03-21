@@ -356,18 +356,53 @@ const botControlRouter = router({
       apiSecret: keys[0].apiSecret,
     });
 
+    // [FIX 5.9] Get current prices BEFORE closing positions
+    const openTrades = await db.select().from(trades)
+      .where(and(eq(trades.userId, userId), eq(trades.status, "OPEN")));
+
+    // Build a map of current prices for open trade symbols
+    const priceMap: Record<string, number> = {};
+    for (const t of openTrades) {
+      if (!priceMap[t.symbol]) {
+        try {
+          const ticker = await gateioClient.getTicker(t.symbol);
+          priceMap[t.symbol] = parseFloat(ticker.lastPrice);
+        } catch {
+          priceMap[t.symbol] = 0;
+        }
+      }
+    }
+
     // Close all positions directly on the exchange
     const result = await gateioClient.closeAllPositions();
 
-    // Also update any OPEN trades in DB to CLOSED
-    const openTrades = await db.select().from(trades)
-      .where(and(eq(trades.userId, userId), eq(trades.status, "OPEN")));
+    // [FIX 5.9] Update OPEN trades with exitPrice and PnL
     for (const t of openTrades) {
       try {
+        const exitPrice = priceMap[t.symbol] || 0;
+        const entryPrice = parseFloat(t.entryPrice || "0");
+        const quantity = parseFloat(t.quantity || "0");
+        // Read quantoMultiplier from stopLoss field (where we store it)
+        const quantoMultiplier = parseFloat(t.stopLoss || "0") > 0 ? parseFloat(t.stopLoss!) : 1;
+
+        let pnl = 0;
+        let pnlPercent = 0;
+        if (exitPrice > 0 && entryPrice > 0) {
+          pnl = t.side === "BUY"
+            ? (exitPrice - entryPrice) * quantity * quantoMultiplier
+            : (entryPrice - exitPrice) * quantity * quantoMultiplier;
+          pnlPercent = t.side === "BUY"
+            ? ((exitPrice - entryPrice) / entryPrice) * 100
+            : ((entryPrice - exitPrice) / entryPrice) * 100;
+        }
+
         await db.update(trades).set({
           status: "CLOSED",
+          exitPrice: exitPrice > 0 ? exitPrice.toString() : null,
           exitTime: new Date(),
           exitReason: "EMERGENCY_CLOSE",
+          pnl: pnl.toString(),
+          pnlPercent: Math.max(-999.99, Math.min(999.99, pnlPercent)).toFixed(2),
         }).where(eq(trades.id, t.id));
       } catch (e) { /* ignore */ }
     }
