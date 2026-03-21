@@ -88,6 +88,9 @@ export class TradingEngine {
   private static readonly API_DELAY_MS = 100; // 100ms between API calls
   private static readonly SNAPSHOT_BATCH_SIZE = 15; // parallel candle fetches per batch
   private static readonly AI_BATCH_SIZE = 50; // pairs per AI call
+  // [FIX 5.9] Reserve 10% of total balance as buffer (emergency + opportunity reserve)
+  // This prevents full capital lock-up and ensures liquidity for SHORT opportunities
+  private static readonly CAPITAL_RESERVE_PCT = 0.10;
 
   private get db() { return getDatabase(); }
 
@@ -349,11 +352,15 @@ export class TradingEngine {
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue; // already in position
 
-        // Check capital availability dynamically before each trade
+        // [FIX 5.9] Check capital availability with 10% reserve
         const balance = await this.config.gateioClient.getBalance();
+        const totalBalance = parseFloat(balance.totalBalance);
         const available = parseFloat(balance.availableBalance);
-        if (available < 1.0) {
-          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: available balance too low ($${available.toFixed(2)} USDT)`);
+        // Reserve 10% of total balance as buffer — never allocate below this floor
+        const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
+        const deployable = available - reserveFloor;
+        if (deployable < 1.0) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: deployable balance too low ($${deployable.toFixed(2)} USDT after ${(TradingEngine.CAPITAL_RESERVE_PCT * 100).toFixed(0)}% reserve of $${reserveFloor.toFixed(2)})`);
           break;
         }
         // No fixed position limit — only capital constrains new positions
@@ -443,7 +450,11 @@ export class TradingEngine {
 
   private async askAIForOpportunities(snapshots: MarketSnapshot[]): Promise<AIDecision[]> {
     const balance = await this.config.gateioClient.getBalance();
+    const totalBalance = parseFloat(balance.totalBalance);
     const availableBalance = parseFloat(balance.availableBalance);
+    // [FIX 5.9] Deployable = available minus 10% reserve floor
+    const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
+    const deployableBalance = Math.max(0, availableBalance - reserveFloor);
 
     const marketSummary = snapshots.map((s) => ({
       symbol: s.symbol,
@@ -467,7 +478,8 @@ export class TradingEngine {
 
     // Calculate how many more positions we can open
     // No fixed position limit — calculate slots purely from available capital
-    const maxNewPositions = Math.max(1, Math.floor(availableBalance / 10)); // each position uses ~$10
+    // [FIX 5.9] Use deployable balance (after 10% reserve) for position count
+    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 10)); // each position uses ~$10
 
     const systemPrompt = `Você é um agente de trading algorítmico avançado especializado em criptoativos (futuros), com foco em MAXIMIZAR o número de posições abertas usando TODO o capital disponível.
 
@@ -495,7 +507,7 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 - Confiança mínima: ${minConf}%
 
 CAPITAL DISPONÍVEL:
-- Saldo disponível: ${availableBalance.toFixed(2)} USDT
+- Saldo deployável: ${deployableBalance.toFixed(2)} USDT (reserva 10% = ${reserveFloor.toFixed(2)} USDT bloqueada)
 - Posições abertas atualmente: ${this.positions.size} (sem limite fixo)
 - Posições que podem ser abertas agora: até ${maxNewPositions} (baseado no saldo disponível)
 - CADA posição usa $10 USDT fixo (o sistema calcula os contratos automaticamente)
@@ -783,13 +795,17 @@ Responda APENAS com JSON:
     decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
 
     try {
-      // Get balance and calculate position size
+      // [FIX 5.9] Get balance and calculate position size respecting 10% reserve
       const balance = await this.config.gateioClient.getBalance();
+      const totalBalance = parseFloat(balance.totalBalance);
       const available = parseFloat(balance.availableBalance);
+      // Deployable = available minus 10% reserve floor
+      const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
+      const deployable = Math.max(0, available - reserveFloor);
 
-      // Always use exactly $10 per position (or available balance if less)
-      // This maximises capital deployment: every position uses the full $10 slot
-      const baseValue = Math.min(available, 10); // hard cap at $10, use all available if < $10
+      // Always use exactly $10 per position (or deployable balance if less)
+      // This maximises capital deployment while respecting the 10% reserve
+      const baseValue = Math.min(deployable, 10); // hard cap at $10, use deployable if < $10
       const notionalValue = baseValue * decision.leverage;
 
       // Get current price
@@ -1094,7 +1110,8 @@ Responda APENAS com JSON:
       } else {
         await this.db.update(botStatus).set({
           isRunning: update.isRunning ?? existing[0].isRunning,
-          startedAt: update.isRunning ? new Date() : existing[0].startedAt,
+          // [FIX 5.9] Preserve original startedAt — only set on first start, never overwrite
+          startedAt: (update.isRunning && !existing[0].startedAt) ? new Date() : existing[0].startedAt,
           lastHeartbeat: new Date(),
         }).where(eq(botStatus.userId, this.config.userId));
       }

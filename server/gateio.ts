@@ -233,7 +233,8 @@ export class GateioClient {
         entryPrice: p.entryPrice || p.entry_price || "0",
         markPrice: p.markPrice || p.mark_price || "0",
         unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
-        leverage: p.leverage || p.crossLeverageLimit || "0",
+        // [FIX 5.9] In cross margin, leverage=0 and the real value is in crossLeverageLimit
+        leverage: (p.leverage && p.leverage !== "0") ? p.leverage : (p.crossLeverageLimit || p.cross_leverage_limit || "10"),
         marginMode: mode,
       };
     });
