@@ -46,7 +46,7 @@ function BalanceBar({ balance }: { balance: any }) {
           fontSize: "11px", color: "#00ff8888", fontFamily: "Courier New, monospace",
           letterSpacing: "1px", textTransform: "uppercase",
         }}>
-          SALDO BYBIT (AO VIVO)
+          SALDO BINANCE FUTURES (AO VIVO)
         </span>
       </div>
       <div style={{
@@ -182,7 +182,7 @@ export function DashboardPage({ onStartBot }: DashboardPageProps) {
   };
 
   const totalPnl = tradeStats?.totalPnl ?? 0;
-  const todayPnl = tradeStats?.todayPnl ?? 0;
+  const todayPnl = 0; // todayPnl not tracked yet
   const winRate = tradeStats?.winRate ?? 0;
   const totalTrades = (tradeStats?.closedTrades ?? 0) + (tradeStats?.openTrades ?? 0);
 

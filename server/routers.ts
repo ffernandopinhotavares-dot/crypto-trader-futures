@@ -1,7 +1,7 @@
-import { router, publicProcedure, protectedProcedure } from "./_core/trpc";
+import { router, protectedProcedure } from "./_core/trpc";
 import { z } from "zod";
 import { getDatabase } from "./db";
-import { createBybitClient } from "./bybit";
+import { createBinanceClient } from "./binance";
 import { TradingEngine } from "./tradingEngine";
 import {
   bybitApiKeys,
@@ -9,8 +9,6 @@ import {
   trades,
   botStatus,
   tradingLogs,
-  candles,
-  indicators,
 } from "../drizzle/schema";
 import { eq, and, desc } from "drizzle-orm";
 import { nanoid } from "nanoid";
@@ -19,10 +17,10 @@ import { nanoid } from "nanoid";
 const tradingEngines = new Map<string, TradingEngine>();
 
 // ============================================================================
-// Bybit API Keys Router
+// Binance API Keys Router (using existing bybit_api_keys table)
 // ============================================================================
 
-const bybitKeysRouter = router({
+const binanceKeysRouter = router({
   saveKeys: protectedProcedure
     .input(
       z.object({
@@ -33,17 +31,14 @@ const bybitKeysRouter = router({
     )
     .mutation(async ({ input, ctx }) => {
       const db = getDatabase();
-      const id = nanoid();
       const userId = ctx.user?.id || "local-owner";
 
       // Delete existing keys for this user
-      await db
-        .delete(bybitApiKeys)
-        .where(eq(bybitApiKeys.userId, userId));
+      await db.delete(bybitApiKeys).where(eq(bybitApiKeys.userId, userId));
 
-      // Insert new keys
+      // Insert new Binance keys (reusing bybit_api_keys table)
       await db.insert(bybitApiKeys).values({
-        id,
+        id: nanoid(),
         userId,
         apiKey: input.apiKey,
         apiSecret: input.apiSecret,
@@ -51,7 +46,7 @@ const bybitKeysRouter = router({
         isActive: true,
       });
 
-      return { success: true, id };
+      return { success: true };
     }),
 
   getKeys: protectedProcedure.query(async ({ ctx }) => {
@@ -64,14 +59,12 @@ const bybitKeysRouter = router({
       .where(eq(bybitApiKeys.userId, userId))
       .limit(1);
 
-    if (keys.length === 0) {
-      return null;
-    }
+    if (keys.length === 0) return null;
 
     const key = keys[0];
     return {
       id: key.id,
-      apiKey: key.apiKey?.substring(0, 10) + "***",
+      apiKey: key.apiKey?.substring(0, 8) + "***",
       testnet: key.testnet,
       isActive: key.isActive,
     };
@@ -80,12 +73,42 @@ const bybitKeysRouter = router({
   deleteKeys: protectedProcedure.mutation(async ({ ctx }) => {
     const db = getDatabase();
     const userId = ctx.user?.id || "local-owner";
-
-    await db
-      .delete(bybitApiKeys)
-      .where(eq(bybitApiKeys.userId, userId));
-
+    await db.delete(bybitApiKeys).where(eq(bybitApiKeys.userId, userId));
     return { success: true };
+  }),
+
+  testConnection: protectedProcedure.mutation(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    const keys = await db
+      .select()
+      .from(bybitApiKeys)
+      .where(eq(bybitApiKeys.userId, userId))
+      .limit(1);
+
+    if (keys.length === 0) {
+      throw new Error("Chaves da API Binance não configuradas");
+    }
+
+    const apiKey = keys[0];
+    const client = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false,
+    });
+
+    try {
+      const balances = await client.getBalance();
+      const usdtBalance = balances.find((b) => b.coin === "USDT");
+      return {
+        success: true,
+        balance: usdtBalance?.walletBalance ?? "0",
+        message: "Conexão com Binance Futures estabelecida com sucesso",
+      };
+    } catch (error: any) {
+      throw new Error(`Falha na conexão: ${error?.message || String(error)}`);
+    }
   }),
 });
 
@@ -119,15 +142,15 @@ const tradingConfigRouter = router({
     )
     .mutation(async ({ input, ctx }) => {
       const db = getDatabase();
-      const id = nanoid();
       const userId = ctx.user?.id || "local-owner";
 
+      const id = nanoid();
       await db.insert(tradingConfigs).values({
         id,
         userId,
         name: input.name,
         description: input.description,
-        tradingPairs: JSON.stringify(input.tradingPairs),
+        tradingPairs: input.tradingPairs,
         maxPositionSize: input.maxPositionSize.toString(),
         maxDrawdown: input.maxDrawdown.toString(),
         stopLossPercent: input.stopLossPercent.toString(),
@@ -160,7 +183,11 @@ const tradingConfigRouter = router({
 
     return configs.map((c: any) => ({
       ...c,
-      tradingPairs: typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : c.tradingPairs,
+      tradingPairs: Array.isArray(c.tradingPairs)
+        ? c.tradingPairs
+        : typeof c.tradingPairs === "string"
+        ? JSON.parse(c.tradingPairs)
+        : [],
     }));
   }),
 
@@ -173,22 +200,19 @@ const tradingConfigRouter = router({
       const configs = await db
         .select()
         .from(tradingConfigs)
-        .where(
-          and(
-            eq(tradingConfigs.id, input.id),
-            eq(tradingConfigs.userId, userId)
-          )
-        )
+        .where(and(eq(tradingConfigs.id, input.id), eq(tradingConfigs.userId, userId)))
         .limit(1);
 
-      if (configs.length === 0) {
-        throw new Error("Configuration not found");
-      }
+      if (configs.length === 0) throw new Error("Configuração não encontrada");
 
       const c = configs[0];
       return {
         ...c,
-        tradingPairs: typeof c.tradingPairs === "string" ? JSON.parse(c.tradingPairs) : c.tradingPairs,
+        tradingPairs: Array.isArray(c.tradingPairs)
+          ? c.tradingPairs
+          : typeof c.tradingPairs === "string"
+          ? JSON.parse(c.tradingPairs)
+          : [],
       };
     }),
 
@@ -209,22 +233,17 @@ const tradingConfigRouter = router({
       const userId = ctx.user?.id || "local-owner";
 
       const updates: any = {};
-      if (input.name) updates.name = input.name;
-      if (input.description) updates.description = input.description;
-      if (input.tradingPairs) updates.tradingPairs = JSON.stringify(input.tradingPairs);
-      if (input.maxPositionSize) updates.maxPositionSize = input.maxPositionSize.toString();
-      if (input.stopLossPercent) updates.stopLossPercent = input.stopLossPercent.toString();
-      if (input.takeProfitPercent) updates.takeProfitPercent = input.takeProfitPercent.toString();
+      if (input.name !== undefined) updates.name = input.name;
+      if (input.description !== undefined) updates.description = input.description;
+      if (input.tradingPairs !== undefined) updates.tradingPairs = input.tradingPairs;
+      if (input.maxPositionSize !== undefined) updates.maxPositionSize = input.maxPositionSize.toString();
+      if (input.stopLossPercent !== undefined) updates.stopLossPercent = input.stopLossPercent.toString();
+      if (input.takeProfitPercent !== undefined) updates.takeProfitPercent = input.takeProfitPercent.toString();
 
       await db
         .update(tradingConfigs)
         .set(updates)
-        .where(
-          and(
-            eq(tradingConfigs.id, input.id),
-            eq(tradingConfigs.userId, userId)
-          )
-        );
+        .where(and(eq(tradingConfigs.id, input.id), eq(tradingConfigs.userId, userId)));
 
       return { success: true };
     }),
@@ -237,12 +256,7 @@ const tradingConfigRouter = router({
 
       await db
         .delete(tradingConfigs)
-        .where(
-          and(
-            eq(tradingConfigs.id, input.id),
-            eq(tradingConfigs.userId, userId)
-          )
-        );
+        .where(and(eq(tradingConfigs.id, input.id), eq(tradingConfigs.userId, userId)));
 
       return { success: true };
     }),
@@ -263,17 +277,10 @@ const botControlRouter = router({
       const configs = await db
         .select()
         .from(tradingConfigs)
-        .where(
-          and(
-            eq(tradingConfigs.id, input.configId),
-            eq(tradingConfigs.userId, userId)
-          )
-        )
+        .where(and(eq(tradingConfigs.id, input.configId), eq(tradingConfigs.userId, userId)))
         .limit(1);
 
-      if (configs.length === 0) {
-        throw new Error("Configuration not found");
-      }
+      if (configs.length === 0) throw new Error("Configuração não encontrada");
 
       // Get API keys
       const keys = await db
@@ -282,28 +289,30 @@ const botControlRouter = router({
         .where(eq(bybitApiKeys.userId, userId))
         .limit(1);
 
-      if (keys.length === 0) {
-        throw new Error("Bybit API keys not configured");
-      }
+      if (keys.length === 0) throw new Error("Chaves da API Binance não configuradas");
 
       const config = configs[0];
       const apiKey = keys[0];
 
-      // Create Bybit client
-      const bybitClient = createBybitClient({
+      // Create Binance client
+      const binanceClient = createBinanceClient({
         apiKey: apiKey.apiKey,
         apiSecret: apiKey.apiSecret,
         testnet: apiKey.testnet ?? false,
       });
 
-      // Create trading engine
+      const tradingPairs = Array.isArray(config.tradingPairs)
+        ? config.tradingPairs
+        : typeof config.tradingPairs === "string"
+        ? JSON.parse(config.tradingPairs)
+        : ["BTCUSDT"];
+
+      // Create and start trading engine
       const engine = new TradingEngine({
         userId,
         configId: input.configId,
-        bybitClient,
-        tradingPairs: typeof config.tradingPairs === "string"
-          ? JSON.parse(config.tradingPairs)
-          : config.tradingPairs,
+        binanceClient,
+        tradingPairs,
         maxPositionSize: parseFloat(config.maxPositionSize ?? "5"),
         maxDrawdown: parseFloat(config.maxDrawdown ?? "10"),
         stopLossPercent: parseFloat(config.stopLossPercent ?? "2"),
@@ -321,10 +330,7 @@ const botControlRouter = router({
         timeframe: config.timeframe ?? "1h",
       });
 
-      // Start engine
       await engine.start();
-
-      // Store engine
       tradingEngines.set(userId, engine);
 
       return { success: true };
@@ -334,9 +340,7 @@ const botControlRouter = router({
     const userId = ctx.user?.id || "local-owner";
 
     const engine = tradingEngines.get(userId);
-    if (!engine) {
-      throw new Error("Trading bot not running");
-    }
+    if (!engine) throw new Error("Bot de trading não está em execução");
 
     await engine.stop();
     tradingEngines.delete(userId);
@@ -354,11 +358,124 @@ const botControlRouter = router({
       .where(eq(botStatus.userId, userId))
       .limit(1);
 
+    const engineRunning = tradingEngines.has(userId);
+
     if (status.length === 0) {
-      return null;
+      return { isRunning: engineRunning, isPaused: false };
     }
 
-    return status[0];
+    return { ...status[0], isRunning: engineRunning || status[0].isRunning };
+  }),
+});
+
+// ============================================================================
+// Market Data Router (public Binance data, no auth required)
+// ============================================================================
+
+const marketDataRouter = router({
+  getTicker: protectedProcedure
+    .input(z.object({ symbol: z.string() }))
+    .query(async ({ input }) => {
+      const { USDMClient } = await import("binance");
+      const client = new USDMClient();
+      const ticker = await client.get24hrChangeStatistics({ symbol: input.symbol });
+      const t = Array.isArray(ticker) ? ticker[0] : ticker;
+      return {
+        symbol: (t as any).symbol,
+        lastPrice: (t as any).lastPrice,
+        priceChangePercent: (t as any).priceChangePercent,
+        volume: (t as any).volume,
+        highPrice: (t as any).highPrice,
+        lowPrice: (t as any).lowPrice,
+      };
+    }),
+
+  getKlines: protectedProcedure
+    .input(
+      z.object({
+        symbol: z.string(),
+        interval: z.string().default("1h"),
+        limit: z.number().default(100),
+      })
+    )
+    .query(async ({ input }) => {
+      const { USDMClient } = await import("binance");
+      const client = new USDMClient();
+      const klines = await client.getKlines({
+        symbol: input.symbol,
+        interval: input.interval as any,
+        limit: input.limit,
+      });
+      return (klines as any[]).map((k: any) => ({
+        time: k[0],
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+    }),
+
+  getBalance: protectedProcedure.query(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    const keys = await db
+      .select()
+      .from(bybitApiKeys)
+      .where(eq(bybitApiKeys.userId, userId))
+      .limit(1);
+
+    if (keys.length === 0) {
+      return { balance: "0", available: "0", unrealizedPnl: "0" };
+    }
+
+    const apiKey = keys[0];
+    const client = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false,
+    });
+
+    try {
+      const account = await client.getAccountInfo();
+      return {
+        balance: account.totalWalletBalance,
+        available: account.availableBalance,
+        unrealizedPnl: account.totalUnrealizedProfit,
+        marginBalance: account.totalMarginBalance,
+      };
+    } catch (error: any) {
+      console.error("Error fetching balance:", error?.message || error);
+      return { balance: "0", available: "0", unrealizedPnl: "0" };
+    }
+  }),
+
+  getPositions: protectedProcedure.query(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    const keys = await db
+      .select()
+      .from(bybitApiKeys)
+      .where(eq(bybitApiKeys.userId, userId))
+      .limit(1);
+
+    if (keys.length === 0) return [];
+
+    const apiKey = keys[0];
+    const client = createBinanceClient({
+      apiKey: apiKey.apiKey,
+      apiSecret: apiKey.apiSecret,
+      testnet: apiKey.testnet ?? false,
+    });
+
+    try {
+      return await client.getPositions();
+    } catch (error: any) {
+      console.error("Error fetching positions:", error?.message || error);
+      return [];
+    }
   }),
 });
 
@@ -373,14 +490,12 @@ const tradesRouter = router({
       const db = getDatabase();
       const userId = ctx.user?.id || "local-owner";
 
-      const tradeList = await db
+      return await db
         .select()
         .from(trades)
         .where(eq(trades.userId, userId))
         .orderBy(desc(trades.createdAt))
         .limit(input.limit);
-
-      return tradeList;
     }),
 
   getBySymbol: protectedProcedure
@@ -389,38 +504,24 @@ const tradesRouter = router({
       const db = getDatabase();
       const userId = ctx.user?.id || "local-owner";
 
-      const tradeList = await db
+      return await db
         .select()
         .from(trades)
-        .where(
-          and(
-            eq(trades.userId, userId),
-            eq(trades.symbol, input.symbol)
-          )
-        )
+        .where(and(eq(trades.userId, userId), eq(trades.symbol, input.symbol)))
         .orderBy(desc(trades.createdAt))
         .limit(input.limit);
-
-      return tradeList;
     }),
 
   getStats: protectedProcedure.query(async ({ ctx }) => {
     const db = getDatabase();
     const userId = ctx.user?.id || "local-owner";
 
-    const tradeList = await db
-      .select()
-      .from(trades)
-      .where(eq(trades.userId, userId));
+    const tradeList = await db.select().from(trades).where(eq(trades.userId, userId));
 
     const closedTrades = tradeList.filter((t: any) => t.status === "CLOSED");
     const winningTrades = closedTrades.filter((t: any) => parseFloat(t.pnl || "0") > 0);
     const losingTrades = closedTrades.filter((t: any) => parseFloat(t.pnl || "0") < 0);
-
-    const totalPnl = closedTrades.reduce(
-      (sum: number, t: any) => sum + parseFloat(t.pnl || "0"),
-      0
-    );
+    const totalPnl = closedTrades.reduce((sum: number, t: any) => sum + parseFloat(t.pnl || "0"), 0);
 
     return {
       totalTrades: tradeList.length,
@@ -428,10 +529,7 @@ const tradesRouter = router({
       closedTrades: closedTrades.length,
       winningTrades: winningTrades.length,
       losingTrades: losingTrades.length,
-      winRate:
-        closedTrades.length > 0
-          ? (winningTrades.length / closedTrades.length) * 100
-          : 0,
+      winRate: closedTrades.length > 0 ? (winningTrades.length / closedTrades.length) * 100 : 0,
       totalPnl,
       avgPnl: closedTrades.length > 0 ? totalPnl / closedTrades.length : 0,
     };
@@ -449,14 +547,12 @@ const logsRouter = router({
       const db = getDatabase();
       const userId = ctx.user?.id || "local-owner";
 
-      const logList = await db
+      return await db
         .select()
         .from(tradingLogs)
         .where(eq(tradingLogs.userId, userId))
         .orderBy(desc(tradingLogs.createdAt))
         .limit(input.limit);
-
-      return logList;
     }),
 });
 
@@ -465,9 +561,12 @@ const logsRouter = router({
 // ============================================================================
 
 export const appRouter = router({
-  bybitKeys: bybitKeysRouter,
+  binanceKeys: binanceKeysRouter,
+  // Keep bybitKeys as alias for backward compatibility with any existing frontend calls
+  bybitKeys: binanceKeysRouter,
   tradingConfig: tradingConfigRouter,
   botControl: botControlRouter,
+  marketData: marketDataRouter,
   trades: tradesRouter,
   logs: logsRouter,
 });

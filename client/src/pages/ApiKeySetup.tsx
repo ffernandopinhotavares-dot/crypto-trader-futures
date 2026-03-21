@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { trpc } from "../App";
-import { Zap, Key, Eye, EyeOff, ExternalLink } from "lucide-react";
+import { Zap, Key, Eye, EyeOff, ExternalLink, CheckCircle } from "lucide-react";
 import { toast } from "sonner";
 
 export function ApiKeySetup() {
@@ -9,7 +9,7 @@ export function ApiKeySetup() {
   const [testnet, setTestnet] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
 
-  const { mutate: saveKeys, isPending } = trpc.bybitKeys.saveKeys.useMutation({
+  const { mutate: saveKeys, isPending } = trpc.binanceKeys.saveKeys.useMutation({
     onSuccess: () => {
       toast.success("Chaves salvas com sucesso!");
       setTimeout(() => window.location.reload(), 800);
@@ -50,7 +50,7 @@ export function ApiKeySetup() {
             </span>
           </div>
           <p style={{ fontSize: "12px", color: "#00ff8844" }}>
-            Configure sua API Bybit para começar a operar
+            Configure sua API Binance Futures para começar a operar
           </p>
         </div>
 
@@ -67,8 +67,21 @@ export function ApiKeySetup() {
           <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "24px" }}>
             <Key size={16} style={{ color: "#00ff8866" }} />
             <h2 style={{ fontSize: "14px", fontWeight: "600", color: "#00ff88" }}>
-              Configurar API Bybit
+              Configurar API Binance Futures
             </h2>
+          </div>
+
+          {/* Exchange badge */}
+          <div style={{
+            display: "flex", alignItems: "center", gap: "6px",
+            marginBottom: "20px", padding: "8px 12px",
+            background: "#F0B90B10", border: "1px solid #F0B90B30",
+            borderRadius: "6px",
+          }}>
+            <CheckCircle size={13} style={{ color: "#F0B90B" }} />
+            <span style={{ fontSize: "11px", color: "#F0B90B99" }}>
+              Binance Futures (USD-M) — disponível no Brasil
+            </span>
           </div>
 
           {/* API Key */}
@@ -80,7 +93,7 @@ export function ApiKeySetup() {
               type="text"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Ex: I2oeyomfRJK73..."
+              placeholder="Cole sua Binance API Key aqui"
               style={inputStyle}
               onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
               onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
@@ -98,7 +111,7 @@ export function ApiKeySetup() {
                 type={showSecret ? "text" : "password"}
                 value={apiSecret}
                 onChange={(e) => setApiSecret(e.target.value)}
-                placeholder="Seu API Secret"
+                placeholder="Cole seu Binance API Secret aqui"
                 style={{ ...inputStyle, paddingRight: "40px" }}
                 onFocus={(e) => (e.target.style.borderColor = "#00ff8850")}
                 onBlur={(e) => (e.target.style.borderColor = "#00ff8820")}
@@ -121,10 +134,7 @@ export function ApiKeySetup() {
 
           {/* Testnet toggle */}
           <div style={{ marginBottom: "24px" }}>
-            <label style={{
-              display: "flex", alignItems: "center", gap: "10px",
-              cursor: "pointer",
-            }}>
+            <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}>
               <div
                 onClick={() => setTestnet(!testnet)}
                 style={{
@@ -164,13 +174,13 @@ export function ApiKeySetup() {
               letterSpacing: "0.5px",
             }}
           >
-            {isPending ? "Salvando..." : "Salvar Chaves"}
+            {isPending ? "Salvando..." : "Salvar Chaves Binance"}
           </button>
 
-          {/* Link to Bybit */}
+          {/* Link to Binance */}
           <div style={{ marginTop: "16px", textAlign: "center" }}>
             <a
-              href="https://www.bybit.com/app/user/api-management"
+              href="https://www.binance.com/pt-BR/my/settings/api-management"
               target="_blank"
               rel="noopener noreferrer"
               style={{
@@ -180,7 +190,7 @@ export function ApiKeySetup() {
               }}
             >
               <ExternalLink size={11} />
-              Criar API Key na Bybit
+              Criar API Key na Binance
             </a>
           </div>
         </form>
@@ -192,13 +202,20 @@ export function ApiKeySetup() {
           borderRadius: "6px",
         }}>
           <p style={{ fontSize: "10px", color: "#00ff8855", marginBottom: "6px", letterSpacing: "0.5px" }}>
-            PERMISSÕES RECOMENDADAS
+            PERMISSÕES RECOMENDADAS NA BINANCE
           </p>
-          {["Leitura de conta", "Leitura de posições", "Leitura de ordens", "Criação de ordens", "Cancelamento de ordens"].map((p) => (
-            <p key={p} style={{ fontSize: "11px", color: "#00ff8866", marginBottom: "2px" }}>
-              ✓ {p}
+          {[
+            "Leitura de conta (Read)",
+            "Negociação de Futuros (Futures Trading)",
+            "NÃO habilitar: Saques ou Transferências",
+          ].map((p, i) => (
+            <p key={p} style={{ fontSize: "11px", color: i === 2 ? "#ff444466" : "#00ff8866", marginBottom: "2px" }}>
+              {i === 2 ? "✗" : "✓"} {p}
             </p>
           ))}
+          <p style={{ fontSize: "10px", color: "#00ff8833", marginTop: "8px" }}>
+            Restrinja o IP ao servidor: 50.31.196.137
+          </p>
         </div>
       </div>
     </div>
