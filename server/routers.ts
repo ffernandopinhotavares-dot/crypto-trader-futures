@@ -120,7 +120,7 @@ const tradingConfigRouter = router({
         aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).default("moderate"),
         maxRiskPerTrade: z.number().min(1).max(20).default(5),
         maxDrawdown: z.number().min(5).max(50).default(15),
-        maxOpenPositions: z.number().min(1).max(30).default(10),
+        maxOpenPositions: z.number().min(1).max(500).default(100),
         timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).default("15m"),
       })
     )
@@ -177,7 +177,7 @@ const tradingConfigRouter = router({
         aggressiveness,
         maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
         maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
-        maxOpenPositions: c.rsiPeriod ?? 10,
+        maxOpenPositions: c.rsiPeriod ?? 100,
         timeframe: c.timeframe ?? "15m",
         isActive: c.isActive,
         createdAt: c.createdAt,
@@ -210,7 +210,7 @@ const tradingConfigRouter = router({
         aggressiveness,
         maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
         maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
-        maxOpenPositions: c.rsiPeriod ?? 10,
+        maxOpenPositions: c.rsiPeriod ?? 100,
         timeframe: c.timeframe ?? "15m",
         isActive: c.isActive,
       };
@@ -320,7 +320,7 @@ const botControlRouter = router({
         gateioClient,
         maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
         maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
-        maxOpenPositions: config.rsiPeriod ?? 10,
+        maxOpenPositions: config.rsiPeriod ?? 100,
         timeframe: config.timeframe ?? "15m",
         aggressiveness,
       });

@@ -35,7 +35,7 @@ export interface TradingEngineConfig {
   // Autonomous config — no fixed pairs, no fixed SL/TP
   maxRiskPerTrade: number;     // max % of balance per trade (default 5)
   maxDrawdown: number;         // max total drawdown % before stopping (default 15)
-  maxOpenPositions: number;    // max concurrent positions (default 10)
+  maxOpenPositions: number;    // kept for compatibility but no longer enforced — capital is the only limit
   timeframe: string;           // analysis timeframe (default "15m")
   aggressiveness: "conservative" | "moderate" | "aggressive"; // risk profile
 }
@@ -218,13 +218,8 @@ export class TradingEngine {
         await this.monitorPositions();
 
         // 3. Scan market for new opportunities every cycle when there is capital available
-        // Always scan if there are open slots AND available capital to deploy
-        const hasOpenSlots = this.positions.size < this.config.maxOpenPositions;
-        if (hasOpenSlots) {
-          await this.scanAndTrade();
-        } else {
-          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} — max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
-        }
+        // No fixed position limit — bot opens as many positions as capital allows ($10 each)
+        await this.scanAndTrade();
 
         // 4. Update heartbeat
         await this.updateBotStatus({ isRunning: true });
@@ -339,10 +334,7 @@ export class TradingEngine {
           await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: available balance too low ($${available.toFixed(2)} USDT)`);
           break;
         }
-        if (this.positions.size >= this.config.maxOpenPositions) {
-          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
-          break;
-        }
+        // No fixed position limit — only capital constrains new positions
 
         // [FIX 5.6] Cap leverage at 10x regardless of AI decision
         decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
@@ -357,7 +349,7 @@ export class TradingEngine {
       }
 
       await this.logEvent("INFO", "SYSTEM",
-        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size}/${this.config.maxOpenPositions}`);
+        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size} | Capital used: ~$${(this.positions.size * 10).toFixed(0)} USDT`);
 
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
@@ -452,8 +444,8 @@ export class TradingEngine {
     const maxLev = this.getMaxLeverage();
 
     // Calculate how many more positions we can open
-    const openSlots = this.config.maxOpenPositions - this.positions.size;
-    const maxNewPositions = Math.min(openSlots, Math.floor(availableBalance / 10) + 1); // each position uses ~$10
+    // No fixed position limit — calculate slots purely from available capital
+    const maxNewPositions = Math.max(1, Math.floor(availableBalance / 10)); // each position uses ~$10
 
     const systemPrompt = `Você é um agente de trading algorítmico avançado especializado em criptoativos (futuros), com foco em MAXIMIZAR o número de posições abertas usando TODO o capital disponível.
 
@@ -482,12 +474,12 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 
 CAPITAL DISPONÍVEL:
 - Saldo disponível: ${availableBalance.toFixed(2)} USDT
-- Slots disponíveis: ${openSlots} (posições abertas: ${this.positions.size}/${this.config.maxOpenPositions})
-- Posições que podem ser abertas agora: até ${maxNewPositions}
+- Posições abertas atualmente: ${this.positions.size} (sem limite fixo)
+- Posições que podem ser abertas agora: até ${maxNewPositions} (baseado no saldo disponível)
 - CADA posição usa $10 USDT fixo (o sistema calcula os contratos automaticamente)
 
 REGRAS:
-- Retorne TODOS os trades viáveis que encontrar, até ${maxNewPositions} oportunidades
+- Retorne TODOS os trades viáveis que encontrar, até ${maxNewPositions} oportunidades (use TODO o capital disponível)
 - Ordene por confiança (maior primeiro)
 - NUNCA repita o mesmo símbolo
 - Só inclua trades com confiança >= ${minConf}%
