@@ -278,40 +278,40 @@ export class GateioClient {
   }
 
   async closePosition(symbol: string, positionSide?: string): Promise<GateioOrderResult | null> {
-    const dual = await this.checkDualMode();
     const positions = await this.getPositions();
 
-    if (dual) {
-      // In dual mode, we need to close the specific side
-      // positionSide should be "LONG" or "SHORT"
-      const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide));
-      if (!pos || parseFloat(pos.size) === 0) return null;
+    // Find the position to close
+    const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide))
+      || positions.find((p) => p.symbol === symbol);
+    if (!pos || parseFloat(pos.size) === 0) return null;
 
-      // Use auto_size to close: "close_long" closes long, "close_short" closes short
-      const autoSize = pos.side === "LONG" ? "close_long" : "close_short";
-      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+    // CORRECT METHOD: Use reduceOnly with negative/positive size
+    // For dual_long (LONG): send negative size to sell and close
+    // For dual_short (SHORT): send positive size to buy and close
+    const absSize = Math.abs(parseFloat(pos.size));
+    const closeSize = pos.side === "LONG" ? -absSize : absSize;
 
-      console.log(`[GATEIO] Closing dual ${pos.side} position ${symbol}: autoSize=${autoSize}`);
+    console.log(`[GATEIO] Closing ${pos.side} position ${symbol}: size=${closeSize} reduceOnly=true`);
 
-      return await this.placeOrder({
-        symbol,
-        side: closeSide,
-        size: 0, // auto_size will determine
-        autoSize,
-      });
-    } else {
-      // Single mode: use reduce_only
-      const pos = positions.find((p) => p.symbol === symbol);
-      if (!pos || parseFloat(pos.size) === 0) return null;
+    const order: any = {
+      contract: symbol,
+      size: closeSize,
+      price: "0",
+      tif: "ioc",
+      reduceOnly: true,
+    };
 
-      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-      return await this.placeOrder({
-        symbol,
-        side: closeSide,
-        size: Math.abs(parseFloat(pos.size)),
-        reduceOnly: true,
-      });
-    }
+    const result = await this.futuresApi.createFuturesOrder(this.settle, order);
+    const o = result.body as any;
+
+    return {
+      orderId: String(o.id || ""),
+      symbol: o.contract || symbol,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      size: absSize,
+      price: o.fillPrice || o.fill_price || o.price || "0",
+      status: o.status || "unknown",
+    };
   }
 
   async closeAllPositions(): Promise<{ closed: string[]; errors: string[] }> {

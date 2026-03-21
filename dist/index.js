@@ -548,32 +548,29 @@ var GateioClient = class _GateioClient {
     };
   }
   async closePosition(symbol, positionSide) {
-    const dual = await this.checkDualMode();
     const positions = await this.getPositions();
-    if (dual) {
-      const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide));
-      if (!pos || parseFloat(pos.size) === 0) return null;
-      const autoSize = pos.side === "LONG" ? "close_long" : "close_short";
-      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-      console.log(`[GATEIO] Closing dual ${pos.side} position ${symbol}: autoSize=${autoSize}`);
-      return await this.placeOrder({
-        symbol,
-        side: closeSide,
-        size: 0,
-        // auto_size will determine
-        autoSize
-      });
-    } else {
-      const pos = positions.find((p) => p.symbol === symbol);
-      if (!pos || parseFloat(pos.size) === 0) return null;
-      const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-      return await this.placeOrder({
-        symbol,
-        side: closeSide,
-        size: Math.abs(parseFloat(pos.size)),
-        reduceOnly: true
-      });
-    }
+    const pos = positions.find((p) => p.symbol === symbol && (!positionSide || p.side === positionSide)) || positions.find((p) => p.symbol === symbol);
+    if (!pos || parseFloat(pos.size) === 0) return null;
+    const absSize = Math.abs(parseFloat(pos.size));
+    const closeSize = pos.side === "LONG" ? -absSize : absSize;
+    console.log(`[GATEIO] Closing ${pos.side} position ${symbol}: size=${closeSize} reduceOnly=true`);
+    const order = {
+      contract: symbol,
+      size: closeSize,
+      price: "0",
+      tif: "ioc",
+      reduceOnly: true
+    };
+    const result = await this.futuresApi.createFuturesOrder(this.settle, order);
+    const o = result.body;
+    return {
+      orderId: String(o.id || ""),
+      symbol: o.contract || symbol,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      size: absSize,
+      price: o.fillPrice || o.fill_price || o.price || "0",
+      status: o.status || "unknown"
+    };
   }
   async closeAllPositions() {
     const positions = await this.getPositions();
