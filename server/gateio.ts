@@ -265,6 +265,26 @@ export class GateioClient {
     }
   }
 
+  /**
+   * [FIX 6.0] Set margin mode for a contract: 'cross' or 'isolated'.
+   * Uses updateContractPositionLeverage which accepts marginMode parameter.
+   * Called automatically when total balance exceeds ISOLATED_MARGIN_THRESHOLD ($200).
+   */
+  async setMarginMode(symbol: string, marginMode: "cross" | "isolated", leverage: number = 10): Promise<void> {
+    try {
+      await this.futuresApi.updateContractPositionLeverage(
+        this.settle as 'usdt' | 'btc',
+        symbol,
+        String(leverage),
+        marginMode
+      );
+      console.log(`[GATEIO] Margin mode set to ${marginMode} for ${symbol} (lev=${leverage}x)`);
+    } catch (e: any) {
+      // Log but don't throw — mode might already be set or contract not open
+      console.log(`[GATEIO] Margin mode note for ${symbol}: ${e?.message || String(e)}`);
+    }
+  }
+
   async placeOrder(params: {
     symbol: string;
     side: "BUY" | "SELL";
