@@ -157,16 +157,31 @@ export class TradingEngine {
     try {
       // Get top volume USDT pairs from Gate.io Futures
       const topPairs = await this.config.gateioClient.getTopPairs(20);
+      console.log(`[SCAN] Found ${topPairs.length} top pairs: ${topPairs.slice(0, 5).map(p => p.symbol).join(', ')}...`);
 
       const snapshots: MarketSnapshot[] = [];
+      let snapshotErrors = 0;
       for (const pair of topPairs) {
         try {
           const snapshot = await this.getMarketSnapshot(pair.symbol);
-          if (snapshot) snapshots.push(snapshot);
-        } catch { /* skip symbols with errors */ }
+          if (snapshot) {
+            snapshots.push(snapshot);
+          } else {
+            snapshotErrors++;
+          }
+        } catch (err) {
+          snapshotErrors++;
+          console.error(`[SCAN] Snapshot error for ${pair.symbol}: ${this.errStr(err)}`);
+        }
       }
 
-      if (snapshots.length === 0) return;
+      console.log(`[SCAN] Got ${snapshots.length} snapshots, ${snapshotErrors} errors`);
+
+      if (snapshots.length === 0) {
+        console.log(`[SCAN] No valid snapshots — skipping AI analysis`);
+        await this.logEvent("ERROR", "SYSTEM", `Scan: 0 valid snapshots from ${topPairs.length} pairs (${snapshotErrors} errors)`);
+        return;
+      }
 
       // Ask AI to pick the best opportunities
       const decisions = await this.askAIForOpportunities(snapshots);
@@ -293,9 +308,15 @@ Retorne no máximo 10 oportunidades, ordenadas por confiança. Se não houver bo
       });
 
       const content = response.choices[0]?.message?.content ?? "[]";
+      console.log(`[AI] Raw response: ${content.substring(0, 300)}`);
       const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) return [];
-      return JSON.parse(jsonMatch[0]) as AIDecision[];
+      if (!jsonMatch) {
+        console.log(`[AI] No JSON array found in response`);
+        return [];
+      }
+      const decisions = JSON.parse(jsonMatch[0]) as AIDecision[];
+      console.log(`[AI] Got ${decisions.length} decisions: ${decisions.map(d => `${d.action} ${d.symbol} conf:${d.confidence}`).join(', ')}`);
+      return decisions;
     } catch (error) {
       await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${this.errStr(error)}`);
       return [];
@@ -408,6 +429,7 @@ Responda APENAS com JSON:
         trend,
       };
     } catch (error) {
+      console.error(`[SNAPSHOT] Error for ${symbol}: ${this.errStr(error)}`);
       return null;
     }
   }
