@@ -515,7 +515,8 @@ var GateioClient = class _GateioClient {
         entryPrice: p.entryPrice || p.entry_price || "0",
         markPrice: p.markPrice || p.mark_price || "0",
         unrealizedPnl: p.unrealisedPnl || p.unrealised_pnl || "0",
-        leverage: p.leverage || p.crossLeverageLimit || "0",
+        // [FIX 5.9] In cross margin, leverage=0 and the real value is in crossLeverageLimit
+        leverage: p.leverage && p.leverage !== "0" ? p.leverage : p.crossLeverageLimit || p.cross_leverage_limit || "10",
         marginMode: mode
       };
     });
@@ -540,6 +541,24 @@ var GateioClient = class _GateioClient {
       }
     } catch (e) {
       console.log(`[GATEIO] Leverage set note for ${symbol}: ${e?.message || String(e)}`);
+    }
+  }
+  /**
+   * [FIX 6.0] Set margin mode for a contract: 'cross' or 'isolated'.
+   * Uses updateContractPositionLeverage which accepts marginMode parameter.
+   * Called automatically when total balance exceeds ISOLATED_MARGIN_THRESHOLD ($200).
+   */
+  async setMarginMode(symbol, marginMode, leverage = 10) {
+    try {
+      await this.futuresApi.updateContractPositionLeverage(
+        this.settle,
+        symbol,
+        String(leverage),
+        marginMode
+      );
+      console.log(`[GATEIO] Margin mode set to ${marginMode} for ${symbol} (lev=${leverage}x)`);
+    } catch (e) {
+      console.log(`[GATEIO] Margin mode note for ${symbol}: ${e?.message || String(e)}`);
     }
   }
   async placeOrder(params) {
@@ -798,6 +817,10 @@ var TradingEngine = class _TradingEngine {
   openai;
   cycleCount = 0;
   initialBalance = 0;
+  // [CREDIT GUARD] Track consecutive AI 402/credit errors
+  consecutiveAIErrors = 0;
+  static MAX_CONSECUTIVE_AI_ERRORS = 3;
+  // Close all after 3 consecutive failures
   // [FIX 5.8] Cache for contract info and tickers
   contractInfoCache = /* @__PURE__ */ new Map();
   allTickersCache = { data: null, cachedAt: 0 };
@@ -811,6 +834,21 @@ var TradingEngine = class _TradingEngine {
   // parallel candle fetches per batch
   static AI_BATCH_SIZE = 50;
   // pairs per AI call
+  // [FIX 5.9] Reserve 10% of total balance as buffer (emergency + opportunity reserve)
+  // This prevents full capital lock-up and ensures liquidity for SHORT opportunities
+  static CAPITAL_RESERVE_PCT = 0.1;
+  // [FIX 6.0] Win Rate monitoring — alert if win rate drops below threshold
+  static WIN_RATE_ALERT_THRESHOLD = 35;
+  // alert if WR < 35%
+  static WIN_RATE_CHECK_INTERVAL = 10;
+  // check every 10 cycles
+  static WIN_RATE_MIN_SAMPLE = 20;
+  // need at least 20 trades to alert
+  // [FIX 6.0] Isolated margin threshold — switch to isolated when balance > $200
+  static ISOLATED_MARGIN_THRESHOLD = 200;
+  // USD
+  static ISOLATED_MARGIN_MODE = "isolated";
+  static CROSS_MARGIN_MODE = "cross";
   get db() {
     return getDatabase();
   }
@@ -877,31 +915,54 @@ var TradingEngine = class _TradingEngine {
   // --------------------------------------------------------------------------
   // [FIX 5.7] Sync positions from exchange into memory on start/restart
   // --------------------------------------------------------------------------
+  // [FIX 7.0] CRITICAL: Sync positions from exchange AND restore entryTime from DB.
+  // Previously used new Date() as entryTime, causing all restored positions to appear
+  // as freshly opened — they would immediately pass the cooldown check and be re-evaluated
+  // by AI, or worse, have their hold-time reset to 0 causing premature exits.
+  // Now we cross-reference the DB trades table (status=OPEN) to restore the real entryTime.
   async syncPositionsFromExchange() {
     try {
       const exchangePositions = await this.config.gateioClient.getPositions();
+      let openDbTrades = [];
+      try {
+        openDbTrades = await this.db.select({
+          symbol: trades.symbol,
+          entryTime: trades.entryTime,
+          entryPrice: trades.entryPrice,
+          side: trades.side,
+          quantity: trades.quantity
+        }).from(trades).where(and(eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId)));
+        console.log(`[SYNC] Found ${openDbTrades.length} OPEN trades in DB to cross-reference`);
+      } catch (dbErr) {
+        console.error("[SYNC] Could not fetch open trades from DB:", this.errStr(dbErr));
+      }
+      let syncedCount = 0;
       for (const pos of exchangePositions) {
         const absSize = Math.abs(parseFloat(pos.size));
         if (absSize > 0 && !this.positions.has(pos.symbol)) {
           const side = pos.side === "LONG" ? "BUY" : "SELL";
           const leverage = parseFloat(pos.leverage) || 10;
           const entryPrice = parseFloat(pos.entryPrice) || 0;
+          const dbTrade = openDbTrades.find((t2) => t2.symbol === pos.symbol && t2.side === side);
+          const entryTime = dbTrade?.entryTime ?? /* @__PURE__ */ new Date();
+          const restoredFrom = dbTrade ? `DB (${entryTime.toISOString()})` : "approximate (new Date)";
           const qm = await this.getCachedContractMultiplier(pos.symbol);
           this.positions.set(pos.symbol, {
             symbol: pos.symbol,
             side,
-            entryPrice,
+            entryPrice: dbTrade ? parseFloat(dbTrade.entryPrice ?? "0") || entryPrice : entryPrice,
             quantity: absSize,
-            entryTime: /* @__PURE__ */ new Date(),
-            // approximate — real entry time unknown after restart
+            entryTime,
             leverage,
             confidence: 50,
             // unknown for restored positions
             quantoMultiplier: qm
           });
-          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm}`);
+          syncedCount++;
+          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm} entryTime=${restoredFrom}`);
         }
       }
+      console.log(`[SYNC] Sync complete: ${syncedCount} positions restored from exchange (${openDbTrades.length} DB trades available)`);
     } catch (error) {
       console.error("[SYNC] Error syncing positions from exchange:", this.errStr(error));
     }
@@ -917,15 +978,24 @@ var TradingEngine = class _TradingEngine {
         if (await this.isDrawdownExceeded()) {
           await this.logEvent("RISK_STOP", "SYSTEM", `Max drawdown ${this.config.maxDrawdown}% exceeded. Closing all positions.`);
           await this.closeAllPositions("MAX_DRAWDOWN");
-          await this.stop();
-          return;
+          await this.logEvent("AUTO_RESTART", "SYSTEM", "Drawdown limit hit. All positions closed. Resetting balance baseline and resuming scan for new opportunities.");
+          try {
+            const freshBalance = await this.config.gateioClient.getBalance();
+            this.initialBalance = parseFloat(freshBalance.totalBalance);
+            await this.logEvent("AUTO_RESTART", "SYSTEM", `New balance baseline: $${this.initialBalance.toFixed(2)} USDT. Resuming trading.`);
+          } catch (e) {
+            await this.logEvent("ERROR", "SYSTEM", `Failed to reset balance: ${this.errStr(e)}. Stopping bot.`);
+            await this.stop();
+            return;
+          }
+          await this.logEvent("AUTO_RESTART", "SYSTEM", "Cooldown: waiting 2 minutes before resuming scan...");
+          await this.sleep(2 * 60 * 1e3);
+          continue;
         }
         await this.monitorPositions();
-        const hasOpenSlots = this.positions.size < this.config.maxOpenPositions;
-        if (hasOpenSlots) {
-          await this.scanAndTrade();
-        } else {
-          console.log(`[SCAN] Skipping scan on cycle #${this.cycleCount} \u2014 max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
+        await this.scanAndTrade();
+        if (this.cycleCount % _TradingEngine.WIN_RATE_CHECK_INTERVAL === 0) {
+          await this.checkWinRateAlert();
         }
         await this.updateBotStatus({ isRunning: true });
         const waitMs = this.config.aggressiveness === "aggressive" ? 5 * 60 * 1e3 : this.config.aggressiveness === "moderate" ? 10 * 60 * 1e3 : 15 * 60 * 1e3;
@@ -1009,13 +1079,12 @@ var TradingEngine = class _TradingEngine {
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue;
         const balance = await this.config.gateioClient.getBalance();
+        const totalBalance = parseFloat(balance.totalBalance);
         const available = parseFloat(balance.availableBalance);
-        if (available < 1) {
-          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: available balance too low ($${available.toFixed(2)} USDT)`);
-          break;
-        }
-        if (this.positions.size >= this.config.maxOpenPositions) {
-          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: max positions reached (${this.positions.size}/${this.config.maxOpenPositions})`);
+        const reserveFloor = totalBalance * _TradingEngine.CAPITAL_RESERVE_PCT;
+        const deployable = available - reserveFloor;
+        if (deployable < 1) {
+          await this.logEvent("INFO", "SYSTEM", `[SCAN] Stopping: deployable balance too low ($${deployable.toFixed(2)} USDT after ${(_TradingEngine.CAPITAL_RESERVE_PCT * 100).toFixed(0)}% reserve of $${reserveFloor.toFixed(2)})`);
           break;
         }
         decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
@@ -1030,7 +1099,7 @@ var TradingEngine = class _TradingEngine {
       await this.logEvent(
         "INFO",
         "SYSTEM",
-        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size}/${this.config.maxOpenPositions}`
+        `[SCAN] Cycle complete: opened ${openedCount} positions | Total open: ${this.positions.size} | Capital used: ~$${(this.positions.size * 10).toFixed(0)} USDT`
       );
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
@@ -1052,13 +1121,20 @@ var TradingEngine = class _TradingEngine {
       try {
         const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1e3 * 60);
         const minHoldMinutes = this.getMinHoldMinutes();
-        if (holdTimeMinutes < minHoldMinutes) {
-          console.log(`[MONITOR] ${symbol}: skipping (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
-          continue;
-        }
         const snapshot = await this.getMarketSnapshot(symbol);
         if (!snapshot) continue;
         const pnlPercent = position.side === "BUY" ? (snapshot.price - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - snapshot.price) / position.entryPrice * 100;
+        const hardStopLoss = -(this.config.maxRiskPerTrade ?? 3);
+        if (pnlPercent <= hardStopLoss) {
+          const reason = `[HARD_STOP] P&L ${pnlPercent.toFixed(2)}% <= stop-loss ${hardStopLoss}% \u2014 closing immediately (bypassing cooldown of ${minHoldMinutes}m)`;
+          await this.logEvent("RISK_STOP", symbol, reason);
+          await this.closePosition(symbol, snapshot.price, reason);
+          continue;
+        }
+        if (holdTimeMinutes < minHoldMinutes) {
+          console.log(`[MONITOR] ${symbol}: skipping AI (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
+          continue;
+        }
         const decision = await this.askAIForPositionManagement(position, snapshot, pnlPercent);
         if (decision.action === "CLOSE") {
           await this.closePosition(symbol, snapshot.price, decision.reasoning);
@@ -1069,25 +1145,79 @@ var TradingEngine = class _TradingEngine {
       }
     }
   }
-  // [FIX 5.4] Minimum hold time based on timeframe
+  // [FIX 6.0] Minimum hold time — doubled to reduce premature exits
+  // Analysis showed 56.8% of trades were closed in < 5 min, cutting profits short.
+  // New minimums give positions time to develop before AI can decide to close.
   getMinHoldMinutes() {
     const tfMinutes = {
-      "1m": 2,
-      "5m": 10,
-      "15m": 15,
-      "30m": 30,
-      "1h": 60,
-      "4h": 240,
+      "1m": 5,
+      // was 2  — minimum 5 min for 1m timeframe
+      "5m": 20,
+      // was 10 — minimum 20 min for 5m timeframe
+      "15m": 30,
+      // was 15 — minimum 30 min for 15m timeframe (main timeframe)
+      "30m": 60,
+      // was 30 — minimum 60 min for 30m timeframe
+      "1h": 90,
+      // was 60 — minimum 90 min for 1h timeframe
+      "4h": 360,
+      // was 240 — minimum 6h for 4h timeframe
       "1d": 1440
     };
-    return tfMinutes[this.config.timeframe] || 15;
+    return tfMinutes[this.config.timeframe] || 30;
+  }
+  // --------------------------------------------------------------------------
+  // [FIX 6.0] Win Rate Monitoring
+  // --------------------------------------------------------------------------
+  /**
+   * Checks current win rate and logs an alert if it drops below the threshold.
+   * Also logs a comparative snapshot vs the FIX 5.9 baseline for 48h tracking.
+   */
+  async checkWinRateAlert() {
+    try {
+      const statusRows = await this.db.select().from(botStatus).where(eq(botStatus.userId, this.config.userId)).limit(1);
+      if (statusRows.length === 0) return;
+      const s = statusRows[0];
+      const total = s.totalTrades || 0;
+      const wins = s.winningTrades || 0;
+      const losses = s.losingTrades || 0;
+      const pnl = parseFloat(s.totalPnl || "0");
+      if (total < _TradingEngine.WIN_RATE_MIN_SAMPLE) {
+        await this.logEvent(
+          "INFO",
+          "SYSTEM",
+          `[WIN_RATE] Insufficient sample (${total} trades < ${_TradingEngine.WIN_RATE_MIN_SAMPLE} min). Monitoring started.`
+        );
+        return;
+      }
+      const winRate = wins / total * 100;
+      const profitFactor = losses > 0 ? wins / losses : wins;
+      if (winRate < _TradingEngine.WIN_RATE_ALERT_THRESHOLD) {
+        await this.logEvent(
+          "ERROR",
+          "SYSTEM",
+          `[WIN_RATE] \u26A0\uFE0F ALERT: Win Rate ${winRate.toFixed(1)}% is below ${_TradingEngine.WIN_RATE_ALERT_THRESHOLD}% threshold! Trades: ${total} | W: ${wins} | L: ${losses} | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT. Consider reviewing AI parameters or pausing the bot.`
+        );
+      } else {
+        await this.logEvent(
+          "INFO",
+          "SYSTEM",
+          `[WIN_RATE] Status OK: ${winRate.toFixed(1)}% (${wins}W/${losses}L) | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT | Cycle #${this.cycleCount}`
+        );
+      }
+    } catch (e) {
+      console.error("[WIN_RATE] Error checking win rate:", this.errStr(e));
+    }
   }
   // --------------------------------------------------------------------------
   // AI Decision Engine
   // --------------------------------------------------------------------------
   async askAIForOpportunities(snapshots) {
     const balance = await this.config.gateioClient.getBalance();
+    const totalBalance = parseFloat(balance.totalBalance);
     const availableBalance = parseFloat(balance.availableBalance);
+    const reserveFloor = totalBalance * _TradingEngine.CAPITAL_RESERVE_PCT;
+    const deployableBalance = Math.max(0, availableBalance - reserveFloor);
     const marketSummary = snapshots.map((s) => ({
       symbol: s.symbol,
       price: s.price,
@@ -1104,8 +1234,7 @@ var TradingEngine = class _TradingEngine {
     }));
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
-    const openSlots = this.config.maxOpenPositions - this.positions.size;
-    const maxNewPositions = Math.min(openSlots, Math.floor(availableBalance / 10) + 1);
+    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 10));
     const systemPrompt = `Voc\xEA \xE9 um agente de trading algor\xEDtmico avan\xE7ado especializado em criptoativos (futuros), com foco em MAXIMIZAR o n\xFAmero de posi\xE7\xF5es abertas usando TODO o capital dispon\xEDvel.
 
 OBJETIVO PRINCIPAL: Identificar TODOS os trades vi\xE1veis nos dados fornecidos e recomendar TODOS eles. N\xE3o filtre demais \u2014 se um trade tem evid\xEAncia t\xE9cnica suficiente, recomende-o.
@@ -1132,13 +1261,13 @@ PERFIL DE RISCO: ${this.config.aggressiveness}
 - Confian\xE7a m\xEDnima: ${minConf}%
 
 CAPITAL DISPON\xCDVEL:
-- Saldo dispon\xEDvel: ${availableBalance.toFixed(2)} USDT
-- Slots dispon\xEDveis: ${openSlots} (posi\xE7\xF5es abertas: ${this.positions.size}/${this.config.maxOpenPositions})
-- Posi\xE7\xF5es que podem ser abertas agora: at\xE9 ${maxNewPositions}
+- Saldo deploy\xE1vel: ${deployableBalance.toFixed(2)} USDT (reserva 10% = ${reserveFloor.toFixed(2)} USDT bloqueada)
+- Posi\xE7\xF5es abertas atualmente: ${this.positions.size} (sem limite fixo)
+- Posi\xE7\xF5es que podem ser abertas agora: at\xE9 ${maxNewPositions} (baseado no saldo dispon\xEDvel)
 - CADA posi\xE7\xE3o usa $10 USDT fixo (o sistema calcula os contratos automaticamente)
 
 REGRAS:
-- Retorne TODOS os trades vi\xE1veis que encontrar, at\xE9 ${maxNewPositions} oportunidades
+- Retorne TODOS os trades vi\xE1veis que encontrar, at\xE9 ${maxNewPositions} oportunidades (use TODO o capital dispon\xEDvel)
 - Ordene por confian\xE7a (maior primeiro)
 - NUNCA repita o mesmo s\xEDmbolo
 - S\xF3 inclua trades com confian\xE7a >= ${minConf}%
@@ -1166,6 +1295,7 @@ ${JSON.stringify(marketSummary, null, 2)}` }
         temperature: 0.3,
         max_tokens: 2e3
       });
+      this.consecutiveAIErrors = 0;
       const content = response.choices[0]?.message?.content ?? "[]";
       console.log(`[AI] Raw response: ${content.substring(0, 300)}`);
       const jsonMatch = content.match(/\[[\s\S]*\]/);
@@ -1177,7 +1307,9 @@ ${JSON.stringify(marketSummary, null, 2)}` }
       console.log(`[AI] Got ${decisions.length} decisions: ${decisions.map((d) => `${d.action} ${d.symbol} conf:${d.confidence}`).join(", ")}`);
       return decisions;
     } catch (error) {
-      await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${this.errStr(error)}`);
+      const errMsg = this.errStr(error);
+      await this.logEvent("ERROR", "AI", `AI opportunity analysis failed: ${errMsg}`);
+      await this.handleAIError(errMsg);
       return [];
     }
   }
@@ -1234,13 +1366,46 @@ Responda APENAS com JSON:
         temperature: 0.2,
         max_tokens: 500
       });
+      this.consecutiveAIErrors = 0;
       const content = response.choices[0]?.message?.content ?? '{"action":"HOLD"}';
       const jsonMatch = content.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "Parse error" };
       return JSON.parse(jsonMatch[0]);
     } catch (error) {
-      await this.logEvent("ERROR", "AI", `AI position management failed: ${this.errStr(error)}`);
+      const errMsg = this.errStr(error);
+      await this.logEvent("ERROR", "AI", `AI position management failed: ${errMsg}`);
+      await this.handleAIError(errMsg);
       return { action: "HOLD", symbol: position.symbol, confidence: 0, leverage: 0, positionSizePercent: 0, reasoning: "AI error - holding" };
+    }
+  }
+  // --------------------------------------------------------------------------
+  // [CREDIT GUARD] Detect AI credit exhaustion and trigger emergency close
+  // --------------------------------------------------------------------------
+  async handleAIError(errMsg) {
+    const isCreditError = errMsg.includes("402") || errMsg.toLowerCase().includes("insufficient credits") || errMsg.toLowerCase().includes("credit") || errMsg.toLowerCase().includes("quota") || errMsg.toLowerCase().includes("billing");
+    if (isCreditError) {
+      this.consecutiveAIErrors++;
+      await this.logEvent(
+        "WARNING",
+        "AI",
+        `[CREDIT GUARD] AI credit error #${this.consecutiveAIErrors}/${_TradingEngine.MAX_CONSECUTIVE_AI_ERRORS}: ${errMsg}`
+      );
+      if (this.consecutiveAIErrors >= _TradingEngine.MAX_CONSECUTIVE_AI_ERRORS) {
+        await this.logEvent(
+          "CRITICAL",
+          "SYSTEM",
+          `[CREDIT GUARD] \u{1F6A8} AI credits EXHAUSTED after ${this.consecutiveAIErrors} consecutive errors. EMERGENCY CLOSING ALL ${this.positions.size} POSITIONS to prevent unmanaged exposure.`
+        );
+        await this.closeAllPositions("AI_CREDITS_EXHAUSTED");
+        await this.logEvent(
+          "CRITICAL",
+          "SYSTEM",
+          `[CREDIT GUARD] Bot STOPPED. Recarregue os cr\xE9ditos da API de IA e reinicie o bot manualmente.`
+        );
+        await this.stop();
+      }
+    } else {
+      this.consecutiveAIErrors = 0;
     }
   }
   // --------------------------------------------------------------------------
@@ -1341,8 +1506,11 @@ Responda APENAS com JSON:
     decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
     try {
       const balance = await this.config.gateioClient.getBalance();
+      const totalBalance = parseFloat(balance.totalBalance);
       const available = parseFloat(balance.availableBalance);
-      const baseValue = Math.min(available, 10);
+      const reserveFloor = totalBalance * _TradingEngine.CAPITAL_RESERVE_PCT;
+      const deployable = Math.max(0, available - reserveFloor);
+      const baseValue = Math.min(deployable, 10);
       const notionalValue = baseValue * decision.leverage;
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
@@ -1354,6 +1522,17 @@ Responda APENAS com JSON:
       const rawContracts = notionalValue / contractValue;
       const contracts = Math.floor(rawContracts);
       if (contracts <= 0) return;
+      const targetMarginMode = totalBalance >= _TradingEngine.ISOLATED_MARGIN_THRESHOLD ? _TradingEngine.ISOLATED_MARGIN_MODE : _TradingEngine.CROSS_MARGIN_MODE;
+      try {
+        await this.config.gateioClient.setMarginMode(
+          decision.symbol,
+          targetMarginMode,
+          decision.leverage
+        );
+        console.log(`[EXEC] ${decision.symbol}: margin mode=${targetMarginMode} (balance=$${totalBalance.toFixed(2)}, threshold=$${_TradingEngine.ISOLATED_MARGIN_THRESHOLD})`);
+      } catch (e) {
+        console.log(`Margin mode warning for ${decision.symbol}:`, this.errStr(e));
+      }
       try {
         await this.config.gateioClient.setLeverage(decision.symbol, decision.leverage);
       } catch (e) {
@@ -1497,12 +1676,24 @@ Responda APENAS com JSON:
   // --------------------------------------------------------------------------
   // Risk Management
   // --------------------------------------------------------------------------
+  // [FIX 7.0] CRITICAL: Use realized balance (account.total) NOT totalBalance which
+  // includes unrealizedPnL. With cross margin and many open positions, unrealizedPnL
+  // fluctuations were triggering false drawdown alerts, closing profitable positions.
+  // The drawdown check now uses the raw 'available' balance from the exchange account,
+  // which represents settled/realized funds only.
   async isDrawdownExceeded() {
     if (this.initialBalance <= 0) return false;
     try {
       const balance = await this.config.gateioClient.getBalance();
-      const currentBalance = parseFloat(balance.totalBalance);
-      const drawdown = (this.initialBalance - currentBalance) / this.initialBalance * 100;
+      const realizedBalance = parseFloat(balance.availableBalance || balance.totalBalance);
+      const drawdown = (this.initialBalance - realizedBalance) / this.initialBalance * 100;
+      if (drawdown >= this.config.maxDrawdown * 0.8) {
+        await this.logEvent(
+          "RISK_WARN",
+          "SYSTEM",
+          `Drawdown warning: ${drawdown.toFixed(2)}% (limit: ${this.config.maxDrawdown}%) | realized=$${realizedBalance.toFixed(2)} initial=$${this.initialBalance.toFixed(2)}`
+        );
+      }
       return drawdown >= this.config.maxDrawdown;
     } catch {
       return false;
@@ -1601,7 +1792,8 @@ Responda APENAS com JSON:
       } else {
         await this.db.update(botStatus).set({
           isRunning: update.isRunning ?? existing[0].isRunning,
-          startedAt: update.isRunning ? /* @__PURE__ */ new Date() : existing[0].startedAt,
+          // [FIX 5.9] Preserve original startedAt — only set on first start, never overwrite
+          startedAt: update.isRunning && !existing[0].startedAt ? /* @__PURE__ */ new Date() : existing[0].startedAt,
           lastHeartbeat: /* @__PURE__ */ new Date()
         }).where(eq(botStatus.userId, this.config.userId));
       }
@@ -1702,8 +1894,8 @@ var tradingConfigRouter = router({
       description: z.string().optional(),
       aggressiveness: z.enum(["conservative", "moderate", "aggressive"]).default("moderate"),
       maxRiskPerTrade: z.number().min(1).max(20).default(5),
-      maxDrawdown: z.number().min(5).max(50).default(15),
-      maxOpenPositions: z.number().min(1).max(30).default(10),
+      maxDrawdown: z.number().min(5).max(50).default(10),
+      maxOpenPositions: z.number().min(1).max(500).default(100),
       timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h", "1d"]).default("15m")
     })
   ).mutation(async ({ input, ctx }) => {
@@ -1749,8 +1941,8 @@ var tradingConfigRouter = router({
         description,
         aggressiveness,
         maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
-        maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
-        maxOpenPositions: c.rsiPeriod ?? 10,
+        maxDrawdown: parseFloat(c.maxDrawdown ?? "10"),
+        maxOpenPositions: c.rsiPeriod ?? 100,
         timeframe: c.timeframe ?? "15m",
         isActive: c.isActive,
         createdAt: c.createdAt
@@ -1771,8 +1963,8 @@ var tradingConfigRouter = router({
       description: descParts.slice(1).join("|") || "Estrat\xE9gia AI Aut\xF4noma",
       aggressiveness,
       maxRiskPerTrade: parseFloat(c.maxPositionSize ?? "5"),
-      maxDrawdown: parseFloat(c.maxDrawdown ?? "15"),
-      maxOpenPositions: c.rsiPeriod ?? 10,
+      maxDrawdown: parseFloat(c.maxDrawdown ?? "10"),
+      maxOpenPositions: c.rsiPeriod ?? 100,
       timeframe: c.timeframe ?? "15m",
       isActive: c.isActive
     };
@@ -1834,8 +2026,8 @@ var botControlRouter = router({
       configId: input.configId,
       gateioClient,
       maxRiskPerTrade: parseFloat(config.maxPositionSize ?? "5"),
-      maxDrawdown: parseFloat(config.maxDrawdown ?? "15"),
-      maxOpenPositions: config.rsiPeriod ?? 10,
+      maxDrawdown: parseFloat(config.maxDrawdown ?? "10"),
+      maxOpenPositions: config.rsiPeriod ?? 100,
       timeframe: config.timeframe ?? "15m",
       aggressiveness
     });
