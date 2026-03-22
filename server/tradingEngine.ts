@@ -179,9 +179,32 @@ export class TradingEngine {
   // [FIX 5.7] Sync positions from exchange into memory on start/restart
   // --------------------------------------------------------------------------
 
+  // [FIX 7.0] CRITICAL: Sync positions from exchange AND restore entryTime from DB.
+  // Previously used new Date() as entryTime, causing all restored positions to appear
+  // as freshly opened — they would immediately pass the cooldown check and be re-evaluated
+  // by AI, or worse, have their hold-time reset to 0 causing premature exits.
+  // Now we cross-reference the DB trades table (status=OPEN) to restore the real entryTime.
   private async syncPositionsFromExchange(): Promise<void> {
     try {
       const exchangePositions = await this.config.gateioClient.getPositions();
+
+      // [FIX 7.0] Pre-fetch all OPEN trades from DB for this user to restore real entryTime
+      let openDbTrades: Array<{ symbol: string; entryTime: Date; entryPrice: string | null; side: "BUY" | "SELL"; quantity: string | null }> = [];
+      try {
+        openDbTrades = await this.db.select({
+          symbol: trades.symbol,
+          entryTime: trades.entryTime,
+          entryPrice: trades.entryPrice,
+          side: trades.side,
+          quantity: trades.quantity,
+        }).from(trades)
+          .where(and(eq(trades.status, "OPEN"), eq(trades.userId, this.config.userId)));
+        console.log(`[SYNC] Found ${openDbTrades.length} OPEN trades in DB to cross-reference`);
+      } catch (dbErr) {
+        console.error("[SYNC] Could not fetch open trades from DB:", this.errStr(dbErr));
+      }
+
+      let syncedCount = 0;
       for (const pos of exchangePositions) {
         const absSize = Math.abs(parseFloat(pos.size));
         if (absSize > 0 && !this.positions.has(pos.symbol)) {
@@ -189,23 +212,30 @@ export class TradingEngine {
           const leverage = parseFloat(pos.leverage) || 10;
           const entryPrice = parseFloat(pos.entryPrice) || 0;
 
+          // [FIX 7.0] Restore real entryTime from DB — avoids cooldown reset on restart
+          const dbTrade = openDbTrades.find(t => t.symbol === pos.symbol && t.side === side);
+          const entryTime = dbTrade?.entryTime ?? new Date();
+          const restoredFrom = dbTrade ? `DB (${entryTime.toISOString()})` : "approximate (new Date)";
+
           // Try to get quantoMultiplier from cache/API
           const qm = await this.getCachedContractMultiplier(pos.symbol);
 
           this.positions.set(pos.symbol, {
             symbol: pos.symbol,
             side,
-            entryPrice,
+            entryPrice: dbTrade ? parseFloat(dbTrade.entryPrice ?? "0") || entryPrice : entryPrice,
             quantity: absSize,
-            entryTime: new Date(), // approximate — real entry time unknown after restart
+            entryTime,
             leverage,
             confidence: 50, // unknown for restored positions
             quantoMultiplier: qm,
           });
 
-          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm}`);
+          syncedCount++;
+          console.log(`[SYNC] Restored position: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x qm=${qm} entryTime=${restoredFrom}`);
         }
       }
+      console.log(`[SYNC] Sync complete: ${syncedCount} positions restored from exchange (${openDbTrades.length} DB trades available)`);
     } catch (error) {
       console.error("[SYNC] Error syncing positions from exchange:", this.errStr(error));
     }
@@ -425,17 +455,30 @@ export class TradingEngine {
         const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1000 * 60);
         const minHoldMinutes = this.getMinHoldMinutes();
 
-        if (holdTimeMinutes < minHoldMinutes) {
-          console.log(`[MONITOR] ${symbol}: skipping (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
-          continue;
-        }
-
+        // [FIX 7.0] CRITICAL: Always get market snapshot to check hard stop-loss,
+        // REGARDLESS of cooldown. Cooldown only blocks AI-based decisions.
         const snapshot = await this.getMarketSnapshot(symbol);
         if (!snapshot) continue;
 
         const pnlPercent = position.side === "BUY"
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
+
+        // [FIX 7.0] Hard stop-loss: always enforced, bypasses cooldown completely.
+        // Uses config.maxRiskPerTrade (default -3%) as the hard floor.
+        const hardStopLoss = -(this.config.maxRiskPerTrade ?? 3);
+        if (pnlPercent <= hardStopLoss) {
+          const reason = `[HARD_STOP] P&L ${pnlPercent.toFixed(2)}% <= stop-loss ${hardStopLoss}% — closing immediately (bypassing cooldown of ${minHoldMinutes}m)`;
+          await this.logEvent("RISK_STOP", symbol, reason);
+          await this.closePosition(symbol, snapshot.price, reason);
+          continue;
+        }
+
+        // Cooldown check: skip AI-based decisions for positions held less than minHoldMinutes
+        if (holdTimeMinutes < minHoldMinutes) {
+          console.log(`[MONITOR] ${symbol}: skipping AI (hold ${holdTimeMinutes.toFixed(0)}m < cooldown ${minHoldMinutes}m)`);
+          continue;
+        }
 
         const decision = await this.askAIForPositionManagement(position, snapshot, pnlPercent);
 
@@ -1086,12 +1129,24 @@ Responda APENAS com JSON:
   // Risk Management
   // --------------------------------------------------------------------------
 
+  // [FIX 7.0] CRITICAL: Use realized balance (account.total) NOT totalBalance which
+  // includes unrealizedPnL. With cross margin and many open positions, unrealizedPnL
+  // fluctuations were triggering false drawdown alerts, closing profitable positions.
+  // The drawdown check now uses the raw 'available' balance from the exchange account,
+  // which represents settled/realized funds only.
   private async isDrawdownExceeded(): Promise<boolean> {
     if (this.initialBalance <= 0) return false;
     try {
       const balance = await this.config.gateioClient.getBalance();
-      const currentBalance = parseFloat(balance.totalBalance);
-      const drawdown = ((this.initialBalance - currentBalance) / this.initialBalance) * 100;
+      // Use availableBalance (realized, settled funds) to avoid unrealizedPnL noise.
+      // Falls back to totalBalance if availableBalance is not available.
+      const realizedBalance = parseFloat(balance.availableBalance || balance.totalBalance);
+      const drawdown = ((this.initialBalance - realizedBalance) / this.initialBalance) * 100;
+      if (drawdown >= this.config.maxDrawdown * 0.8) {
+        // Log a warning when approaching 80% of the drawdown limit
+        await this.logEvent("RISK_WARN", "SYSTEM",
+          `Drawdown warning: ${drawdown.toFixed(2)}% (limit: ${this.config.maxDrawdown}%) | realized=$${realizedBalance.toFixed(2)} initial=$${this.initialBalance.toFixed(2)}`);
+      }
       return drawdown >= this.config.maxDrawdown;
     } catch { return false; }
   }
