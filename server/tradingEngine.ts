@@ -1170,9 +1170,13 @@ Responda APENAS com JSON:
     if (this.initialBalance <= 0) return false;
     try {
       const balance = await this.config.gateioClient.getBalance();
-      // Use availableBalance (realized, settled funds) to avoid unrealizedPnL noise.
-      // Falls back to totalBalance if availableBalance is not available.
-      const realizedBalance = parseFloat(balance.availableBalance || balance.totalBalance);
+      // [FIX 9.0] Use totalBalance (equity = settled + unrealizedPnL) for drawdown.
+      // availableBalance is $0 when all capital is in open positions (cross margin),
+      // which would falsely trigger 100% drawdown. totalBalance reflects real equity.
+      // We also add unrealizedPnL to get the true margin balance.
+      const total = parseFloat(balance.totalBalance);
+      const unrealized = parseFloat(balance.unrealizedPnl || "0");
+      const realizedBalance = total + unrealized; // true equity including open positions
       const drawdown = ((this.initialBalance - realizedBalance) / this.initialBalance) * 100;
       if (drawdown >= this.config.maxDrawdown * 0.8) {
         // Log a warning when approaching 80% of the drawdown limit
