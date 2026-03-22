@@ -91,11 +91,11 @@ async function autoRestartBot(): Promise<void> {
     });
 
     // Parse aggressiveness from description
-    const descParts = (config.description ?? "moderate|").split("|");
+    const descParts = (config.description ?? "aggressive|").split("|");
     const aggressiveness = (
       ["conservative", "moderate", "aggressive"].includes(descParts[0])
         ? descParts[0]
-        : "moderate"
+        : "aggressive"
     ) as "conservative" | "moderate" | "aggressive";
 
     // Create and start engine
@@ -124,6 +124,28 @@ async function startServer() {
   try {
     console.log("🔧 Initializing database...");
     await initializeDatabase();
+
+    // [FIX 10.0] Migrate all configs with 'moderate' fallback to 'aggressive'
+    try {
+      const db = getDatabase();
+      const allConfigs = await db.select().from(tradingConfigs);
+      for (const cfg of allConfigs) {
+        const parts = (cfg.description ?? "").split("|");
+        if (!['conservative','moderate','aggressive'].includes(parts[0])) {
+          // No aggressiveness prefix — add aggressive
+          const newDesc = `aggressive|${cfg.description ?? 'Estratégia AI Autônoma'}`;
+          await db.update(tradingConfigs).set({ description: newDesc }).where(eq(tradingConfigs.id, cfg.id));
+          console.log(`[MIGRATION] Config ${cfg.id}: set aggressiveness=aggressive`);
+        } else if (parts[0] === 'moderate') {
+          // Was moderate — upgrade to aggressive
+          parts[0] = 'aggressive';
+          await db.update(tradingConfigs).set({ description: parts.join('|') }).where(eq(tradingConfigs.id, cfg.id));
+          console.log(`[MIGRATION] Config ${cfg.id}: upgraded moderate → aggressive`);
+        }
+      }
+    } catch (migErr) {
+      console.warn('[MIGRATION] Could not migrate aggressiveness:', migErr);
+    }
 
     // TRPC middleware
     app.use(

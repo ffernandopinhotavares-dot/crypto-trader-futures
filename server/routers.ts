@@ -167,7 +167,7 @@ const tradingConfigRouter = router({
 
     return configs.map((c: any) => {
       const descParts = (c.description ?? "moderate|").split("|");
-      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "aggressive";
       const description = descParts.slice(1).join("|") || "Estratégia AI Autônoma";
 
       return {
@@ -201,7 +201,7 @@ const tradingConfigRouter = router({
 
       const c = configs[0];
       const descParts = (c.description ?? "moderate|").split("|");
-      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate";
+      const aggressiveness = ["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "aggressive";
 
       return {
         id: c.id,
@@ -311,7 +311,7 @@ const botControlRouter = router({
 
       // Parse aggressiveness from description
       const descParts = (config.description ?? "moderate|").split("|");
-      const aggressiveness = (["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "moderate") as "conservative" | "moderate" | "aggressive";
+      const aggressiveness = (["conservative", "moderate", "aggressive"].includes(descParts[0]) ? descParts[0] : "aggressive") as "conservative" | "moderate" | "aggressive";
 
       // Create and start AI trading engine
       const engine = new TradingEngine({
