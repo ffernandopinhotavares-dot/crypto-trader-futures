@@ -8,6 +8,7 @@ import { TradingEngine } from "../tradingEngine";
 import { bybitApiKeys, tradingConfigs, botStatus } from "../../drizzle/schema";
 import { eq, and } from "drizzle-orm";
 import path from "path";
+import { startSystemMonitor } from "../systemMonitor"; // [FIX 8.0] 15-min health monitor
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -153,6 +154,9 @@ async function startServer() {
     setTimeout(() => {
       autoRestartBot().catch((e) => console.error("Auto-restart error:", e));
     }, 3000);
+
+    // [FIX 8.0] Start 15-minute system health monitor
+    startSystemMonitor();
   } catch (error) {
     console.error("❌ Failed to start server:", error);
     process.exit(1);

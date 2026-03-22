@@ -26,6 +26,9 @@ export interface TradePosition {
   leverage: number;
   confidence: number; // 0-100 confidence at entry
   quantoMultiplier: number; // [FIX 5.1] cached at entry for correct PnL calculation
+  // [FIX 8.0] Trailing stop fields
+  highWaterMarkPct: number;   // highest pnlPercent seen since entry (for trailing stop)
+  trailingStopPct: number;    // current trailing stop level (pnlPercent floor)
 }
 
 export interface TradingEngineConfig {
@@ -33,7 +36,7 @@ export interface TradingEngineConfig {
   configId: string;
   gateioClient: GateioClient;
   // Autonomous config — no fixed pairs, no fixed SL/TP
-  maxRiskPerTrade: number;     // max % of balance per trade (default 5)
+  maxRiskPerTrade: number;     // max % of balance per trade (default 2.5) [FIX 8.0]
   maxDrawdown: number;         // max total drawdown % before stopping (default 10)
   maxOpenPositions: number;    // kept for compatibility but no longer enforced — capital is the only limit
   timeframe: string;           // analysis timeframe (default "15m")
@@ -229,6 +232,9 @@ export class TradingEngine {
             leverage,
             confidence: 50, // unknown for restored positions
             quantoMultiplier: qm,
+            // [FIX 8.0] Trailing stop — restored positions start with conservative defaults
+            highWaterMarkPct: 0,
+            trailingStopPct: -(this.config.maxRiskPerTrade ?? 2.5),
           });
 
           syncedCount++;
@@ -464,11 +470,28 @@ export class TradingEngine {
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
 
+        // [FIX 8.0] Update trailing stop high-water mark and trailing floor
+        // Logic: once position gains +2%, stop moves to breakeven (0%)
+        //        once position gains +4%, stop moves to +2% (locking in profit)
+        //        the trailing floor never moves down — only up
+        if (pnlPercent > position.highWaterMarkPct) {
+          position.highWaterMarkPct = pnlPercent;
+          if (pnlPercent >= 4.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 2.0);
+            console.log(`[TRAIL] ${symbol}: HWM=${pnlPercent.toFixed(2)}% → trailing stop raised to +2.0% (locking profit)`);
+          } else if (pnlPercent >= 2.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 0.0);
+            console.log(`[TRAIL] ${symbol}: HWM=${pnlPercent.toFixed(2)}% → trailing stop raised to breakeven (0%)`);
+          }
+        }
+
         // [FIX 7.0] Hard stop-loss: always enforced, bypasses cooldown completely.
-        // Uses config.maxRiskPerTrade (default -3%) as the hard floor.
-        const hardStopLoss = -(this.config.maxRiskPerTrade ?? 3);
+        // [FIX 8.0] Uses trailing stop floor (trailingStopPct) which starts at -maxRiskPerTrade
+        //           and rises as position gains, protecting profits.
+        const hardStopLoss = position.trailingStopPct;
         if (pnlPercent <= hardStopLoss) {
-          const reason = `[HARD_STOP] P&L ${pnlPercent.toFixed(2)}% <= stop-loss ${hardStopLoss}% — closing immediately (bypassing cooldown of ${minHoldMinutes}m)`;
+          const stopType = hardStopLoss >= 0 ? "[TRAIL_STOP]" : "[HARD_STOP]";
+          const reason = `${stopType} P&L ${pnlPercent.toFixed(2)}% <= stop ${hardStopLoss.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) — closing immediately`;
           await this.logEvent("RISK_STOP", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
           continue;
@@ -701,23 +724,29 @@ Indicadores atuais:
 
 REGRAS DE DECISÃO (siga rigorosamente):
 
-1. ZONA DE TOLERÂNCIA AO RUÍDO:
-   - Se |P&L| < 1.0%, a posição está na zona de ruído normal de mercado.
+1. ZONA DE TOLERÂNCIA AO RUÍDO: [FIX 8.0]
+   - Se |P&L| < 1.5%, a posição está na zona de ruído normal de mercado.
    - Na zona de ruído, SÓ feche se houver REVERSÃO CLARA de tendência (RSI inverteu + MACD cruzou contra a posição).
    - NÃO feche apenas porque o P&L é levemente negativo.
 
-2. POSIÇÃO LUCRATIVA (P&L > +1%):
+2. POSIÇÃO LUCRATIVA (P&L > +1.5%): [FIX 8.0]
    - HOLD se a tendência continua favorável (LONG + BULLISH, ou SHORT + BEARISH).
    - CLOSE apenas se houver sinais CLAROS de reversão: RSI extremo (>75 para LONG, <25 para SHORT) + MACD cruzando contra + BB position extrema.
+   - NUNCA feche posição lucrativa com P&L < +1.5% — deixe o trade se desenvolver.
 
-3. POSIÇÃO COM PREJUÍZO (P&L < -1%):
+3. POSIÇÃO COM PREJUÍZO (P&L < -1.5%): [FIX 8.0]
    - CLOSE se a tendência virou contra a posição (LONG + BEARISH, ou SHORT + BULLISH).
    - HOLD se a tendência ainda é favorável e o RSI sugere recuperação.
 
-4. STOP LOSS AUTOMÁTICO:
-   - CLOSE imediatamente se P&L < -3% (proteção de capital).
+4. STOP LOSS AUTOMÁTICO: [FIX 8.0]
+   - O sistema já aplica stop-loss automático em -2.5% (hard stop) — você NÃO precisa fechar por isso.
+   - Só feche por decisão de IA se houver reversão técnica clara.
 
 5. NUNCA use a "confiança na entrada" como razão para fechar. Foque APENAS nos indicadores ATUAIS.
+
+6. TRAILING STOP ATIVO: [FIX 8.0]
+   - Se P&L atingiu +2%, o sistema moveu o stop para breakeven — HOLD enquanto tendência for favorável.
+   - Se P&L atingiu +4%, o sistema travou +2% de lucro — HOLD para maximizar ganho.
 
 Decida: CLOSE ou HOLD?
 Responda APENAS com JSON:
@@ -964,6 +993,7 @@ Responda APENAS com JSON:
       });
 
       // [FIX 5.1] Record position in memory WITH quantoMultiplier
+      // [FIX 8.0] Initialize trailing stop fields
       this.positions.set(decision.symbol, {
         symbol: decision.symbol,
         side,
@@ -973,6 +1003,8 @@ Responda APENAS com JSON:
         leverage: decision.leverage,
         confidence: decision.confidence,
         quantoMultiplier, // [FIX 5.1] cached for correct PnL calculation
+        highWaterMarkPct: 0,   // [FIX 8.0] will be updated as position gains
+        trailingStopPct: -(this.config.maxRiskPerTrade ?? 2.5), // [FIX 8.0] starts at hard stop
       });
 
       // [FIX 5.1] Record trade in DB — store quantoMultiplier in stopLoss field (repurposed)
