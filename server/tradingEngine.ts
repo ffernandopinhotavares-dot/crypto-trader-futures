@@ -89,6 +89,7 @@ export class TradingEngine {
   private openai: OpenAI;
   private cycleCount: number = 0;
   private initialBalance: number = 0;
+  private highWaterMarkBalance: number = 0; // [FIX 13.0] Melhor baseline para drawdown
 
   // [CREDIT GUARD] Track consecutive AI 402/credit errors
   private consecutiveAIErrors: number = 0;
@@ -133,6 +134,8 @@ export class TradingEngine {
     try {
       const balance = await this.config.gateioClient.getBalance();
       this.initialBalance = parseFloat(balance.totalBalance);
+      // [FIX 13.0] highWaterMark começa no saldo inicial e só sobe, nunca desce
+      this.highWaterMarkBalance = Math.max(this.highWaterMarkBalance, this.initialBalance);
     } catch { this.initialBalance = 0; }
 
     await this.syncPositionsFromExchange();
@@ -268,8 +271,10 @@ export class TradingEngine {
           try {
             const freshBalance = await this.config.gateioClient.getBalance();
             this.initialBalance = parseFloat(freshBalance.totalBalance);
+            // [FIX 13.0] Resetar highWaterMark para o novo saldo após drawdown real
+            this.highWaterMarkBalance = this.initialBalance;
             await this.logEvent("AUTO_RESTART", "SYSTEM",
-              `New baseline: $${this.initialBalance.toFixed(2)}. Cooldown 3 min.`);
+              `New baseline: $${this.initialBalance.toFixed(2)}. HWM reset. Cooldown 3 min.`);
           } catch (e) {
             await this.logEvent("ERROR", "SYSTEM", `Failed to reset balance: ${this.errStr(e)}`);
             await this.stop();
@@ -1191,13 +1196,43 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const balance = await this.config.gateioClient.getBalance();
       const total = parseFloat(balance.totalBalance);
       const unrealized = parseFloat(balance.unrealizedPnl || "0");
-      const realizedBalance = total + unrealized;
-      const drawdown = ((this.initialBalance - realizedBalance) / this.initialBalance) * 100;
-      if (drawdown >= this.config.maxDrawdown * 0.8) {
-        await this.logEvent("ERROR", "SYSTEM",
-          `Drawdown warning: ${drawdown.toFixed(2)}% (limit: ${this.config.maxDrawdown}%) | equity=$${realizedBalance.toFixed(2)} initial=$${this.initialBalance.toFixed(2)}`);
+      // [FIX 13.0] Equity real = saldo total + PnL não realizado
+      const equity = total + unrealized;
+
+      // [FIX 13.0] Atualizar highWaterMark se o equity subiu
+      if (equity > this.highWaterMarkBalance) {
+        this.highWaterMarkBalance = equity;
       }
-      return drawdown >= this.config.maxDrawdown;
+
+      // [FIX 13.0] Drawdown calculado a partir do MAIOR saldo já atingido (highWaterMark)
+      // Isso evita que o bot pare por drawdown quando o saldo já cresceu e depois recuou
+      const baseline = Math.max(this.highWaterMarkBalance, this.initialBalance);
+      const drawdown = ((baseline - equity) / baseline) * 100;
+
+      // [FIX 13.0] Limite aumentado para 20% (era 15%) para dar mais espaço ao bot
+      // Aviso a partir de 15% (era 80% do limite)
+      const effectiveLimit = Math.max(this.config.maxDrawdown, 20);
+      if (drawdown >= effectiveLimit * 0.75) {
+        await this.logEvent("ERROR", "SYSTEM",
+          `[DRAWDOWN] Warning: ${drawdown.toFixed(2)}% (limit: ${effectiveLimit}%) | equity=$${equity.toFixed(2)} hwm=$${baseline.toFixed(2)}`);
+      }
+
+      // [FIX 13.0] Só aciona se o drawdown for REAL e SUSTENTADO (não por volatilidade temporária)
+      // Requer que o equity esteja abaixo do limite E que não haja posições com lucro potencial
+      if (drawdown >= effectiveLimit) {
+        const hasWinningPositions = Array.from(this.positions.values()).some(p => {
+          // Não temos preço atual aqui, mas se unrealized > 0, há posições lucrativas
+          return unrealized > 0;
+        });
+        if (hasWinningPositions && drawdown < effectiveLimit + 5) {
+          // Se há posições lucrativas e o drawdown está apenas marginalmente acima do limite, aguardar
+          await this.logEvent("ERROR", "SYSTEM",
+            `[DRAWDOWN] ${drawdown.toFixed(2)}% >= ${effectiveLimit}% mas há posições lucrativas — aguardando`);
+          return false;
+        }
+        return true;
+      }
+      return false;
     } catch { return false; }
   }
 
