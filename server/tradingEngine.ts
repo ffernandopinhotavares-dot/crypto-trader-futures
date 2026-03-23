@@ -106,8 +106,8 @@ export class TradingEngine {
   private static readonly AI_BATCH_SIZE = 50;
 
   // Capital management
-  private static readonly CAPITAL_RESERVE_PCT = 0.15; // 15% reserve (up from 10%)
-  private static readonly MIN_VOLUME_24H = 200_000; // $200k min volume (up from $50k)
+  private static readonly CAPITAL_RESERVE_PCT = 0.05; // 5% reserve (down from 15% to deploy more capital)
+  private static readonly MIN_VOLUME_24H = 500_000; // $500k min volume (up from $200k for better liquidity)
 
   // Win rate monitoring
   private static readonly WIN_RATE_ALERT_THRESHOLD = 40;
@@ -364,11 +364,12 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // MACRO GATE: If market sentiment is RISK_OFF, block LONGs but allow SHORTs
+      // MACRO GATE: OTIMIZADO PARA LUCRO - NUNCA BLOQUEIA TOTALMENTE, APENAS APLICA VIÉS
+      // Em RISK_OFF, a IA já recebe a instrução para priorizar SHORTs, não precisamos bloquear LONGs excepcionais
       const isRiskOff = this.macroContext?.marketSentiment === "RISK_OFF";
       if (isRiskOff) {
         await this.logEvent("INFO", "SYSTEM",
-          `[SCAN] RISK_OFF (BTC: ${this.macroContext!.btcTrend}, RSI: ${this.macroContext!.btcRsi.toFixed(1)}, 24h: ${this.macroContext!.btcChange24h.toFixed(2)}%) — LONGs bloqueados, SHORTs permitidos`);
+          `[SCAN] RISK_OFF (BTC: ${this.macroContext!.btcTrend}, RSI: ${this.macroContext!.btcRsi.toFixed(1)}, 24h: ${this.macroContext!.btcChange24h.toFixed(2)}%) — IA instruída a priorizar SHORTs`);
       }
 
       // STAGE 1: Fetch ALL tickers, filter by higher volume threshold
@@ -452,9 +453,9 @@ export class TradingEngine {
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue;
-        // MACRO GATE: block LONGs in RISK_OFF, allow SHORTs
-        if (isRiskOff && decision.action === "OPEN_LONG") {
-          await this.logEvent("INFO", decision.symbol, `[MACRO] LONG bloqueado em RISK_OFF`);
+        // MACRO GATE: Exigir mais confiança para LONGs em RISK_OFF
+        if (isRiskOff && decision.action === "OPEN_LONG" && decision.confidence < this.getMinConfidence() + 5) {
+          await this.logEvent("INFO", decision.symbol, `[MACRO] LONG rejeitado em RISK_OFF (confiança ${decision.confidence}% insuficiente)`);
           continue;
         }
 
@@ -495,18 +496,18 @@ export class TradingEngine {
     }
   }
 
-  // Confidence thresholds — RAISED for better quality trades
+  // Confidence thresholds — OTIMIZADO PARA MAIS TRADES
   private getMinConfidence(): number {
-    return this.config.aggressiveness === "conservative" ? 85
-      : this.config.aggressiveness === "moderate" ? 80
-      : 75;
+    return this.config.aggressiveness === "conservative" ? 80
+      : this.config.aggressiveness === "moderate" ? 75
+      : 70; // 70% permite mais oportunidades com alavancagem adaptativa
   }
 
-  // Leverage limits — LOWERED to reduce risk
+  // Leverage limits — OTIMIZADO PARA MAIOR LUCRO EM SINAIS FORTES
   private getMaxLeverage(): number {
-    return this.config.aggressiveness === "conservative" ? 3
-      : this.config.aggressiveness === "moderate" ? 4
-      : 5;
+    return this.config.aggressiveness === "conservative" ? 5
+      : this.config.aggressiveness === "moderate" ? 8
+      : 12; // Aumentado para maximizar retorno em trades de alta convicção
   }
 
   // --------------------------------------------------------------------------
@@ -526,19 +527,22 @@ export class TradingEngine {
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
 
-        // Update trailing stop high-water mark
-        // Logic: +1.5% → stop moves to breakeven (0%)
-        //        +3.0% → stop moves to +1.5% (locking profit)
-        //        +5.0% → stop moves to +3.0%
+        // Update trailing stop high-water mark (OTIMIZADO PARA LUCRO)
+        // Logic: +1.0% → stop moves to breakeven (+0.1% para cobrir taxas)
+        //        +2.0% → stop moves to +1.0% (garante lucro rápido)
+        //        +4.0% → stop moves to +2.5%
+        //        +8.0% → stop moves to +6.0%
         //        The floor never moves down
         if (pnlPercent > position.highWaterMarkPct) {
           position.highWaterMarkPct = pnlPercent;
-          if (pnlPercent >= 5.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 3.0);
-          } else if (pnlPercent >= 3.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 1.5);
-          } else if (pnlPercent >= 1.5) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 0.0);
+          if (pnlPercent >= 8.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 6.0);
+          } else if (pnlPercent >= 4.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 2.5);
+          } else if (pnlPercent >= 2.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 1.0);
+          } else if (pnlPercent >= 1.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 0.1); // Breakeven + taxas
           }
         }
 
@@ -553,7 +557,8 @@ export class TradingEngine {
         }
 
         // Max hold time protection — close positions held too long with small P&L
-        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.5) {
+        // OTIMIZADO: Fechar mais rápido se não for a lugar nenhum para girar o capital
+        if (holdTimeMinutes > 60 && Math.abs(pnlPercent) < 0.5) {
           const reason = `[TIME_STOP] Held ${holdTimeMinutes.toFixed(0)}m with only ${pnlPercent.toFixed(2)}% P&L — freeing capital`;
           await this.logEvent("INFO", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
@@ -666,11 +671,11 @@ export class TradingEngine {
 OBJETIVO: Identificar APENAS trades de ALTA PROBABILIDADE com confluência técnica clara. Prefira NÃO operar a operar mal.
 
 FILOSOFIA:
-- QUALIDADE > QUANTIDADE: Melhor 3 trades com 80%+ de confiança do que 10 trades com 70%.
+- MAXIMIZAR LUCRO: Identifique as tendências mais fortes. Se o mercado está volátil, capture os rompimentos.
 - CONFLUÊNCIA OBRIGATÓRIA: Mínimo 3 indicadores alinhados para abrir posição.
-- DIVERSIFICAÇÃO: Não concentre em um único setor (ex: não abra 5 memecoins ao mesmo tempo).
-- EVITE LOW-CAP: Prefira pares com volume 24h > $500k para melhor execução.
-- RESPEITE O MACRO: Se BTC está bearish, reduza exposição a longs em altcoins.
+- NÃO HESITE EM SHORTAR: Se o mercado está caindo, abra shorts agressivamente nas moedas mais fracas.
+- ALAVANCAGEM ADAPTATIVA: Use alavancagem máxima permitida apenas quando houver rompimento claro de resistência/suporte com alto volume.
+- RESPEITE O MACRO: Se BTC está bearish, priorize SHORTS. Se bullish, priorize LONGS.
 ${macroInfo}
 
 CRITÉRIOS DE ENTRADA (TODOS devem ser atendidos):
@@ -780,22 +785,22 @@ CONTEXTO MACRO: BTC ${this.macroContext?.btcTrend ?? "N/A"} | Sentimento: ${this
 
 REGRAS (siga rigorosamente):
 
-1. ZONA DE RUÍDO (|P&L| < 2%):
-   - NÃO feche por ruído. Só feche se houver REVERSÃO CLARA (RSI inverteu + MACD cruzou contra).
+1. ZONA DE RUÍDO (|P&L| < 1%):
+   - NÃO feche por ruído. Dê espaço para o trade respirar.
    
-2. POSIÇÃO LUCRATIVA (P&L > +2%):
-   - HOLD se tendência favorável. O trailing stop protege o lucro automaticamente.
-   - CLOSE apenas com sinais CLAROS de reversão: RSI extremo (>78 long, <22 short) + MACD contra.
+2. POSIÇÃO LUCRATIVA (P&L > +1.5%):
+   - HOLD absoluto se a tendência continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
+   - O trailing stop do sistema é agressivo e já protege os lucros. SÓ ordene CLOSE se houver um PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15) indicando exaustão imediata.
    
-3. POSIÇÃO COM PREJUÍZO (P&L < -1.5%):
-   - Se tendência CONTRA a posição + RSI desfavorável → CLOSE (cortar perdas cedo).
-   - Se tendência FAVORÁVEL e RSI sugere recuperação → HOLD.
+3. POSIÇÃO COM PREJUÍZO (P&L < -1.0%):
+   - CORTAR PERDAS RÁPIDO: Se a tendência virou contra a posição (MACD cruzou contra, preço cruzou EMA50 contra) → CLOSE imediatamente. Não espere o stop-loss bater.
+   - Se a estrutura ainda está intacta (apenas um pullback) → HOLD.
 
-4. O sistema já tem stop-loss automático em -${this.config.maxRiskPerTrade}% e trailing stop — você NÃO precisa fechar por stop.
+4. O sistema já tem stop-loss automático e trailing stop — você foca apenas em ler a estrutura de mercado.
 
-5. NUNCA feche posição lucrativa com P&L < +2% sem reversão técnica clara.
+5. MAXIMIZE GANHOS: Deixe os trades vencedores correrem o máximo possível.
 
-6. Se P&L > +1.5% e tendência favorável → HOLD para maximizar ganho.
+6. CORTE PERDAS: Seja impiedoso com trades que perderam a estrutura técnica.
 
 Decida: CLOSE ou HOLD?
 JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"leverage":0,"positionSizePercent":0,"reasoning":"..."}`;
@@ -983,8 +988,10 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // $10 per position (or less if capital is limited)
-      const baseValue = Math.min(deployable, 10);
+      // OTIMIZADO: Tamanho dinâmico baseado na confiança (10 a 20 USDT)
+      // Confiança 70% = $10 | 80% = $15 | 90%+ = $20
+      const targetSize = decision.confidence >= 90 ? 20 : (decision.confidence >= 80 ? 15 : 10);
+      const baseValue = Math.min(deployable, targetSize);
       const notionalValue = baseValue * decision.leverage;
 
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
@@ -1037,7 +1044,9 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        trailingStopPct: -(this.config.maxRiskPerTrade ?? 3),
+        // OTIMIZADO: Stop-loss inicial dinâmico (mais largo para menor alavancagem, mais justo para alta)
+        // Isso evita violinadas em moedas voláteis com baixa alavancagem
+        trailingStopPct: decision.leverage > 8 ? -2.5 : -3.5,
       });
 
       // Record trade in DB
