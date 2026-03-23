@@ -364,11 +364,11 @@ export class TradingEngine {
 
   private async scanAndTrade(): Promise<void> {
     try {
-      // MACRO GATE: If market sentiment is RISK_OFF, skip opening new positions
-      if (this.macroContext?.marketSentiment === "RISK_OFF") {
+      // MACRO GATE: If market sentiment is RISK_OFF, block LONGs but allow SHORTs
+      const isRiskOff = this.macroContext?.marketSentiment === "RISK_OFF";
+      if (isRiskOff) {
         await this.logEvent("INFO", "SYSTEM",
-          `[SCAN] Skipping new positions — RISK_OFF (BTC: ${this.macroContext.btcTrend}, RSI: ${this.macroContext.btcRsi.toFixed(1)}, 24h: ${this.macroContext.btcChange24h.toFixed(2)}%)`);
-        return;
+          `[SCAN] RISK_OFF (BTC: ${this.macroContext!.btcTrend}, RSI: ${this.macroContext!.btcRsi.toFixed(1)}, 24h: ${this.macroContext!.btcChange24h.toFixed(2)}%) — LONGs bloqueados, SHORTs permitidos`);
       }
 
       // STAGE 1: Fetch ALL tickers, filter by higher volume threshold
@@ -452,6 +452,11 @@ export class TradingEngine {
         if (decision.action === "SKIP" || decision.action === "HOLD") continue;
         if (decision.confidence < this.getMinConfidence()) continue;
         if (this.positions.has(decision.symbol)) continue;
+        // MACRO GATE: block LONGs in RISK_OFF, allow SHORTs
+        if (isRiskOff && decision.action === "OPEN_LONG") {
+          await this.logEvent("INFO", decision.symbol, `[MACRO] LONG bloqueado em RISK_OFF`);
+          continue;
+        }
 
         // Check capital availability with reserve
         const balance = await this.config.gateioClient.getBalance();
