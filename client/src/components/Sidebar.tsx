@@ -11,9 +11,10 @@ import {
   X,
   SlidersHorizontal,
   Radio,
+  Activity,
 } from "lucide-react";
 
-type Page = "dashboard" | "futures" | "monitor" | "configuration" | "trades" | "logs" | "corrections" | "admin" | "settings" | "api-setup";
+type Page = "dashboard" | "futures" | "monitor" | "configuration" | "trades" | "logs" | "log-analysis" | "corrections" | "admin" | "settings" | "api-setup";
 
 interface SidebarProps {
   currentPage: Page;
@@ -29,6 +30,7 @@ const menuItems = [
   { id: "configuration" as Page, label: "Configuração", icon: Settings },
   { id: "trades" as Page, label: "Trades", icon: List },
   { id: "logs" as Page, label: "Logs", icon: FileText },
+  { id: "log-analysis" as Page, label: "Análise Logs", icon: Activity },
   { id: "corrections" as Page, label: "Correções", icon: AlertTriangle },
   { id: "admin" as Page, label: "Admin", icon: ShieldCheck },
   { id: "settings" as Page, label: "Configurações", icon: SlidersHorizontal },

@@ -784,10 +784,183 @@ const maintenanceRouter = router({
   }),
 });
 
+/// ============================================================================
+// Log Analysis Router — Métricas, diagnóstico e ações de correção
+// ============================================================================
+const logAnalysisRouter = router({
+  /**
+   * Retorna métricas calculadas a partir dos trades e logs do banco:
+   * win rate, PnL, tendência, erros por tipo, heartbeat lag, etc.
+   */
+  getMetrics: protectedProcedure
+    .input(z.object({ lastHours: z.number().optional() }))
+    .query(async ({ input, ctx }) => {
+      const db = getDatabase();
+      const userId = ctx.user?.id || "local-owner";
+
+      // Filtro de tempo
+      const since = input.lastHours
+        ? new Date(Date.now() - input.lastHours * 3600 * 1000)
+        : null;
+
+      // Trades fechados
+      const allTrades = await db.select().from(trades)
+        .where(eq(trades.userId, userId))
+        .orderBy(desc(trades.createdAt));
+
+      const closed = allTrades.filter((t: any) => t.status === "CLOSED");
+      const open   = allTrades.filter((t: any) => t.status === "OPEN");
+      const closedFiltered = since
+        ? closed.filter((t: any) => t.updatedAt && new Date(t.updatedAt) >= since)
+        : closed;
+
+      const wins   = closedFiltered.filter((t: any) => parseFloat(t.pnl || "0") > 0);
+      const losses = closedFiltered.filter((t: any) => parseFloat(t.pnl || "0") <= 0);
+      const totalPnl = closedFiltered.reduce((s: number, t: any) => s + parseFloat(t.pnl || "0"), 0);
+      const winRate = closedFiltered.length > 0 ? (wins.length / closedFiltered.length) * 100 : 0;
+
+      // Tendência de PnL (últimos 10 vs anteriores 10)
+      const last10  = closed.slice(0, 10).reduce((s: number, t: any) => s + parseFloat(t.pnl || "0"), 0);
+      const prev10  = closed.slice(10, 20).reduce((s: number, t: any) => s + parseFloat(t.pnl || "0"), 0);
+      const pnlTrend = last10 > prev10 ? "melhorando" : last10 < prev10 ? "piorando" : "estável";
+
+      // Logs de erro
+      const allLogs = await db.select().from(tradingLogs)
+        .where(eq(tradingLogs.userId, userId))
+        .orderBy(desc(tradingLogs.createdAt))
+        .limit(500);
+
+      const logsFiltered = since
+        ? allLogs.filter((l: any) => l.createdAt && new Date(l.createdAt) >= since)
+        : allLogs;
+
+      const errorLogs  = logsFiltered.filter((l: any) => l.logType === "ERROR");
+      const errorsByType: Record<string, number> = {};
+      for (const l of errorLogs) {
+        const key = l.message?.split(":")[0]?.trim()?.substring(0, 40) || "ERROR";
+        errorsByType[key] = (errorsByType[key] || 0) + 1;
+      }
+
+      // Bot status / heartbeat
+      const statusRows = await db.select().from(botStatus)
+        .where(eq(botStatus.userId, userId)).limit(1);
+      const status = statusRows[0] || null;
+      const heartbeatLagMin = status?.lastHeartbeat
+        ? (Date.now() - new Date(status.lastHeartbeat).getTime()) / 60000
+        : null;
+
+      // Série temporal de PnL (últimos 50 trades fechados)
+      const pnlSeries = closed.slice(0, 50).reverse().map((t: any) => ({
+        time: t.exitTime || t.updatedAt,
+        pnl: parseFloat(t.pnl || "0"),
+        symbol: t.symbol,
+        side: t.side,
+      }));
+
+      // PnL acumulado
+      let cumPnl = 0;
+      const cumPnlSeries = pnlSeries.map((p: any) => {
+        cumPnl += p.pnl;
+        return { time: p.time, cumPnl };
+      });
+
+      // Distribuição por símbolo
+      const bySymbol: Record<string, { wins: number; losses: number; pnl: number }> = {};
+      for (const t of closedFiltered) {
+        const sym = (t as any).symbol;
+        if (!bySymbol[sym]) bySymbol[sym] = { wins: 0, losses: 0, pnl: 0 };
+        const p = parseFloat((t as any).pnl || "0");
+        if (p > 0) bySymbol[sym].wins++; else bySymbol[sym].losses++;
+        bySymbol[sym].pnl += p;
+      }
+
+      // Diagnóstico automático
+      const WINRATE_THRESHOLD = 40;
+      const BALANCE_MIN = 5;
+      const HEARTBEAT_MAX = 15;
+      const diagnoses: { severity: string; category: string; message: string; action: string }[] = [];
+
+      if (winRate < WINRATE_THRESHOLD) {
+        diagnoses.push({
+          severity: "ALERTA",
+          category: "Win Rate",
+          message: `Win Rate ${winRate.toFixed(1)}% abaixo do limiar ${WINRATE_THRESHOLD}%`,
+          action: "Recalcular estatísticas ou revisar configuração de trading",
+        });
+      } else {
+        diagnoses.push({ severity: "OK", category: "Win Rate", message: `Win Rate ${winRate.toFixed(1)}% dentro do esperado`, action: "" });
+      }
+
+      if (pnlTrend === "piorando") {
+        diagnoses.push({
+          severity: "ALERTA",
+          category: "PnL",
+          message: `PnL em tendência de piora (últimos 10 trades: ${last10.toFixed(4)} USDT)`,
+          action: "Corrigir PnL histórico ou revisar estratégia",
+        });
+      } else {
+        diagnoses.push({ severity: "OK", category: "PnL", message: `PnL tendência: ${pnlTrend}`, action: "" });
+      }
+
+      if (heartbeatLagMin !== null && heartbeatLagMin > HEARTBEAT_MAX) {
+        diagnoses.push({
+          severity: "CRÍTICO",
+          category: "Heartbeat",
+          message: `Heartbeat atrasado ${heartbeatLagMin.toFixed(1)} min (limite: ${HEARTBEAT_MAX} min)`,
+          action: "Verificar se o bot está em execução",
+        });
+      } else {
+        diagnoses.push({
+          severity: "OK",
+          category: "Heartbeat",
+          message: heartbeatLagMin !== null ? `Heartbeat ${heartbeatLagMin.toFixed(1)} min — normal` : "Heartbeat sem dados",
+          action: "",
+        });
+      }
+
+      if (errorLogs.length > 10) {
+        diagnoses.push({
+          severity: "AVISO",
+          category: "Erros",
+          message: `${errorLogs.length} erros encontrados no período`,
+          action: "Verificar logs de erro e corrigir se necessário",
+        });
+      } else {
+        diagnoses.push({ severity: "OK", category: "Erros", message: `${errorLogs.length} erros no período — normal`, action: "" });
+      }
+
+      return {
+        period: {
+          from: since ? since.toISOString() : null,
+          totalTrades: closedFiltered.length,
+          openTrades: open.length,
+        },
+        winRate,
+        wins: wins.length,
+        losses: losses.length,
+        totalPnl,
+        pnlTrend,
+        last10Pnl: last10,
+        heartbeatLagMin,
+        isRunning: status?.isRunning ?? false,
+        errorCount: errorLogs.length,
+        errorsByType,
+        pnlSeries,
+        cumPnlSeries,
+        bySymbol,
+        diagnoses,
+        recentErrors: errorLogs.slice(0, 20).map((l: any) => ({
+          time: l.createdAt,
+          message: l.message,
+          details: l.details,
+        })),
+      };
+    }),
+});
+
 // ============================================================================
 // Main Router
 // ============================================================================
-
 export const appRouter = router({
   gateioKeys: gateioKeysRouter,
   // Backward compatibility aliases
@@ -799,6 +972,7 @@ export const appRouter = router({
   trades: tradesRouter,
   logs: logsRouter,
   maintenance: maintenanceRouter,
+  logAnalysis: logAnalysisRouter,
 });
 
 export type AppRouter = typeof appRouter;

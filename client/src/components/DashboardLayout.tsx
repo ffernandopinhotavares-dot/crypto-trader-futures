@@ -9,9 +9,10 @@ import { SettingsPage } from "../pages/Settings";
 import { LogsPage } from "../pages/Logs";
 import { FuturesPage } from "../pages/Futures";
 import { MonitorPage } from "../pages/Monitor";
+import { LogAnalysisPage } from "../pages/LogAnalysis";
 import { RefreshCw, Power } from "lucide-react";
 
-type Page = "dashboard" | "futures" | "monitor" | "configuration" | "trades" | "logs" | "corrections" | "admin" | "settings" | "api-setup";
+type Page = "dashboard" | "futures" | "monitor" | "configuration" | "trades" | "logs" | "log-analysis" | "corrections" | "admin" | "settings" | "api-setup";
 
 function useCurrentTime() {
   const [time, setTime] = useState(() => new Date().toLocaleTimeString("pt-BR", { hour12: false }));
@@ -70,6 +71,7 @@ export function DashboardLayout() {
     configuration: "CryptoTrader",
     trades: "CryptoTrader",
     logs: "CryptoTrader",
+    "log-analysis": "CryptoTrader",
     corrections: "CryptoTrader",
     admin: "CryptoTrader",
     settings: "CryptoTrader",
@@ -186,6 +188,7 @@ export function DashboardLayout() {
           {currentPage === "configuration" && <ConfigurationPage />}
           {currentPage === "trades" && <TradesPage />}
           {currentPage === "logs" && <LogsPage />}
+          {currentPage === "log-analysis" && <LogAnalysisPage />}
           {currentPage === "corrections" && (
             <PlaceholderPage title="Correções" />
           )}
