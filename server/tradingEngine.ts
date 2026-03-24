@@ -107,8 +107,10 @@ export class TradingEngine {
   private static readonly AI_BATCH_SIZE = 50;
 
   // Capital management
-  private static readonly CAPITAL_RESERVE_PCT = 0.05; // 5% reserve (down from 15% to deploy more capital)
-  private static readonly MIN_VOLUME_24H = 500_000; // $500k min volume (up from $200k for better liquidity)
+  private static readonly CAPITAL_RESERVE_PCT = 0.25; // [FIX 17.0] 25% reserve — blindagem contra liquidação em cascata
+  // Análise: drawdown P95 de -$48.72 com 12 posições. Com 20% reserva ($37), o drawdown ultrapassa a margem.
+  // Com 25% ($46), há folga suficiente para absorver o pior cenário histórico sem liquidação.
+  private static readonly MIN_VOLUME_24H = 1_000_000; // [FIX 17.0] $1M min volume (up from $500k) — anti-slippage: evita NAORIS_USDT-style -$16 losses por falta de liquidez no order book
 
   // Win rate monitoring
   private static readonly WIN_RATE_ALERT_THRESHOLD = 40;
@@ -244,6 +246,28 @@ export class TradingEngine {
         console.error("[SYNC] Could not fetch open trades from DB:", this.errStr(dbErr));
       }
 
+      // [FIX 17.0] ORPHAN_CLEANUP: Fechar trades OPEN no DB que não existem mais na exchange
+      // Causa: posições liquidadas ou fechadas na Gate.io não eram detectadas, gerando 22 trades fantasmas
+      // com perda média de -$1.57/trade e total de -$34.59 (maior avg_loss do sistema)
+      const exchangeSymbols = new Set(exchangePositions.filter(p => Math.abs(parseFloat(p.size)) > 0).map(p => p.symbol));
+      let orphansClosed = 0;
+      for (const dbTrade of openDbTrades) {
+        if (!exchangeSymbols.has(dbTrade.symbol)) {
+          try {
+            const ticker = await this.config.gateioClient.getTicker(dbTrade.symbol).catch(() => null);
+            const exitPrice = ticker ? parseFloat(ticker.lastPrice) : parseFloat(dbTrade.entryPrice ?? "0");
+            await this.closePositionRecord(dbTrade.symbol, exitPrice, "ORPHAN_CLEANUP");
+            orphansClosed++;
+            await this.logEvent("INFO", dbTrade.symbol, `[FIX 17.0] ORPHAN_CLEANUP: trade OPEN no DB mas inexistente na exchange. Fechado @ ${exitPrice}`);
+          } catch (orphanErr) {
+            console.error(`[SYNC] ORPHAN_CLEANUP error for ${dbTrade.symbol}:`, this.errStr(orphanErr));
+          }
+        }
+      }
+      if (orphansClosed > 0) {
+        await this.logEvent("INFO", "SYSTEM", `[FIX 17.0] ORPHAN_CLEANUP: ${orphansClosed} trades órfãos fechados no DB`);
+      }
+
       let syncedCount = 0;
       for (const pos of exchangePositions) {
         const absSize = Math.abs(parseFloat(pos.size));
@@ -274,7 +298,7 @@ export class TradingEngine {
           console.log(`[SYNC] Restored: ${pos.symbol} ${side} qty=${absSize} entry=${entryPrice} lev=${leverage}x`);
         }
       }
-      console.log(`[SYNC] Complete: ${syncedCount} positions restored`);
+      console.log(`[SYNC] Complete: ${syncedCount} positions restored | ${orphansClosed} orphans cleaned`);
     } catch (error) {
       console.error("[SYNC] Error:", this.errStr(error));
     }
@@ -459,8 +483,11 @@ export class TradingEngine {
         if (s.volatility.volatility < 0.4) return false;
         // Minimum volume ratio — need decent liquidity
         if (s.volumeAnalysis.volumeRatio < 0.5) return false;
-        // [FIX 15.0] Remover o hard block RSI>85 que impedia SHORTs válidos em sobrecompra extrema
-        // Manter apenas o filtro de RSI<15 (oversold extremo não é candidato a SHORT)
+        // [FIX 17.0] HARD BLOCK: LONG com RSI >= 70 — dados de 418 trades mostram WR=34% e PnL=-$110.83
+        // 291 dos 418 trades (69%) foram abertos com RSI>=70, causando quase 100% das perdas totais
+        // SHORTs com RSI < 70 são PERMITIDOS (WR=48.8%, PnL=+$4.84 — rentáveis)
+        if (s.rsi >= 70 && s.trend === 'BULLISH') return false; // Bloqueia candidatos a LONG exaustos
+        // [FIX 15.0] Manter apenas o filtro de RSI<15 (oversold extremo não é candidato a SHORT)
         if (s.rsi < 15) return false;
         // Skip if 24h change is extreme (>15% or <-15%) — likely exhausted
         if (Math.abs(s.change24h) > 15) return false;
@@ -582,21 +609,27 @@ export class TradingEngine {
         //   The floor never moves down
         if (pnlPercent > position.highWaterMarkPct) {
           position.highWaterMarkPct = pnlPercent;
+          // [FIX 17.0] Trailing stop diferenciado por side:
+          // SELL (SHORT): breakeven em +2.0% (vs +1.5% para BUY) — dados mostram que shorts fecham cedo
+          // demais com medo de repiques. Avg win SHORT = $0.34 (75% dos wins < 1.0%). Dar mais espaço.
+          const isSell = position.side === "SELL";
+          const breakevenLevel = isSell ? 2.0 : 1.5;   // SHORT: +2.0% | LONG: +1.5%
+          const firstTargetIn = isSell ? 4.0 : 3.0;    // SHORT: +4.0% | LONG: +3.0%
+          const firstTargetOut = isSell ? 2.0 : 1.5;   // SHORT: stop → +2.0% | LONG: +1.5%
+          const secondTargetIn = isSell ? 5.5 : 4.5;   // SHORT: +5.5% | LONG: +4.5%
+          const secondTargetOut = isSell ? 3.5 : 3.0;  // SHORT: stop → +3.5% | LONG: +3.0%
           if (pnlPercent >= 12.0) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 9.0);
           } else if (pnlPercent >= 7.0) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 5.0);
-          } else if (pnlPercent >= 4.5) {
-            // [FIX 16.0] Garante R:R=1.5x para leverage<=8 (SL=-3.0% → TP alvo=+4.5%)
-            position.trailingStopPct = Math.max(position.trailingStopPct, 3.0);
-          } else if (pnlPercent >= 3.0) {
-            // [FIX 16.0] Garante R:R=1.5x para leverage>8 (SL=-2.0% → TP alvo=+3.0%)
-            position.trailingStopPct = Math.max(position.trailingStopPct, 1.5);
-          } else if (pnlPercent >= 1.5) {
-            // [FIX 16.0] Breakeven apenas — não corta lucro antes de atingir R:R mínimo
+          } else if (pnlPercent >= secondTargetIn) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, secondTargetOut);
+          } else if (pnlPercent >= firstTargetIn) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, firstTargetOut);
+          } else if (pnlPercent >= breakevenLevel) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 0.1); // Breakeven + taxas
           }
-          // Abaixo de +1.5%: não mover stop — deixar o HARD_STOP inicial atuar
+          // Abaixo do breakevenLevel: não mover stop — deixar o HARD_STOP inicial atuar
         }
 
         // Hard stop-loss / trailing stop — ALWAYS enforced, bypasses cooldown
@@ -620,8 +653,11 @@ export class TradingEngine {
           continue;
         }
 
-        // Cooldown: skip AI decisions for young positions
-        if (holdTimeMinutes < minHoldMinutes) {
+        // [FIX 17.0] Cooldown de Pânico: IA bloqueada de fechar posições antes de 60 minutos
+        // Dados: 26 trades fechados por AI_CLOSE nos primeiros 60min causaram -$15.05 (WR=0%)
+        // O HARD_STOP já protege o capital — a IA não precisa intervir antes de 60 minutos
+        const panicCooldownMinutes = 60;
+        if (holdTimeMinutes < Math.max(minHoldMinutes, panicCooldownMinutes)) {
           continue;
         }
 
@@ -714,7 +750,7 @@ export class TradingEngine {
 
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
-    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 10));
+    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 5)); // [FIX 17.0] $5/trade
 
     // Macro context for AI
     const macroInfo = this.macroContext
@@ -1068,9 +1104,10 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // OTIMIZADO: Tamanho dinâmico baseado na confiança (10 a 20 USDT)
-      // Confiança 70% = $10 | 80% = $15 | 90%+ = $20
-      const targetSize = decision.confidence >= 90 ? 20 : (decision.confidence >= 80 ? 15 : 10);
+      // [FIX 17.0] Tamanho fixo de $5 por trade (era $10-$20 dinâmico)
+      // Motivo: reduz impacto de qualquer trade individual de -$16 (pior caso) para no máximo -$8
+      // Permite o dobro de posições simultâneas com o mesmo capital, melhorando diversificação
+      const targetSize = 5.0; // $5 fixo — independente da confiança da IA
       const baseValue = Math.min(deployable, targetSize);
       const notionalValue = baseValue * decision.leverage;
 
