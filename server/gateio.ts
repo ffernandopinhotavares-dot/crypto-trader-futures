@@ -270,7 +270,7 @@ export class GateioClient {
    * Uses updateContractPositionLeverage which accepts marginMode parameter.
    * Called automatically when total balance exceeds ISOLATED_MARGIN_THRESHOLD ($200).
    */
-  async setMarginMode(symbol: string, marginMode: "cross" | "isolated", leverage: number = 10): Promise<void> {
+  async setMarginMode(symbol: string, marginMode: "cross" | "isolated", leverage: number = 5): Promise<void> { // FIX MAX_LEVERAGE: default 5x
     try {
       await this.futuresApi.updateContractPositionLeverage(
         this.settle as 'usdt' | 'btc',

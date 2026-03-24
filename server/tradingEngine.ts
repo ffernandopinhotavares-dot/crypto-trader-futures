@@ -217,7 +217,7 @@ export class TradingEngine {
         const absSize = Math.abs(parseFloat(pos.size));
         if (absSize > 0 && !this.positions.has(pos.symbol)) {
           const side: "BUY" | "SELL" = pos.side === "LONG" ? "BUY" : "SELL";
-          const leverage = parseFloat(pos.leverage) || 5;
+          const leverage = Math.min(parseFloat(pos.leverage) || 5, this.getMaxLeverage()); // FIX MAX_LEVERAGE: cap 5x no sync
           const entryPrice = parseFloat(pos.entryPrice) || 0;
 
           const dbTrade = openDbTrades.find(t => t.symbol === pos.symbol && t.side === side);
@@ -508,11 +508,9 @@ export class TradingEngine {
       : 70; // 70% permite mais oportunidades com alavancagem adaptativa
   }
 
-  // Leverage limits — OTIMIZADO PARA MAIOR LUCRO EM SINAIS FORTES
+  // Leverage limits — MAX 5x por configuração do usuário (FIX MAX_LEVERAGE)
   private getMaxLeverage(): number {
-    return this.config.aggressiveness === "conservative" ? 5
-      : this.config.aggressiveness === "moderate" ? 8
-      : 12; // Aumentado para maximizar retorno em trades de alta convicção
+    return 5; // Limite máximo fixo em 5x conforme configuração do usuário
   }
 
   // --------------------------------------------------------------------------
