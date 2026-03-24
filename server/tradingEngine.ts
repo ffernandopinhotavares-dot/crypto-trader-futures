@@ -120,14 +120,15 @@ export class TradingEngine {
   private static readonly ISOLATED_MARGIN_MODE = "isolated";
   private static readonly CROSS_MARGIN_MODE = "cross";
 
-  // [FIX 14.0] Symbol blacklist — pares com histórico de perdas consistentes
-  // Atualizado em 24/03/2026 com base em análise desde reinício do bot
+  // [FIX 17.0] Symbol blacklist — pares com histórico de perdas consistentes
+  // Atualizado em 24/03/2026 19:09 BRT — Learning Engine delta desde baseline 12:21 BRT
   private static readonly SYMBOL_BLACKLIST = new Set([
-    "RDNT_USDT",    // WR 0%, PnL total -$4.59
-    "FOLKS_USDT",   // PnL negativo, duração longa
+    // === BANIDOS ANTERIORES (FIX 14.0) ===
+    "RDNT_USDT",    // WR 0%, PnL total -$4.59 (histórico)
+    "FOLKS_USDT",   // PnL negativo, duração longa (histórico) | delta: -$1.06
     "HUMA_USDT",    // WR 0%, -$2.34 total
     "龙虾_USDT",    // WR 0%, -$1.27 total
-    "C_USDT",       // HARD_STOP com slippage extremo (-$2.88)
+    "C_USDT",       // HARD_STOP slippage extremo (-$2.88 histórico) | delta: -$2.875
     "NAORIS_USDT",  // PnL crítico -$15.46
     "DEGO_USDT",    // 25 trades, WR 40%, -$12.33
     "TURBO_USDT",   // Duração 376min, -$8.07
@@ -138,9 +139,17 @@ export class TradingEngine {
     "LYN_USDT",     // Perda consistente
     "SAHARA_USDT",  // Perda consistente
     "OP_USDT",      // Perda consistente
-    "FLOW_USDT",    // Perda consistente
+    "FLOW_USDT",    // Perda consistente (delta: -$0.46 em 1 trade)
     "ORDER_USDT",   // Perda consistente
     "MON_USDT",     // Perda consistente
+    // === NOVOS BANIDOS (FIX 17.0) — delta 24/03/2026 12:21→19:09 BRT ===
+    "FORTH_USDT",   // WR 50%, PnL delta -$1.158 (HARD_STOP -$1.458 em 1 trade)
+    "BTR_USDT",     // WR 0%, PnL delta -$0.9095
+    "AIA_USDT",     // WR 50%, PnL delta -$0.5644 (2 trades, avg -$0.28)
+    "PLAY_USDT",    // WR 0%, PnL delta -$0.456
+    "UAI_USDT",     // WR 0%, PnL delta -$0.33
+    "PHA_USDT",     // WR 0%, PnL delta -$0.307
+    "DEXE_USDT",    // WR 0%, PnL delta -$0.260
   ]);
 
   private get db() { return getDatabase(); }
@@ -601,10 +610,10 @@ export class TradingEngine {
         }
 
         // Max hold time protection — close positions held too long with small P&L
-        // [FIX 16.0] Aumentado de 60min para 120min: trades de 2-5h têm WR=50.9% e avg +$0.52
-        // Dados: 58 trades fechados em 30-60min tiveram WR=19.0% e avg -$0.62 (pior faixa)
-        // Deixar mais tempo: 70 trades de 1-2h tiveram WR=34.3% e avg -$0.26 (melhor que 30-60min)
-        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.5) {
+        // [FIX 17.0] Mantido 120min mas threshold P&L reduzido de 0.5% para 0.3%
+        // Motivo: TIME_STOP com WR=50% e avg -$0.016 — neutro, mas libera capital para trades melhores
+        // Trades de 1-2h com P&L < 0.3% estão estagnados — fechar e realocar
+        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.3) {
           const reason = `[TIME_STOP] Held ${holdTimeMinutes.toFixed(0)}m with only ${pnlPercent.toFixed(2)}% P&L — freeing capital`;
           await this.logEvent("INFO", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
@@ -756,12 +765,15 @@ FILTROS DE REJEIÇÃO (NÃO abra posição se):
   - RSI entre 45-55 SEM confirmação de MACD e tendência (zona neutra)
   - Mudança 24h > 10% (movimento já exausto)
 
-[FIX 15.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026 — atualizado):
+[FIX 17.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026 19:09 BRT — atualizado):
   - Ratio R:R mínimo 1.5x: só abra se o potencial de ganho for pelo menos 1.5x o risco
   - Prefira pares com tendência clara e volume acima da média (volume_ratio > 1.3)
   - EVITE pares com baixa liquidez ou movimentos erráticos recentes
   - Para SHORTs: RSI DEVE ser > 80 E BB position > 90. Análise de dados mostrou WR de apenas 28% com RSI 60-79.
   - Para SHORTs: NÃO use contexto bearish do BTC como justificativa única. Exija exaustão técnica do ativo.
+  - NOVOS ALVOS R:R (FIX 17.0): leverage>8 → alvo mínimo +2.25% (SL=-1.5%) | leverage<=8 → alvo mínimo +3.0% (SL=-2.0%)
+  - ATENÇÃO HORÁRIO: Análise de dados mostra WR=22-25% entre 13h-14h BRT. Nesse período, exija confluência EXTRA (4+ indicadores) ou prefira NÃO operar.
+  - Profit Factor atual: 0.186 (crítico). Priorize QUALIDADE sobre QUANTIDADE. Prefira 1 trade excelente a 3 trades mediocres.
 
 EXCHANGE: Gate.io Futures (USDT-M) — Símbolos: BTC_USDT, ETH_USDT
 
@@ -828,7 +840,7 @@ Responda APENAS com JSON array:
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
 - Tempo: ${holdTime.toFixed(0)} min
-- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo R:R 1.5x: ${position.leverage > 8 ? '+3.0%' : '+4.5%'}
+- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo R:R 1.5x: ${position.leverage > 8 ? '+2.25%' : '+3.0%'} [FIX 17.0]
 
 Indicadores:
 - RSI: ${snapshot.rsi.toFixed(1)}
@@ -849,19 +861,20 @@ REGRAS (siga rigorosamente):
    
 2. POSIÇÃO LUCRATIVA (P&L > +1.5%):
    - HOLD absoluto se a tendência continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
-   - [FIX 16.0] OBJETIVO R:R ≥1.5x: leverage>8 → alvo mínimo +3.0% | leverage<=8 → alvo mínimo +4.5%
+   - [FIX 17.0] OBJETIVO R:R ≥1.5x: leverage>8 → alvo mínimo +2.25% | leverage<=8 → alvo mínimo +3.0%
    - NÃO feche antes de atingir o alvo mínimo de R:R, a menos que haja PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15).
    - O trailing stop do sistema já protege os lucros após atingir o alvo. SUA MISSÃO: deixar o trade correr até o alvo.
    
-3. POSIÇÃO COM PREJUÍZO (P&L entre -1.0% e -4.0%):
-   - [FIX 15.0] NÃO feche posições SHORT com prejuízo entre -0.1% e -3.0% apenas porque a tendência parece contra.
-     Análise de dados: 11 de 34 perdedores foram fechados prematuramente pela IA nessa faixa, gerando perdas desnecessárias.
+3. POSIÇÃO COM PREJUÍZO (P&L entre -1.0% e -3.0%):
+   - [FIX 17.0] NÃO feche posições com prejuízo entre -0.1% e -2.0% apenas porque a tendência parece contra.
+     Análise de dados: categoria 'OTHER' gerou -$5.47 em 11 trades — fechamentos prematuros são a maior fonte de perda.
    - SÓ ordene CLOSE se DOIS dos seguintes ocorrerem simultaneamente:
      a) RSI caiu abaixo de 40 (ativo reverteu para oversold — SHORT perdeu tese)
      b) MACD cruzou de negativo para positivo (reversão confirmada)
      c) Preço rompeu EMA50 para CIMA com volume > 1.5x
    - Se apenas 1 sinal está presente → HOLD. Deixe o stop-loss automático do sistema atuar.
-   - Para P&L < -4.0% com estrutura claramente rompida → CLOSE permitido.
+   - Para P&L < -2.0% com estrutura claramente rompida (2+ sinais) → CLOSE permitido.
+   - NUNCA feche baseado apenas em 'sinto que vai cair mais' sem confirmação técnica.
 
 4. O sistema já tem stop-loss automático e trailing stop — você foca apenas em ler a estrutura de mercado.
 
@@ -1111,11 +1124,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // [FIX 16.0] Stop-loss inicial calibrado para R:R ≥1.5x
-        // leverage>8: SL=-2.0% → TP alvo=+3.0% (R:R=1.5x)
-        // leverage<=8: SL=-3.0% → TP alvo=+4.5% (R:R=1.5x)
-        // Trailing stop só ativa após atingir o alvo mínimo de R:R
-        trailingStopPct: decision.leverage > 8 ? -2.0 : -3.0,
+        // [FIX 17.0] Stop-loss inicial calibrado para R:R ≥1.5x
+        // Reduzido: leverage>8: SL=-1.5% → TP alvo=+2.25% (R:R=1.5x)
+        //           leverage<=8: SL=-2.0% → TP alvo=+3.0% (R:R=1.5x)
+        // Motivo: HARD_STOP avg -$2.17/trade com SL=-3.0%. Reduzindo exposição.
+        trailingStopPct: decision.leverage > 8 ? -1.5 : -2.0,
       });
 
       // Record trade in DB
