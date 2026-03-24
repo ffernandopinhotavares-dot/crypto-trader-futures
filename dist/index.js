@@ -1157,7 +1157,7 @@ var TradingEngine = class _TradingEngine {
       const filteredSnapshots = snapshots.filter((s) => {
         if (s.volatility.volatility < 0.4) return false;
         if (s.volumeAnalysis.volumeRatio < 0.5) return false;
-        if (s.rsi > 85 || s.rsi < 15) return false;
+        if (s.rsi < 15) return false;
         if (Math.abs(s.change24h) > 15) return false;
         return true;
       });
@@ -1246,13 +1246,15 @@ var TradingEngine = class _TradingEngine {
         const pnlPercent = position.side === "BUY" ? (snapshot.price - position.entryPrice) / position.entryPrice * 100 : (position.entryPrice - snapshot.price) / position.entryPrice * 100;
         if (pnlPercent > position.highWaterMarkPct) {
           position.highWaterMarkPct = pnlPercent;
-          if (pnlPercent >= 8) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 6);
-          } else if (pnlPercent >= 4) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 2.5);
-          } else if (pnlPercent >= 2) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 1);
-          } else if (pnlPercent >= 0.8) {
+          if (pnlPercent >= 12) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 9);
+          } else if (pnlPercent >= 7) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 5);
+          } else if (pnlPercent >= 4.5) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 3);
+          } else if (pnlPercent >= 3) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 1.5);
+          } else if (pnlPercent >= 1.5) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 0.1);
           }
         }
@@ -1264,7 +1266,7 @@ var TradingEngine = class _TradingEngine {
           await this.closePosition(symbol, snapshot.price, reason);
           continue;
         }
-        if (holdTimeMinutes > 60 && Math.abs(pnlPercent) < 0.5) {
+        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.5) {
           const reason = `[TIME_STOP] Held ${holdTimeMinutes.toFixed(0)}m with only ${pnlPercent.toFixed(2)}% P&L \u2014 freeing capital`;
           await this.logEvent("INFO", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
@@ -1379,14 +1381,20 @@ LONG requer pelo menos 3 de:
   6. Tend\xEAncia geral BULLISH
   7. Funding rate negativo (shorts pagando longs = press\xE3o de alta)
 
-SHORT requer pelo menos 3 de:
-  1. RSI > 60 (overbought) OU RSI entre 45-60 com tend\xEAncia de queda
-  2. MACD bearish (histogram negativo e decrescente)
-  3. Pre\xE7o abaixo da EMA50
-  4. BB position > 70 (perto da banda superior = sobrevalorizado)
-  5. Volume ratio > 1.2 (confirma\xE7\xE3o de volume)
-  6. Tend\xEAncia geral BEARISH
-  7. Funding rate positivo (longs pagando shorts = press\xE3o de queda)
+SHORT requer TODOS os 3 obrigat\xF3rios + pelo menos 1 adicional:
+  OBRIGAT\xD3RIOS (todos devem estar presentes):
+  1. RSI > 80 (sobrecomprado extremo) \u2014 N\xC3O abra SHORT com RSI < 80, mesmo que BTC esteja caindo
+  2. MACD bearish OU perdendo for\xE7a (histograma decrescente ou negativo)
+  3. BB position > 90 (pre\xE7o na Banda de Bollinger Superior \u2014 sobrevalorizado extremo)
+  ADICIONAIS (pelo menos 1):
+  4. Tend\xEAncia geral BEARISH ou SIDEWAYS (NUNCA SHORT em tend\xEAncia BULLISH forte)
+  5. Funding rate positivo (longs pagando shorts = press\xE3o de queda)
+  6. Volume ratio > 1.2 (confirma\xE7\xE3o de volume na queda)
+  7. Mudan\xE7a 24h > +5% (ativo sobrecomprado no dia \u2014 candidato a revers\xE3o)
+  PROIBI\xC7\xD5ES ABSOLUTAS PARA SHORT:
+  - NUNCA abra SHORT em ativo com alta relativa > +8% no dia (momentum forte)
+  - NUNCA abra SHORT com RSI < 70 baseando-se apenas no contexto bearish do BTC
+  - NUNCA abra SHORT em ativo com tend\xEAncia BULLISH confirmada (EMA50 subindo + MACD positivo)
 
 FILTROS DE REJEI\xC7\xC3O (N\xC3O abra posi\xE7\xE3o se):
   - Volatilidade > 8% (risco de whipsaw)
@@ -1394,11 +1402,12 @@ FILTROS DE REJEI\xC7\xC3O (N\xC3O abra posi\xE7\xE3o se):
   - RSI entre 45-55 SEM confirma\xE7\xE3o de MACD e tend\xEAncia (zona neutra)
   - Mudan\xE7a 24h > 10% (movimento j\xE1 exausto)
 
-[FIX 14.0] REGRAS CR\xCDTICAS BASEADAS EM DADOS (24/03/2026):
+[FIX 15.0] REGRAS CR\xCDTICAS BASEADAS EM DADOS (24/03/2026 \u2014 atualizado):
   - Ratio R:R m\xEDnimo 1.5x: s\xF3 abra se o potencial de ganho for pelo menos 1.5x o risco
   - Prefira pares com tend\xEAncia clara e volume acima da m\xE9dia (volume_ratio > 1.3)
   - EVITE pares com baixa liquidez ou movimentos err\xE1ticos recentes
-  - Para SHORTs: confirme que o par est\xE1 em tend\xEAncia de queda h\xE1 pelo menos 2 velas
+  - Para SHORTs: RSI DEVE ser > 80 E BB position > 90. An\xE1lise de dados mostrou WR de apenas 28% com RSI 60-79.
+  - Para SHORTs: N\xC3O use contexto bearish do BTC como justificativa \xFAnica. Exija exaust\xE3o t\xE9cnica do ativo.
 
 EXCHANGE: Gate.io Futures (USDT-M) \u2014 S\xEDmbolos: BTC_USDT, ETH_USDT
 
@@ -1458,7 +1467,7 @@ ${JSON.stringify(marketSummary, null, 2)}` }
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
 - Tempo: ${holdTime.toFixed(0)} min
-- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%)
+- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo R:R 1.5x: ${position.leverage > 8 ? "+3.0%" : "+4.5%"}
 
 Indicadores:
 - RSI: ${snapshot.rsi.toFixed(1)}
@@ -1479,11 +1488,19 @@ REGRAS (siga rigorosamente):
    
 2. POSI\xC7\xC3O LUCRATIVA (P&L > +1.5%):
    - HOLD absoluto se a tend\xEAncia continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
-   - O trailing stop do sistema \xE9 agressivo e j\xE1 protege os lucros. S\xD3 ordene CLOSE se houver um PICO CLIM\xC1TICO (volume explosivo + RSI > 85 ou < 15) indicando exaust\xE3o imediata.
+   - [FIX 16.0] OBJETIVO R:R \u22651.5x: leverage>8 \u2192 alvo m\xEDnimo +3.0% | leverage<=8 \u2192 alvo m\xEDnimo +4.5%
+   - N\xC3O feche antes de atingir o alvo m\xEDnimo de R:R, a menos que haja PICO CLIM\xC1TICO (volume explosivo + RSI > 85 ou < 15).
+   - O trailing stop do sistema j\xE1 protege os lucros ap\xF3s atingir o alvo. SUA MISS\xC3O: deixar o trade correr at\xE9 o alvo.
    
-3. POSI\xC7\xC3O COM PREJU\xCDZO (P&L < -1.0%):
-   - CORTAR PERDAS R\xC1PIDO: Se a tend\xEAncia virou contra a posi\xE7\xE3o (MACD cruzou contra, pre\xE7o cruzou EMA50 contra) \u2192 CLOSE imediatamente. N\xE3o espere o stop-loss bater.
-   - Se a estrutura ainda est\xE1 intacta (apenas um pullback) \u2192 HOLD.
+3. POSI\xC7\xC3O COM PREJU\xCDZO (P&L entre -1.0% e -4.0%):
+   - [FIX 15.0] N\xC3O feche posi\xE7\xF5es SHORT com preju\xEDzo entre -0.1% e -3.0% apenas porque a tend\xEAncia parece contra.
+     An\xE1lise de dados: 11 de 34 perdedores foram fechados prematuramente pela IA nessa faixa, gerando perdas desnecess\xE1rias.
+   - S\xD3 ordene CLOSE se DOIS dos seguintes ocorrerem simultaneamente:
+     a) RSI caiu abaixo de 40 (ativo reverteu para oversold \u2014 SHORT perdeu tese)
+     b) MACD cruzou de negativo para positivo (revers\xE3o confirmada)
+     c) Pre\xE7o rompeu EMA50 para CIMA com volume > 1.5x
+   - Se apenas 1 sinal est\xE1 presente \u2192 HOLD. Deixe o stop-loss autom\xE1tico do sistema atuar.
+   - Para P&L < -4.0% com estrutura claramente rompida \u2192 CLOSE permitido.
 
 4. O sistema j\xE1 tem stop-loss autom\xE1tico e trailing stop \u2014 voc\xEA foca apenas em ler a estrutura de mercado.
 
@@ -1497,7 +1514,7 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: [
-          { role: "system", content: "Voc\xEA \xE9 um gestor de risco quantitativo. Siga as REGRAS rigorosamente. Deixe os trades se desenvolverem. Na d\xFAvida, HOLD." },
+          { role: "system", content: "Voc\xEA \xE9 um gestor de risco quantitativo. Siga as REGRAS rigorosamente. [FIX 15.0] Para posi\xE7\xF5es SHORT com P&L entre -0.1% e -3.0%, a resposta padr\xE3o \xE9 HOLD. S\xF3 feche se 2+ sinais de revers\xE3o confirmados. Na d\xFAvida, HOLD." },
           { role: "user", content: prompt }
         ],
         temperature: 0.15,
@@ -1693,10 +1710,10 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // [FIX 14.0] Stop-loss inicial ajustado para reduzir slippage no HARD_STOP
-        // Observado: C_USDT saiu em -4.82% com stop configurado em -3.50% (slippage 1.32%)
-        // Novo: leverage>8 → -2.0% (era -2.5%), leverage<=8 → -3.0% (era -3.5%)
-        // Ratio R:R alvo: 1.5x (TP deve ser 1.5x o stop)
+        // [FIX 16.0] Stop-loss inicial calibrado para R:R ≥1.5x
+        // leverage>8: SL=-2.0% → TP alvo=+3.0% (R:R=1.5x)
+        // leverage<=8: SL=-3.0% → TP alvo=+4.5% (R:R=1.5x)
+        // Trailing stop só ativa após atingir o alvo mínimo de R:R
         trailingStopPct: decision.leverage > 8 ? -2 : -3
       });
       await this.db.insert(trades).values({
@@ -2469,6 +2486,26 @@ var maintenanceRouter = router({
    * Reset bot statistics (totalTrades, winningTrades, losingTrades, totalPnl)
    * by recalculating from actual trade records in the database.
    */
+  /**
+   * [FIX 15.0] Reset Win Rate Counter — Zera os contadores de WR no bot_status
+   * sem apagar trades históricos. Usado após correções de prompt para iniciar
+   * uma nova contagem limpa da meta de validação (WR >= 52% em 100+ trades).
+   */
+  resetWinRateCounter: protectedProcedure.mutation(async ({ ctx }) => {
+    const db2 = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+    await db2.update(botStatus).set({
+      totalTrades: 0,
+      winningTrades: 0,
+      losingTrades: 0,
+      totalPnl: "0"
+    }).where(eq2(botStatus.userId, userId));
+    return {
+      success: true,
+      message: "[FIX 15.0] Contadores de Win Rate zerados. Nova contagem iniciada para valida\xE7\xE3o da meta WR >= 52% em 100+ trades SHORT.",
+      resetAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }),
   recalculateStats: protectedProcedure.mutation(async ({ ctx }) => {
     const db2 = getDatabase();
     const userId = ctx.user?.id || "local-owner";
@@ -2836,6 +2873,8 @@ app.use((req, res, next) => {
   }
   next();
 });
+var SERVER_START_TIME = Date.now();
+var AUTO_RESTART_GRACE_MS = 9e4;
 async function autoRestartBot() {
   try {
     const db2 = getDatabase();
@@ -2850,6 +2889,14 @@ async function autoRestartBot() {
     if (!configId) {
       console.log("\u2139\uFE0F Bot has no configId, skipping auto-restart");
       return;
+    }
+    if (bot.stoppedAt) {
+      const stoppedMsAgo = Date.now() - new Date(bot.stoppedAt).getTime();
+      if (stoppedMsAgo < AUTO_RESTART_GRACE_MS) {
+        const waitMs = AUTO_RESTART_GRACE_MS - stoppedMsAgo;
+        console.log(`\u23F3 [FIX 15.0] Bot parado h\xE1 ${(stoppedMsAgo / 1e3).toFixed(0)}s \u2014 aguardando ${(waitMs / 1e3).toFixed(0)}s antes de reiniciar (grace period anti-cascata)`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
     }
     const keys = await db2.select().from(bybitApiKeys).where(eq4(bybitApiKeys.userId, userId)).limit(1);
     if (keys.length === 0) {
@@ -2927,7 +2974,7 @@ async function startServer() {
     });
     setTimeout(() => {
       autoRestartBot().catch((e) => console.error("Auto-restart error:", e));
-    }, 3e3);
+    }, 1e4);
     startSystemMonitor();
   } catch (error) {
     console.error("\u274C Failed to start server:", error);

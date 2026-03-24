@@ -558,26 +558,36 @@ export class TradingEngine {
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
 
-        // Update trailing stop high-water mark (OTIMIZADO PARA LUCRO)
-        // [FIX 14.0] HWM mínimo aumentado de 1.0% para 0.8% antes de ativar trailing
-        // Evita TRAIL_STOP prematuro observado em FORTH_USDT e BAT_USDT (24/03/2026)
-        // Logic: +0.8% → stop moves to breakeven (+0.1% para cobrir taxas)
-        //        +2.0% → stop moves to +1.0% (garante lucro rápido)
-        //        +4.0% → stop moves to +2.5%
-        //        +8.0% → stop moves to +6.0%
-        //        The floor never moves down
+        // Update trailing stop high-water mark (OTIMIZADO PARA R:R ≥ 1.5x)
+        // [FIX 16.0] Trailing stop redesenhado para garantir ratio R:R mínimo de 1.5x
+        // Diagnóstico 24/03/2026: avg_win=+$0.65 vs avg_loss=-$0.88 → R:R=0.74 (precisa ser ≥1.5)
+        // Causa raiz: trailing stop ativava muito cedo, cortando ganhos antes de atingir 1.5x o risco
+        // Hard stop: leverage>8 → -2.0%, leverage<=8 → -3.0%
+        // Para R:R=1.5x: leverage>8 → TP alvo = +3.0%, leverage<=8 → TP alvo = +4.5%
+        // Nova lógica:
+        //   +1.5% → breakeven (+0.1%) — só protege capital, não corta lucro ainda
+        //   +3.0% → stop move para +1.5% (garante R:R=1.5x para leverage>8)
+        //   +4.5% → stop move para +3.0% (garante R:R=1.5x para leverage<=8)
+        //   +7.0% → stop move para +5.0%
+        //   +12.0% → stop move para +9.0%
+        //   The floor never moves down
         if (pnlPercent > position.highWaterMarkPct) {
           position.highWaterMarkPct = pnlPercent;
-          if (pnlPercent >= 8.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 6.0);
-          } else if (pnlPercent >= 4.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 2.5);
-          } else if (pnlPercent >= 2.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 1.0);
-          } else if (pnlPercent >= 0.8) {
-            // [FIX 14.0] Antes era 1.0% — agora 0.8% para capturar mais lucro antes do breakeven
+          if (pnlPercent >= 12.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 9.0);
+          } else if (pnlPercent >= 7.0) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, 5.0);
+          } else if (pnlPercent >= 4.5) {
+            // [FIX 16.0] Garante R:R=1.5x para leverage<=8 (SL=-3.0% → TP alvo=+4.5%)
+            position.trailingStopPct = Math.max(position.trailingStopPct, 3.0);
+          } else if (pnlPercent >= 3.0) {
+            // [FIX 16.0] Garante R:R=1.5x para leverage>8 (SL=-2.0% → TP alvo=+3.0%)
+            position.trailingStopPct = Math.max(position.trailingStopPct, 1.5);
+          } else if (pnlPercent >= 1.5) {
+            // [FIX 16.0] Breakeven apenas — não corta lucro antes de atingir R:R mínimo
             position.trailingStopPct = Math.max(position.trailingStopPct, 0.1); // Breakeven + taxas
           }
+          // Abaixo de +1.5%: não mover stop — deixar o HARD_STOP inicial atuar
         }
 
         // Hard stop-loss / trailing stop — ALWAYS enforced, bypasses cooldown
@@ -591,8 +601,10 @@ export class TradingEngine {
         }
 
         // Max hold time protection — close positions held too long with small P&L
-        // OTIMIZADO: Fechar mais rápido se não for a lugar nenhum para girar o capital
-        if (holdTimeMinutes > 60 && Math.abs(pnlPercent) < 0.5) {
+        // [FIX 16.0] Aumentado de 60min para 120min: trades de 2-5h têm WR=50.9% e avg +$0.52
+        // Dados: 58 trades fechados em 30-60min tiveram WR=19.0% e avg -$0.62 (pior faixa)
+        // Deixar mais tempo: 70 trades de 1-2h tiveram WR=34.3% e avg -$0.26 (melhor que 30-60min)
+        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.5) {
           const reason = `[TIME_STOP] Held ${holdTimeMinutes.toFixed(0)}m with only ${pnlPercent.toFixed(2)}% P&L — freeing capital`;
           await this.logEvent("INFO", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
@@ -816,7 +828,7 @@ Responda APENAS com JSON array:
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
 - Tempo: ${holdTime.toFixed(0)} min
-- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%)
+- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo R:R 1.5x: ${position.leverage > 8 ? '+3.0%' : '+4.5%'}
 
 Indicadores:
 - RSI: ${snapshot.rsi.toFixed(1)}
@@ -837,7 +849,9 @@ REGRAS (siga rigorosamente):
    
 2. POSIÇÃO LUCRATIVA (P&L > +1.5%):
    - HOLD absoluto se a tendência continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
-   - O trailing stop do sistema é agressivo e já protege os lucros. SÓ ordene CLOSE se houver um PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15) indicando exaustão imediata.
+   - [FIX 16.0] OBJETIVO R:R ≥1.5x: leverage>8 → alvo mínimo +3.0% | leverage<=8 → alvo mínimo +4.5%
+   - NÃO feche antes de atingir o alvo mínimo de R:R, a menos que haja PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15).
+   - O trailing stop do sistema já protege os lucros após atingir o alvo. SUA MISSÃO: deixar o trade correr até o alvo.
    
 3. POSIÇÃO COM PREJUÍZO (P&L entre -1.0% e -4.0%):
    - [FIX 15.0] NÃO feche posições SHORT com prejuízo entre -0.1% e -3.0% apenas porque a tendência parece contra.
@@ -1097,10 +1111,10 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // [FIX 14.0] Stop-loss inicial ajustado para reduzir slippage no HARD_STOP
-        // Observado: C_USDT saiu em -4.82% com stop configurado em -3.50% (slippage 1.32%)
-        // Novo: leverage>8 → -2.0% (era -2.5%), leverage<=8 → -3.0% (era -3.5%)
-        // Ratio R:R alvo: 1.5x (TP deve ser 1.5x o stop)
+        // [FIX 16.0] Stop-loss inicial calibrado para R:R ≥1.5x
+        // leverage>8: SL=-2.0% → TP alvo=+3.0% (R:R=1.5x)
+        // leverage<=8: SL=-3.0% → TP alvo=+4.5% (R:R=1.5x)
+        // Trailing stop só ativa após atingir o alvo mínimo de R:R
         trailingStopPct: decision.leverage > 8 ? -2.0 : -3.0,
       });
 
