@@ -548,7 +548,7 @@ var GateioClient = class _GateioClient {
    * Uses updateContractPositionLeverage which accepts marginMode parameter.
    * Called automatically when total balance exceeds ISOLATED_MARGIN_THRESHOLD ($200).
    */
-  async setMarginMode(symbol, marginMode, leverage = 10) {
+  async setMarginMode(symbol, marginMode, leverage = 5) {
     try {
       await this.futuresApi.updateContractPositionLeverage(
         this.settle,
@@ -846,6 +846,46 @@ var TradingEngine = class _TradingEngine {
   static ISOLATED_MARGIN_THRESHOLD = 200;
   static ISOLATED_MARGIN_MODE = "isolated";
   static CROSS_MARGIN_MODE = "cross";
+  // [FIX 14.0] Symbol blacklist — pares com histórico de perdas consistentes
+  // Atualizado em 24/03/2026 com base em análise desde reinício do bot
+  static SYMBOL_BLACKLIST = /* @__PURE__ */ new Set([
+    "RDNT_USDT",
+    // WR 0%, PnL total -$4.59
+    "FOLKS_USDT",
+    // PnL negativo, duração longa
+    "HUMA_USDT",
+    // WR 0%, -$2.34 total
+    "\u9F99\u867E_USDT",
+    // WR 0%, -$1.27 total
+    "C_USDT",
+    // HARD_STOP com slippage extremo (-$2.88)
+    "NAORIS_USDT",
+    // PnL crítico -$15.46
+    "DEGO_USDT",
+    // 25 trades, WR 40%, -$12.33
+    "TURBO_USDT",
+    // Duração 376min, -$8.07
+    "CFG_USDT",
+    // Duração 599min (baixa liquidez), -$7.23
+    "POWER_USDT",
+    // PnL severo -$4.97
+    "DASH_USDT",
+    // WR 33%, -$4.04
+    "OPEN_USDT",
+    // WR 0%, -$3.78
+    "LYN_USDT",
+    // Perda consistente
+    "SAHARA_USDT",
+    // Perda consistente
+    "OP_USDT",
+    // Perda consistente
+    "FLOW_USDT",
+    // Perda consistente
+    "ORDER_USDT",
+    // Perda consistente
+    "MON_USDT"
+    // Perda consistente
+  ]);
   get db() {
     return getDatabase();
   }
@@ -936,7 +976,7 @@ var TradingEngine = class _TradingEngine {
         const absSize = Math.abs(parseFloat(pos.size));
         if (absSize > 0 && !this.positions.has(pos.symbol)) {
           const side = pos.side === "LONG" ? "BUY" : "SELL";
-          const leverage = parseFloat(pos.leverage) || 5;
+          const leverage = Math.min(parseFloat(pos.leverage) || 5, this.getMaxLeverage());
           const entryPrice = parseFloat(pos.entryPrice) || 0;
           const dbTrade = openDbTrades.find((t2) => t2.symbol === pos.symbol && t2.side === side);
           const entryTime = dbTrade?.entryTime ?? /* @__PURE__ */ new Date();
@@ -1077,11 +1117,15 @@ var TradingEngine = class _TradingEngine {
         );
       }
       const allTickers = await this.getCachedAllTickers();
-      const candidateTickers = allTickers.filter((t2) => !this.positions.has(t2.symbol));
+      const candidateTickers = allTickers.filter(
+        (t2) => !this.positions.has(t2.symbol) && !_TradingEngine.SYMBOL_BLACKLIST.has(t2.symbol)
+        // [FIX 14.0] Excluir pares da blacklist
+      );
+      const blacklistFiltered = allTickers.filter((t2) => _TradingEngine.SYMBOL_BLACKLIST.has(t2.symbol)).length;
       await this.logEvent(
         "INFO",
         "SYSTEM",
-        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$${(_TradingEngine.MIN_VOLUME_24H / 1e3).toFixed(0)}k) | ${candidateTickers.length} candidates`
+        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$${(_TradingEngine.MIN_VOLUME_24H / 1e3).toFixed(0)}k) | ${candidateTickers.length} candidates | ${blacklistFiltered} blacklisted`
       );
       if (candidateTickers.length === 0) return;
       const snapshots = [];
@@ -1185,9 +1229,9 @@ var TradingEngine = class _TradingEngine {
   getMinConfidence() {
     return this.config.aggressiveness === "conservative" ? 80 : this.config.aggressiveness === "moderate" ? 75 : 70;
   }
-  // Leverage limits — OTIMIZADO PARA MAIOR LUCRO EM SINAIS FORTES
+  // Leverage limits — MAX 5x por configuração do usuário (FIX MAX_LEVERAGE)
   getMaxLeverage() {
-    return this.config.aggressiveness === "conservative" ? 5 : this.config.aggressiveness === "moderate" ? 8 : 12;
+    return 5;
   }
   // --------------------------------------------------------------------------
   // Position Monitoring — Hard stops + Trailing + AI decisions
@@ -1208,7 +1252,7 @@ var TradingEngine = class _TradingEngine {
             position.trailingStopPct = Math.max(position.trailingStopPct, 2.5);
           } else if (pnlPercent >= 2) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 1);
-          } else if (pnlPercent >= 1) {
+          } else if (pnlPercent >= 0.8) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 0.1);
           }
         }
@@ -1349,6 +1393,12 @@ FILTROS DE REJEI\xC7\xC3O (N\xC3O abra posi\xE7\xE3o se):
   - Volume ratio < 0.5 (sem liquidez)
   - RSI entre 45-55 SEM confirma\xE7\xE3o de MACD e tend\xEAncia (zona neutra)
   - Mudan\xE7a 24h > 10% (movimento j\xE1 exausto)
+
+[FIX 14.0] REGRAS CR\xCDTICAS BASEADAS EM DADOS (24/03/2026):
+  - Ratio R:R m\xEDnimo 1.5x: s\xF3 abra se o potencial de ganho for pelo menos 1.5x o risco
+  - Prefira pares com tend\xEAncia clara e volume acima da m\xE9dia (volume_ratio > 1.3)
+  - EVITE pares com baixa liquidez ou movimentos err\xE1ticos recentes
+  - Para SHORTs: confirme que o par est\xE1 em tend\xEAncia de queda h\xE1 pelo menos 2 velas
 
 EXCHANGE: Gate.io Futures (USDT-M) \u2014 S\xEDmbolos: BTC_USDT, ETH_USDT
 
@@ -1643,9 +1693,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // OTIMIZADO: Stop-loss inicial dinâmico (mais largo para menor alavancagem, mais justo para alta)
-        // Isso evita violinadas em moedas voláteis com baixa alavancagem
-        trailingStopPct: decision.leverage > 8 ? -2.5 : -3.5
+        // [FIX 14.0] Stop-loss inicial ajustado para reduzir slippage no HARD_STOP
+        // Observado: C_USDT saiu em -4.82% com stop configurado em -3.50% (slippage 1.32%)
+        // Novo: leverage>8 → -2.0% (era -2.5%), leverage<=8 → -3.0% (era -3.5%)
+        // Ratio R:R alvo: 1.5x (TP deve ser 1.5x o stop)
+        trailingStopPct: decision.leverage > 8 ? -2 : -3
       });
       await this.db.insert(trades).values({
         id: nanoid(),

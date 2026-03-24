@@ -120,6 +120,29 @@ export class TradingEngine {
   private static readonly ISOLATED_MARGIN_MODE = "isolated";
   private static readonly CROSS_MARGIN_MODE = "cross";
 
+  // [FIX 14.0] Symbol blacklist — pares com histórico de perdas consistentes
+  // Atualizado em 24/03/2026 com base em análise desde reinício do bot
+  private static readonly SYMBOL_BLACKLIST = new Set([
+    "RDNT_USDT",    // WR 0%, PnL total -$4.59
+    "FOLKS_USDT",   // PnL negativo, duração longa
+    "HUMA_USDT",    // WR 0%, -$2.34 total
+    "龙虾_USDT",    // WR 0%, -$1.27 total
+    "C_USDT",       // HARD_STOP com slippage extremo (-$2.88)
+    "NAORIS_USDT",  // PnL crítico -$15.46
+    "DEGO_USDT",    // 25 trades, WR 40%, -$12.33
+    "TURBO_USDT",   // Duração 376min, -$8.07
+    "CFG_USDT",     // Duração 599min (baixa liquidez), -$7.23
+    "POWER_USDT",   // PnL severo -$4.97
+    "DASH_USDT",    // WR 33%, -$4.04
+    "OPEN_USDT",    // WR 0%, -$3.78
+    "LYN_USDT",     // Perda consistente
+    "SAHARA_USDT",  // Perda consistente
+    "OP_USDT",      // Perda consistente
+    "FLOW_USDT",    // Perda consistente
+    "ORDER_USDT",   // Perda consistente
+    "MON_USDT",     // Perda consistente
+  ]);
+
   private get db() { return getDatabase(); }
 
   constructor(config: TradingEngineConfig) {
@@ -379,9 +402,13 @@ export class TradingEngine {
 
       // STAGE 1: Fetch ALL tickers, filter by higher volume threshold
       const allTickers = await this.getCachedAllTickers();
-      const candidateTickers = allTickers.filter(t => !this.positions.has(t.symbol));
+      const candidateTickers = allTickers.filter(t =>
+        !this.positions.has(t.symbol) &&
+        !TradingEngine.SYMBOL_BLACKLIST.has(t.symbol)  // [FIX 14.0] Excluir pares da blacklist
+      );
+      const blacklistFiltered = allTickers.filter(t => TradingEngine.SYMBOL_BLACKLIST.has(t.symbol)).length;
       await this.logEvent("INFO", "SYSTEM",
-        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$${(TradingEngine.MIN_VOLUME_24H/1000).toFixed(0)}k) | ${candidateTickers.length} candidates`);
+        `[SCAN] Stage 1: ${allTickers.length} tickers (vol>$${(TradingEngine.MIN_VOLUME_24H/1000).toFixed(0)}k) | ${candidateTickers.length} candidates | ${blacklistFiltered} blacklisted`);
 
       if (candidateTickers.length === 0) return;
 
@@ -531,7 +558,9 @@ export class TradingEngine {
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
 
         // Update trailing stop high-water mark (OTIMIZADO PARA LUCRO)
-        // Logic: +1.0% → stop moves to breakeven (+0.1% para cobrir taxas)
+        // [FIX 14.0] HWM mínimo aumentado de 1.0% para 0.8% antes de ativar trailing
+        // Evita TRAIL_STOP prematuro observado em FORTH_USDT e BAT_USDT (24/03/2026)
+        // Logic: +0.8% → stop moves to breakeven (+0.1% para cobrir taxas)
         //        +2.0% → stop moves to +1.0% (garante lucro rápido)
         //        +4.0% → stop moves to +2.5%
         //        +8.0% → stop moves to +6.0%
@@ -544,7 +573,8 @@ export class TradingEngine {
             position.trailingStopPct = Math.max(position.trailingStopPct, 2.5);
           } else if (pnlPercent >= 2.0) {
             position.trailingStopPct = Math.max(position.trailingStopPct, 1.0);
-          } else if (pnlPercent >= 1.0) {
+          } else if (pnlPercent >= 0.8) {
+            // [FIX 14.0] Antes era 1.0% — agora 0.8% para capturar mais lucro antes do breakeven
             position.trailingStopPct = Math.max(position.trailingStopPct, 0.1); // Breakeven + taxas
           }
         }
@@ -706,6 +736,12 @@ FILTROS DE REJEIÇÃO (NÃO abra posição se):
   - Volume ratio < 0.5 (sem liquidez)
   - RSI entre 45-55 SEM confirmação de MACD e tendência (zona neutra)
   - Mudança 24h > 10% (movimento já exausto)
+
+[FIX 14.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026):
+  - Ratio R:R mínimo 1.5x: só abra se o potencial de ganho for pelo menos 1.5x o risco
+  - Prefira pares com tendência clara e volume acima da média (volume_ratio > 1.3)
+  - EVITE pares com baixa liquidez ou movimentos erráticos recentes
+  - Para SHORTs: confirme que o par está em tendência de queda há pelo menos 2 velas
 
 EXCHANGE: Gate.io Futures (USDT-M) — Símbolos: BTC_USDT, ETH_USDT
 
@@ -1047,9 +1083,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // OTIMIZADO: Stop-loss inicial dinâmico (mais largo para menor alavancagem, mais justo para alta)
-        // Isso evita violinadas em moedas voláteis com baixa alavancagem
-        trailingStopPct: decision.leverage > 8 ? -2.5 : -3.5,
+        // [FIX 14.0] Stop-loss inicial ajustado para reduzir slippage no HARD_STOP
+        // Observado: C_USDT saiu em -4.82% com stop configurado em -3.50% (slippage 1.32%)
+        // Novo: leverage>8 → -2.0% (era -2.5%), leverage<=8 → -3.0% (era -3.5%)
+        // Ratio R:R alvo: 1.5x (TP deve ser 1.5x o stop)
+        trailingStopPct: decision.leverage > 8 ? -2.0 : -3.0,
       });
 
       // Record trade in DB
