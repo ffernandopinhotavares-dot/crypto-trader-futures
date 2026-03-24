@@ -755,6 +755,29 @@ const maintenanceRouter = router({
    * Reset bot statistics (totalTrades, winningTrades, losingTrades, totalPnl)
    * by recalculating from actual trade records in the database.
    */
+  /**
+   * [FIX 15.0] Reset Win Rate Counter — Zera os contadores de WR no bot_status
+   * sem apagar trades históricos. Usado após correções de prompt para iniciar
+   * uma nova contagem limpa da meta de validação (WR >= 52% em 100+ trades).
+   */
+  resetWinRateCounter: protectedProcedure.mutation(async ({ ctx }) => {
+    const db = getDatabase();
+    const userId = ctx.user?.id || "local-owner";
+
+    await db.update(botStatus).set({
+      totalTrades: 0,
+      winningTrades: 0,
+      losingTrades: 0,
+      totalPnl: "0",
+    }).where(eq(botStatus.userId, userId));
+
+    return {
+      success: true,
+      message: "[FIX 15.0] Contadores de Win Rate zerados. Nova contagem iniciada para validação da meta WR >= 52% em 100+ trades SHORT.",
+      resetAt: new Date().toISOString(),
+    };
+  }),
+
   recalculateStats: protectedProcedure.mutation(async ({ ctx }) => {
     const db = getDatabase();
     const userId = ctx.user?.id || "local-owner";

@@ -450,8 +450,9 @@ export class TradingEngine {
         if (s.volatility.volatility < 0.4) return false;
         // Minimum volume ratio — need decent liquidity
         if (s.volumeAnalysis.volumeRatio < 0.5) return false;
-        // Skip extreme RSI (>85 or <15) — likely to reverse
-        if (s.rsi > 85 || s.rsi < 15) return false;
+        // [FIX 15.0] Remover o hard block RSI>85 que impedia SHORTs válidos em sobrecompra extrema
+        // Manter apenas o filtro de RSI<15 (oversold extremo não é candidato a SHORT)
+        if (s.rsi < 15) return false;
         // Skip if 24h change is extreme (>15% or <-15%) — likely exhausted
         if (Math.abs(s.change24h) > 15) return false;
         return true;
@@ -722,14 +723,20 @@ LONG requer pelo menos 3 de:
   6. Tendência geral BULLISH
   7. Funding rate negativo (shorts pagando longs = pressão de alta)
 
-SHORT requer pelo menos 3 de:
-  1. RSI > 60 (overbought) OU RSI entre 45-60 com tendência de queda
-  2. MACD bearish (histogram negativo e decrescente)
-  3. Preço abaixo da EMA50
-  4. BB position > 70 (perto da banda superior = sobrevalorizado)
-  5. Volume ratio > 1.2 (confirmação de volume)
-  6. Tendência geral BEARISH
-  7. Funding rate positivo (longs pagando shorts = pressão de queda)
+SHORT requer TODOS os 3 obrigatórios + pelo menos 1 adicional:
+  OBRIGATÓRIOS (todos devem estar presentes):
+  1. RSI > 80 (sobrecomprado extremo) — NÃO abra SHORT com RSI < 80, mesmo que BTC esteja caindo
+  2. MACD bearish OU perdendo força (histograma decrescente ou negativo)
+  3. BB position > 90 (preço na Banda de Bollinger Superior — sobrevalorizado extremo)
+  ADICIONAIS (pelo menos 1):
+  4. Tendência geral BEARISH ou SIDEWAYS (NUNCA SHORT em tendência BULLISH forte)
+  5. Funding rate positivo (longs pagando shorts = pressão de queda)
+  6. Volume ratio > 1.2 (confirmação de volume na queda)
+  7. Mudança 24h > +5% (ativo sobrecomprado no dia — candidato a reversão)
+  PROIBIÇÕES ABSOLUTAS PARA SHORT:
+  - NUNCA abra SHORT em ativo com alta relativa > +8% no dia (momentum forte)
+  - NUNCA abra SHORT com RSI < 70 baseando-se apenas no contexto bearish do BTC
+  - NUNCA abra SHORT em ativo com tendência BULLISH confirmada (EMA50 subindo + MACD positivo)
 
 FILTROS DE REJEIÇÃO (NÃO abra posição se):
   - Volatilidade > 8% (risco de whipsaw)
@@ -737,11 +744,12 @@ FILTROS DE REJEIÇÃO (NÃO abra posição se):
   - RSI entre 45-55 SEM confirmação de MACD e tendência (zona neutra)
   - Mudança 24h > 10% (movimento já exausto)
 
-[FIX 14.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026):
+[FIX 15.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026 — atualizado):
   - Ratio R:R mínimo 1.5x: só abra se o potencial de ganho for pelo menos 1.5x o risco
   - Prefira pares com tendência clara e volume acima da média (volume_ratio > 1.3)
   - EVITE pares com baixa liquidez ou movimentos erráticos recentes
-  - Para SHORTs: confirme que o par está em tendência de queda há pelo menos 2 velas
+  - Para SHORTs: RSI DEVE ser > 80 E BB position > 90. Análise de dados mostrou WR de apenas 28% com RSI 60-79.
+  - Para SHORTs: NÃO use contexto bearish do BTC como justificativa única. Exija exaustão técnica do ativo.
 
 EXCHANGE: Gate.io Futures (USDT-M) — Símbolos: BTC_USDT, ETH_USDT
 
@@ -831,9 +839,15 @@ REGRAS (siga rigorosamente):
    - HOLD absoluto se a tendência continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
    - O trailing stop do sistema é agressivo e já protege os lucros. SÓ ordene CLOSE se houver um PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15) indicando exaustão imediata.
    
-3. POSIÇÃO COM PREJUÍZO (P&L < -1.0%):
-   - CORTAR PERDAS RÁPIDO: Se a tendência virou contra a posição (MACD cruzou contra, preço cruzou EMA50 contra) → CLOSE imediatamente. Não espere o stop-loss bater.
-   - Se a estrutura ainda está intacta (apenas um pullback) → HOLD.
+3. POSIÇÃO COM PREJUÍZO (P&L entre -1.0% e -4.0%):
+   - [FIX 15.0] NÃO feche posições SHORT com prejuízo entre -0.1% e -3.0% apenas porque a tendência parece contra.
+     Análise de dados: 11 de 34 perdedores foram fechados prematuramente pela IA nessa faixa, gerando perdas desnecessárias.
+   - SÓ ordene CLOSE se DOIS dos seguintes ocorrerem simultaneamente:
+     a) RSI caiu abaixo de 40 (ativo reverteu para oversold — SHORT perdeu tese)
+     b) MACD cruzou de negativo para positivo (reversão confirmada)
+     c) Preço rompeu EMA50 para CIMA com volume > 1.5x
+   - Se apenas 1 sinal está presente → HOLD. Deixe o stop-loss automático do sistema atuar.
+   - Para P&L < -4.0% com estrutura claramente rompida → CLOSE permitido.
 
 4. O sistema já tem stop-loss automático e trailing stop — você foca apenas em ler a estrutura de mercado.
 
@@ -848,7 +862,7 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const response = await this.openai.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: [
-          { role: "system", content: "Você é um gestor de risco quantitativo. Siga as REGRAS rigorosamente. Deixe os trades se desenvolverem. Na dúvida, HOLD." },
+          { role: "system", content: "Você é um gestor de risco quantitativo. Siga as REGRAS rigorosamente. [FIX 15.0] Para posições SHORT com P&L entre -0.1% e -3.0%, a resposta padrão é HOLD. Só feche se 2+ sinais de reversão confirmados. Na dúvida, HOLD." },
           { role: "user", content: prompt },
         ],
         temperature: 0.15,

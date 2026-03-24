@@ -31,7 +31,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auto-restart bot if it was running before server restart
+// [FIX 15.0] Grace period para evitar reinicializações em cascata no Fly.io
+// O problema: cada restart do container chamava autoRestartBot() → stop() (BOT_STOPPED em todas posições)
+// → start() imediatamente, gerando 13+ BOT_START/STOP em 24h e destruindo o Win Rate.
+// Solução: verificar se o bot foi parado há menos de 90 segundos (restart de container)
+// e aguardar estabilização antes de reiniciar.
+const SERVER_START_TIME = Date.now();
+const AUTO_RESTART_GRACE_MS = 90_000; // 90s — tempo para o container estabilizar
+
 async function autoRestartBot(): Promise<void> {
   try {
     const db = getDatabase();
@@ -55,6 +62,17 @@ async function autoRestartBot(): Promise<void> {
     if (!configId) {
       console.log("ℹ️ Bot has no configId, skipping auto-restart");
       return;
+    }
+
+    // [FIX 15.0] Verificar se o bot foi parado recentemente (indica restart de container)
+    // Se stoppedAt for recente (< 90s), aguardar antes de reiniciar para evitar cascata
+    if (bot.stoppedAt) {
+      const stoppedMsAgo = Date.now() - new Date(bot.stoppedAt).getTime();
+      if (stoppedMsAgo < AUTO_RESTART_GRACE_MS) {
+        const waitMs = AUTO_RESTART_GRACE_MS - stoppedMsAgo;
+        console.log(`⏳ [FIX 15.0] Bot parado há ${(stoppedMsAgo/1000).toFixed(0)}s — aguardando ${(waitMs/1000).toFixed(0)}s antes de reiniciar (grace period anti-cascata)`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
     }
 
     // Get API keys
@@ -172,10 +190,11 @@ async function startServer() {
       console.log(`✅ Server running on http://0.0.0.0:${PORT}`);
     });
 
-    // Auto-restart bot after server is up (with small delay to ensure DB is ready)
+    // [FIX 15.0] Auto-restart bot after server is up
+    // Delay aumentado de 3s para 10s para garantir estabilidade do container antes de reiniciar
     setTimeout(() => {
       autoRestartBot().catch((e) => console.error("Auto-restart error:", e));
-    }, 3000);
+    }, 10_000);
 
     // [FIX 8.0] Start 15-minute system health monitor
     startSystemMonitor();
