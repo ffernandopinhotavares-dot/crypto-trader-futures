@@ -576,18 +576,20 @@ export class TradingEngine {
       if (snapshots.length === 0) return;
 
       // PRE-FILTER: Apply quantitative filters BEFORE sending to AI
-      // [FIX 19.2] Relaxado para evitar bloqueio total de candidatos — a IA faz a seleção fina
+      // [FIX 19.3] CORREÇÃO CRÍTICA: analyzeVolatility retorna desvio padrão dos retornos candle-a-candle
+      // Escala real: mercado normal = 0.05%-0.3%, alta volatilidade = 0.5%-2%+
+      // Limiar de 0.3-0.4 bloqueava 95%+ dos ativos em mercado normal
       const filteredSnapshots = snapshots.filter(s => {
-        // Minimum volatility — too stable pairs don't generate profit
-        if (s.volatility.volatility < 0.3) return false; // [FIX 19.2] era 0.4, relaxado para 0.3
-        // Minimum volume ratio — need decent liquidity
-        if (s.volumeAnalysis.volumeRatio < 0.4) return false; // [FIX 19.2] era 0.5, relaxado para 0.4
-        // [FIX 17.0] HARD BLOCK: LONG com RSI >= 75 em tendência BULLISH forte
+        // Minimum volatility — [FIX 19.3] Corrigido para escala real: 0.05% mínimo (era 0.3)
+        if (s.volatility.volatility < 0.05) return false;
+        // Minimum volume ratio — [FIX 19.3] Relaxado para 0.3 (era 0.4)
+        if (s.volumeAnalysis.volumeRatio < 0.3) return false;
+        // HARD BLOCK: LONG com RSI >= 75 em tendência BULLISH forte
         if (s.rsi >= 75 && s.trend === 'BULLISH') return false;
-        // [FIX 15.0] RSI < 10 = oversold extremo patológico
-        if (s.rsi < 10) return false; // [FIX 19.2] era <15, relaxado para <10
+        // RSI < 10 = oversold extremo patológico
+        if (s.rsi < 10) return false;
         // Skip if 24h change is extreme (>20% or <-20%)
-        if (Math.abs(s.change24h) > 20) return false; // [FIX 19.2] era >15, relaxado para >20
+        if (Math.abs(s.change24h) > 20) return false;
         return true;
       });
 
