@@ -80,6 +80,98 @@ interface MacroContext {
 }
 
 // ============================================================================
+// [FIX 19.1] Position Escalation Manager — Escalonamento Progressivo de Entrada
+// $20 → (60 min sem sinal) → $40 → (60 min sem sinal) → $80 → reset se fluxo normal
+// ============================================================================
+
+class PositionEscalationManager {
+  private readonly BASE_VALUE = 20.0;
+  private readonly SECOND_VALUE = 40.0;
+  private readonly THIRD_VALUE = 80.0;
+  private readonly INACTIVITY_MINUTES = 60;
+
+  private lastPositionOpenedAt: Date | null = null;
+  private currentStep: number = 0; // 0=base, 1=second, 2=third
+
+  /**
+   * Verifica se já passou o tempo mínimo sem nova posição.
+   */
+  private hasInactivityReached(now: Date): boolean {
+    if (!this.lastPositionOpenedAt) return false;
+    const elapsed = (now.getTime() - this.lastPositionOpenedAt.getTime()) / (1000 * 60);
+    return elapsed >= this.INACTIVITY_MINUTES;
+  }
+
+  /**
+   * Retorna o valor que deve ser usado na próxima entrada.
+   * Regras:
+   * - Se não passou 60 min sem nova posição → $20 (reset)
+   * - Se passou 60 min (step 0) → $40
+   * - Se passou 60 min novamente (step 1) → $80
+   * - Máximo: $80
+   */
+  getNextEntryValue(now?: Date): number {
+    const currentTime = now || new Date();
+
+    // Primeira entrada ou sem histórico
+    if (!this.lastPositionOpenedAt) {
+      return this.BASE_VALUE;
+    }
+
+    const inactiveLongEnough = this.hasInactivityReached(currentTime);
+
+    // Se encontrou oportunidade antes de 60 min → reset para base
+    if (!inactiveLongEnough) {
+      this.currentStep = 0;
+      return this.BASE_VALUE;
+    }
+
+    // Passou 60 min sem posição → escala progressivamente
+    if (this.currentStep === 0) {
+      return this.SECOND_VALUE; // $40
+    } else {
+      return this.THIRD_VALUE;  // $80 (máximo)
+    }
+  }
+
+  /**
+   * Confirma que uma posição foi aberta com sucesso.
+   * Atualiza o degrau atual do escalonamento.
+   */
+  confirmOpenedPosition(usedValue: number, openedAt?: Date): void {
+    const now = openedAt || new Date();
+
+    if (usedValue <= this.BASE_VALUE) {
+      this.currentStep = 0;
+    } else if (usedValue <= this.SECOND_VALUE) {
+      this.currentStep = 1;
+    } else {
+      this.currentStep = 2;
+    }
+
+    this.lastPositionOpenedAt = now;
+  }
+
+  /**
+   * Força reset manual do ciclo.
+   */
+  resetCycle(): void {
+    this.currentStep = 0;
+  }
+
+  /**
+   * Retorna info de debug sobre o estado atual.
+   */
+  getStatus(): { step: number; lastOpened: string | null; nextValue: number } {
+    return {
+      step: this.currentStep,
+      lastOpened: this.lastPositionOpenedAt?.toISOString() || null,
+      nextValue: this.getNextEntryValue(),
+    };
+  }
+}
+
+// ============================================================================
 // Trading Engine v2.0 — Optimized AI-Driven (Gate.io Futures)
 // ============================================================================
 
@@ -91,6 +183,9 @@ export class TradingEngine {
   private cycleCount: number = 0;
   private initialBalance: number = 0;
   private highWaterMarkBalance: number = 0; // [FIX 13.0] Melhor baseline para drawdown
+
+  // [FIX 19.1] Escalation Manager — escalonamento progressivo $20 → $40 → $80
+  private escalationManager: PositionEscalationManager = new PositionEscalationManager();
 
   // [CREDIT GUARD] Track consecutive AI 402/credit errors
   private consecutiveAIErrors: number = 0;
@@ -561,8 +656,9 @@ export class TradingEngine {
         }
       }
 
+      const escInfo = this.escalationManager.getStatus();
       await this.logEvent("INFO", "SYSTEM",
-        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | ~$${(this.positions.size * 20).toFixed(0)} deployed`);
+        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | Escalation: step=${escInfo.step} next=$${escInfo.nextValue}`);
 
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
@@ -798,7 +894,8 @@ export class TradingEngine {
 
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
-    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 20)); // [FIX 19.0] $20/trade — menos posições, mais qualidade
+    const currentEntryValue = this.escalationManager.getNextEntryValue();
+    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / currentEntryValue)); // [FIX 19.1] Escalonamento: $20/$40/$80 por trade
 
     // Macro context for AI
     const macroInfo = this.macroContext
@@ -891,7 +988,7 @@ PERFIL: ${this.config.aggressiveness}
 CAPITAL:
 - Deployável: ${deployableBalance.toFixed(2)} USDT (máx 75% do total)
 - Posições abertas: ${this.positions.size}
-- Máx novas posições: ${maxNewPositions} ($20 cada — foco em qualidade)
+- Máx novas posições: ${maxNewPositions} ($${currentEntryValue} cada — escalonamento ativo)
 
 REGRAS:
 - Retorne APENAS os 1-3 MELHORES trades com confiança >= ${minConf}%
@@ -1176,11 +1273,10 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // [FIX 19.0] Tamanho de $20 por trade (era $5 fixo)
-      // Motivo: focar nas MELHORES posições com maior capital por trade
-      // Análise HARD_STOP 25/03/2026: muitas posições de $5 diluíam capital em trades mediocres
-      // Agora: menos posições, mais seletivas, com $20 cada — qualidade sobre quantidade
-      const targetSize = 20.0; // $20 por trade — foco em qualidade
+      // [FIX 19.1] Escalonamento progressivo de entrada
+      // $20 → (60 min sem sinal) → $40 → (60 min sem sinal) → $80 → reset se fluxo normal
+      // O escalationManager decide o valor com base no tempo desde a última posição aberta
+      const targetSize = this.escalationManager.getNextEntryValue();
       const baseValue = Math.min(deployable, targetSize);
       const notionalValue = baseValue * decision.leverage;
 
@@ -1260,11 +1356,15 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         bybitOrderId: order.orderId,
       });
 
+      // [FIX 19.1] Confirmar abertura no escalation manager
+      this.escalationManager.confirmOpenedPosition(targetSize);
+
       const appliedSL = decision.weak_signal ? -1.5 : (decision.leverage > 8 ? -1.5 : -2.0);
+      const escStatus = this.escalationManager.getStatus();
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} | SL:${appliedSL}%${decision.weak_signal ? ' [WEAK]' : ''} | ${decision.reasoning}`
+        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} (step:${escStatus.step}) | SL:${appliedSL}%${decision.weak_signal ? ' [WEAK]' : ''} | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
