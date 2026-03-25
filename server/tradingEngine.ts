@@ -66,6 +66,7 @@ interface AIDecision {
   leverage: number;
   positionSizePercent: number;
   reasoning: string;
+  weak_signal?: boolean; // [FIX 19.0] Sinal fraco — stop-loss dinâmico de -1.5%
 }
 
 // BTC macro trend context
@@ -107,9 +108,9 @@ export class TradingEngine {
   private static readonly AI_BATCH_SIZE = 50;
 
   // Capital management
-  private static readonly CAPITAL_RESERVE_PCT = 0.25; // [FIX 17.0] 25% reserve — blindagem contra liquidação em cascata
-  // Análise: drawdown P95 de -$48.72 com 12 posições. Com 20% reserva ($37), o drawdown ultrapassa a margem.
-  // Com 25% ($46), há folga suficiente para absorver o pior cenário histórico sem liquidação.
+  private static readonly CAPITAL_RESERVE_PCT = 0.25; // [FIX 19.0] 25% reserve — máx 75% do capital total deployável
+  // Análise HARD_STOP 25/03/2026: focar em menos posições de maior qualidade ($20 cada)
+  // Reserva de 25% garante margem de segurança contra liquidação em cascata
   private static readonly MIN_VOLUME_24H = 1_000_000; // [FIX 17.0] $1M min volume (up from $500k) — anti-slippage: evita NAORIS_USDT-style -$16 losses por falta de liquidez no order book
 
   // Win rate monitoring
@@ -561,7 +562,7 @@ export class TradingEngine {
       }
 
       await this.logEvent("INFO", "SYSTEM",
-        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | ~$${(this.positions.size * 10).toFixed(0)} deployed`);
+        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | ~$${(this.positions.size * 20).toFixed(0)} deployed`);
 
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
@@ -797,66 +798,89 @@ export class TradingEngine {
 
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
-    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 5)); // [FIX 17.0] $5/trade
+    const maxNewPositions = Math.max(1, Math.floor(deployableBalance / 20)); // [FIX 19.0] $20/trade — menos posições, mais qualidade
 
     // Macro context for AI
     const macroInfo = this.macroContext
       ? `\nCONTEXTO MACRO (BTC): Tendência=${this.macroContext.btcTrend} | RSI=${this.macroContext.btcRsi.toFixed(1)} | 24h=${this.macroContext.btcChange24h.toFixed(2)}% | Sentimento=${this.macroContext.marketSentiment}`
       : "";
 
-    const systemPrompt = `Você é um gestor quantitativo de futuros cripto com foco em QUALIDADE sobre QUANTIDADE de trades.
+    const systemPrompt = `Você é um gestor quantitativo de futuros cripto com foco em QUALIDADE MÁXIMA de trades.
 
-OBJETIVO: Identificar APENAS trades de ALTA PROBABILIDADE com confluência técnica clara. Prefira NÃO operar a operar mal.
+OBJETIVO: Identificar APENAS os MELHORES trades de ALTA PROBABILIDADE com confluência técnica indiscutível. Prefira NÃO operar a operar mal. Cada trade usa $20 — seja extremamente seletivo.
 
 FILOSOFIA:
-- MAXIMIZAR LUCRO: Identifique as tendências mais fortes. Se o mercado está volátil, capture os rompimentos.
-- CONFLUÊNCIA OBRIGATÓRIA: Mínimo 3 indicadores alinhados para abrir posição.
-- NÃO HESITE EM SHORTAR: Se o mercado está caindo, abra shorts agressivamente nas moedas mais fracas.
-- ALAVANCAGEM ADAPTATIVA: Use alavancagem máxima permitida apenas quando houver rompimento claro de resistência/suporte com alto volume.
+- QUALIDADE ABSOLUTA: Selecione apenas os 2-3 melhores setups do mercado inteiro. Rejeite tudo que não for excepcional.
+- CONFLUÊNCIA OBRIGATÓRIA: Mínimo 4 indicadores alinhados para abrir posição (era 3, agora 4).
+- RESPEITE A TENDÊNCIA: NUNCA opere contra a tendência dominante sem divergência MACD confirmada.
+- ALAVANCAGEM ADAPTATIVA: Use alavancagem máxima permitida apenas quando houver rompimento claro com alto volume.
 - RESPEITE O MACRO: Se BTC está bearish, priorize SHORTS. Se bullish, priorize LONGS.
 ${macroInfo}
 
+[FIX 19.0] REGRA ABSOLUTA — PROIBIÇÃO DE COUNTER-TREND SEM DIVERGÊNCIA:
+  - NUNCA abra LONG em ativo com tendência BEARISH, A MENOS que haja divergência MACD confirmada (preço caindo MAS histograma MACD subindo). RSI oversold sozinho NÃO é suficiente.
+  - NUNCA abra SHORT em ativo com tendência BULLISH, A MENOS que haja divergência MACD confirmada (preço subindo MAS histograma MACD caindo). RSI overbought sozinho NÃO é suficiente.
+  - Se não houver divergência MACD clara, REJEITE o trade imediatamente — sem exceções.
+  - Análise de dados (25/03/2026): 60% dos HARD_STOPs foram causados por counter-trend trading sem divergência.
+
 CRITÉRIOS DE ENTRADA (TODOS devem ser atendidos):
 
-LONG requer pelo menos 3 de:
-  1. RSI < 40 (oversold) OU RSI entre 40-55 com tendência de alta
+LONG requer pelo menos 4 de (era 3, agora 4 — mais seletivo):
+  1. RSI < 25 (oversold extremo) — [FIX 19.0] Endurecido: era <40, agora <25 para tendência forte
   2. MACD bullish (histogram positivo e crescente)
-  3. Preço acima da EMA50
-  4. BB position < 30 (perto da banda inferior = desconto)
-  5. Volume ratio > 1.2 (confirmação de volume)
-  6. Tendência geral BULLISH
+  3. Preço acima da EMA50 OU divergência MACD confirmada se abaixo
+  4. BB position < 20 (perto da banda inferior = desconto real)
+  5. Volume ratio > 1.2 (confirmação de volume) MAS Volume ratio > 5.0 com preço caindo = REJEIÇÃO (capitulação, não exaustão)
+  6. Tendência geral BULLISH (obrigatório, exceto com divergência MACD)
   7. Funding rate negativo (shorts pagando longs = pressão de alta)
+  PROIBIÇÕES ABSOLUTAS PARA LONG:
+  - NUNCA abra LONG com RSI entre 35-65 (zona neutra — sem sinal claro)
+  - NUNCA abra LONG em tendência BEARISH sem divergência MACD confirmada
+  - NUNCA abra LONG quando Volume ratio > 5.0 E preço caindo (indica capitulação/rompimento de suporte)
 
-SHORT requer TODOS os 3 obrigatórios + pelo menos 1 adicional:
+SHORT requer TODOS os 3 obrigatórios + pelo menos 2 adicionais (era 1, agora 2):
   OBRIGATÓRIOS (todos devem estar presentes):
-  1. RSI > 80 (sobrecomprado extremo) — NÃO abra SHORT com RSI < 80, mesmo que BTC esteja caindo
+  1. RSI > 75 (sobrecomprado) — [FIX 19.0] Endurecido para 75 (era 80 para tendência forte)
   2. MACD bearish OU perdendo força (histograma decrescente ou negativo)
   3. BB position > 90 (preço na Banda de Bollinger Superior — sobrevalorizado extremo)
-  ADICIONAIS (pelo menos 1):
-  4. Tendência geral BEARISH ou SIDEWAYS (NUNCA SHORT em tendência BULLISH forte)
+  ADICIONAIS (pelo menos 2 — era 1):
+  4. Tendência geral BEARISH ou SIDEWAYS (NUNCA SHORT em tendência BULLISH forte sem divergência MACD)
   5. Funding rate positivo (longs pagando shorts = pressão de queda)
   6. Volume ratio > 1.2 (confirmação de volume na queda)
   7. Mudança 24h > +5% (ativo sobrecomprado no dia — candidato a reversão)
   PROIBIÇÕES ABSOLUTAS PARA SHORT:
   - NUNCA abra SHORT em ativo com alta relativa > +8% no dia (momentum forte)
-  - NUNCA abra SHORT com RSI < 70 baseando-se apenas no contexto bearish do BTC
-  - NUNCA abra SHORT em ativo com tendência BULLISH confirmada (EMA50 subindo + MACD positivo)
+  - NUNCA abra SHORT com RSI < 75 — [FIX 19.0] Endurecido (era 70)
+  - NUNCA abra SHORT em ativo com tendência BULLISH confirmada sem divergência MACD
+
+[FIX 19.0] REINTERPRETAÇÃO DE VOLUME RATIO:
+  - Volume Ratio > 5.0 com forte movimentação de preço (>3% no período) = CONTINUAÇÃO DE TENDÊNCIA (rompimento/capitulação), NÃO exaustão.
+  - Exaustão real = candles de corpo pequeno com pavios longos + volume normal/baixo.
+  - Se Volume Ratio > 5.0 E preço subindo forte: NÃO abra SHORT (rompimento de resistência).
+  - Se Volume Ratio > 5.0 E preço caindo forte: NÃO abra LONG (capitulação/rompimento de suporte).
 
 FILTROS DE REJEIÇÃO (NÃO abra posição se):
   - Volatilidade > 8% (risco de whipsaw)
   - Volume ratio < 0.5 (sem liquidez)
-  - RSI entre 45-55 SEM confirmação de MACD e tendência (zona neutra)
+  - RSI entre 35-65 SEM divergência MACD confirmada (zona neutra ampliada) — [FIX 19.0] Era 45-55
   - Mudança 24h > 10% (movimento já exausto)
+  - Volume ratio > 5.0 com preço movendo >3% na mesma direção (continuação, não reversão)
 
-[FIX 17.0] REGRAS CRÍTICAS BASEADAS EM DADOS (24/03/2026 19:09 BRT — atualizado):
+[FIX 19.0] REGRAS CRÍTICAS BASEADAS EM DADOS (25/03/2026 — Análise HARD_STOP):
   - Ratio R:R mínimo 1.5x: só abra se o potencial de ganho for pelo menos 1.5x o risco
   - Prefira pares com tendência clara e volume acima da média (volume_ratio > 1.3)
   - EVITE pares com baixa liquidez ou movimentos erráticos recentes
-  - Para SHORTs: RSI DEVE ser > 80 E BB position > 90. Análise de dados mostrou WR de apenas 28% com RSI 60-79.
-  - Para SHORTs: NÃO use contexto bearish do BTC como justificativa única. Exija exaustão técnica do ativo.
-  - NOVOS ALVOS R:R (FIX 17.0): leverage>8 → alvo mínimo +2.25% (SL=-1.5%) | leverage<=8 → alvo mínimo +3.0% (SL=-2.0%)
-  - ATENÇÃO HORÁRIO: Análise de dados mostra WR=22-25% entre 13h-14h BRT. Nesse período, exija confluência EXTRA (4+ indicadores) ou prefira NÃO operar.
-  - Profit Factor atual: 0.186 (crítico). Priorize QUALIDADE sobre QUANTIDADE. Prefira 1 trade excelente a 3 trades mediocres.
+  - 70% dos HARD_STOPs tiveram HWM=0% (nunca foram favoráveis) — sinal de entrada errado
+  - 60% dos HARD_STOPs foram counter-trend — a regra de divergência MACD é obrigatória
+  - 40% dos HARD_STOPs tinham RSI em zona neutra (35-65) — zona neutra ampliada para rejeição
+  - ATENÇÃO HORÁRIO: WR=22-25% entre 13h-14h BRT. Nesse período, exija 5+ indicadores ou NÃO opere.
+  - Profit Factor crítico. Priorize QUALIDADE ABSOLUTA. Prefira 0 trades a 1 trade mediocre.
+
+[FIX 19.0] STOP-LOSS DINÂMICO PARA SINAIS FRACOS:
+  - Se o trade atende os requisitos mínimos MAS apresenta qualquer conflito parcial de tendência:
+    → Adicione "weak_signal":true no JSON de saída
+    → O sistema aplicará stop-loss de -1.5% ao invés de -2.0%
+  - Conflito parcial = tendência SIDEWAYS (não alinhada), ou MACD fraco/neutro, ou volume ratio < 1.0
 
 EXCHANGE: Gate.io Futures (USDT-M) — Símbolos: BTC_USDT, ETH_USDT
 
@@ -865,20 +889,21 @@ PERFIL: ${this.config.aggressiveness}
 - Confiança mínima: ${minConf}%
 
 CAPITAL:
-- Deployável: ${deployableBalance.toFixed(2)} USDT
+- Deployável: ${deployableBalance.toFixed(2)} USDT (máx 75% do total)
 - Posições abertas: ${this.positions.size}
-- Máx novas posições: ${maxNewPositions} ($10 cada)
+- Máx novas posições: ${maxNewPositions} ($20 cada — foco em qualidade)
 
 REGRAS:
-- Retorne APENAS trades com confiança >= ${minConf}%
+- Retorne APENAS os 1-3 MELHORES trades com confiança >= ${minConf}%
 - Ordene por confiança (maior primeiro)
 - NUNCA repita símbolo
-- Se nenhum trade atende os critérios, retorne []
+- Se nenhum trade é EXCEPCIONAL, retorne [] (prefira 0 trades a trades mediocres)
 - Na dúvida, NÃO opere (retorne [])
 - Alavancagem deve ser proporcional à confiança: 75-80% → ${Math.max(1, maxLev-2)}x, 80-90% → ${Math.max(1, maxLev-1)}x, 90%+ → ${maxLev}x
+- Se o sinal é fraco (conflito parcial de tendência), adicione "weak_signal":true
 
 Responda APENAS com JSON array:
-[{"action":"OPEN_LONG"|"OPEN_SHORT","symbol":"BTC_USDT","confidence":80,"leverage":${maxLev},"positionSizePercent":100,"reasoning":"3+ indicadores: RSI=35 oversold + MACD bullish + acima EMA50 + volume_ratio=1.8"}]`;
+[{"action":"OPEN_LONG"|"OPEN_SHORT","symbol":"BTC_USDT","confidence":85,"leverage":${maxLev},"positionSizePercent":100,"weak_signal":false,"reasoning":"4+ indicadores: RSI=22 oversold extremo + MACD bullish divergente + BB=5 desconto + volume_ratio=1.8 + tendência BULLISH"}]`;
 
     try {
       const response = await this.openai.chat.completions.create({
@@ -1151,10 +1176,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // [FIX 17.0] Tamanho fixo de $5 por trade (era $10-$20 dinâmico)
-      // Motivo: reduz impacto de qualquer trade individual de -$16 (pior caso) para no máximo -$8
-      // Permite o dobro de posições simultâneas com o mesmo capital, melhorando diversificação
-      const targetSize = 5.0; // $5 fixo — independente da confiança da IA
+      // [FIX 19.0] Tamanho de $20 por trade (era $5 fixo)
+      // Motivo: focar nas MELHORES posições com maior capital por trade
+      // Análise HARD_STOP 25/03/2026: muitas posições de $5 diluíam capital em trades mediocres
+      // Agora: menos posições, mais seletivas, com $20 cada — qualidade sobre quantidade
+      const targetSize = 20.0; // $20 por trade — foco em qualidade
       const baseValue = Math.min(deployable, targetSize);
       const notionalValue = baseValue * decision.leverage;
 
@@ -1208,11 +1234,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // [FIX 17.0] Stop-loss inicial calibrado para R:R ≥1.5x
-        // Reduzido: leverage>8: SL=-1.5% → TP alvo=+2.25% (R:R=1.5x)
-        //           leverage<=8: SL=-2.0% → TP alvo=+3.0% (R:R=1.5x)
-        // Motivo: HARD_STOP avg -$2.17/trade com SL=-3.0%. Reduzindo exposição.
-        trailingStopPct: decision.leverage > 8 ? -1.5 : -2.0,
+        // [FIX 19.0] Stop-loss dinâmico baseado na qualidade do sinal
+        // Sinal fraco (weak_signal=true): SL=-1.5% — mitiga risco de operações especulativas
+        // Sinal forte: leverage>8 → SL=-1.5% | leverage<=8 → SL=-2.0%
+        // Análise HARD_STOP 25/03/2026: 70% dos trades nunca foram favoráveis (HWM=0%)
+        trailingStopPct: decision.weak_signal ? -1.5 : (decision.leverage > 8 ? -1.5 : -2.0),
       });
 
       // Record trade in DB
@@ -1234,10 +1260,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         bybitOrderId: order.orderId,
       });
 
+      const appliedSL = decision.weak_signal ? -1.5 : (decision.leverage > 8 ? -1.5 : -2.0);
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} | ${decision.reasoning}`
+        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} | SL:${appliedSL}%${decision.weak_signal ? ' [WEAK]' : ''} | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
