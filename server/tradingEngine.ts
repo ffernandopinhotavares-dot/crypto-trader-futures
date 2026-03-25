@@ -576,20 +576,18 @@ export class TradingEngine {
       if (snapshots.length === 0) return;
 
       // PRE-FILTER: Apply quantitative filters BEFORE sending to AI
-      // This reduces AI load and prevents low-quality signals
+      // [FIX 19.2] Relaxado para evitar bloqueio total de candidatos — a IA faz a seleção fina
       const filteredSnapshots = snapshots.filter(s => {
         // Minimum volatility — too stable pairs don't generate profit
-        if (s.volatility.volatility < 0.4) return false;
+        if (s.volatility.volatility < 0.3) return false; // [FIX 19.2] era 0.4, relaxado para 0.3
         // Minimum volume ratio — need decent liquidity
-        if (s.volumeAnalysis.volumeRatio < 0.5) return false;
-        // [FIX 17.0] HARD BLOCK: LONG com RSI >= 70 — dados de 418 trades mostram WR=34% e PnL=-$110.83
-        // 291 dos 418 trades (69%) foram abertos com RSI>=70, causando quase 100% das perdas totais
-        // SHORTs com RSI < 70 são PERMITIDOS (WR=48.8%, PnL=+$4.84 — rentáveis)
-        if (s.rsi >= 70 && s.trend === 'BULLISH') return false; // Bloqueia candidatos a LONG exaustos
-        // [FIX 15.0] Manter apenas o filtro de RSI<15 (oversold extremo não é candidato a SHORT)
-        if (s.rsi < 15) return false;
-        // Skip if 24h change is extreme (>15% or <-15%) — likely exhausted
-        if (Math.abs(s.change24h) > 15) return false;
+        if (s.volumeAnalysis.volumeRatio < 0.4) return false; // [FIX 19.2] era 0.5, relaxado para 0.4
+        // [FIX 17.0] HARD BLOCK: LONG com RSI >= 75 em tendência BULLISH forte
+        if (s.rsi >= 75 && s.trend === 'BULLISH') return false;
+        // [FIX 15.0] RSI < 10 = oversold extremo patológico
+        if (s.rsi < 10) return false; // [FIX 19.2] era <15, relaxado para <10
+        // Skip if 24h change is extreme (>20% or <-20%)
+        if (Math.abs(s.change24h) > 20) return false; // [FIX 19.2] era >15, relaxado para >20
         return true;
       });
 
@@ -904,11 +902,11 @@ export class TradingEngine {
 
     const systemPrompt = `Você é um gestor quantitativo de futuros cripto com foco em QUALIDADE MÁXIMA de trades.
 
-OBJETIVO: Identificar APENAS os MELHORES trades de ALTA PROBABILIDADE com confluência técnica indiscutível. Prefira NÃO operar a operar mal. Cada trade usa $20 — seja extremamente seletivo.
+OBJETIVO: Identificar trades de ALTA PROBABILIDADE com boa confluência técnica. [FIX 19.2] Equilíbrio entre qualidade e frequência — o bot PRECISA operar para gerar retorno. Cada trade usa $${currentEntryValue}.
 
 FILOSOFIA:
-- QUALIDADE ABSOLUTA: Selecione apenas os 2-3 melhores setups do mercado inteiro. Rejeite tudo que não for excepcional.
-- CONFLUÊNCIA OBRIGATÓRIA: Mínimo 4 indicadores alinhados para abrir posição (era 3, agora 4).
+- QUALIDADE COM FREQUÊNCIA: Selecione os 1-3 melhores setups. Não exija perfeição — exija boa confluência (3+ indicadores).
+- CONFLUÊNCIA OBRIGATÓRIA: Mínimo 3 indicadores alinhados para abrir posição. [FIX 19.2] era 4, relaxado para 3.
 - RESPEITE A TENDÊNCIA: NUNCA opere contra a tendência dominante sem divergência MACD confirmada.
 - ALAVANCAGEM ADAPTATIVA: Use alavancagem máxima permitida apenas quando houver rompimento claro com alto volume.
 - RESPEITE O MACRO: Se BTC está bearish, priorize SHORTS. Se bullish, priorize LONGS.
@@ -922,32 +920,32 @@ ${macroInfo}
 
 CRITÉRIOS DE ENTRADA (TODOS devem ser atendidos):
 
-LONG requer pelo menos 4 de (era 3, agora 4 — mais seletivo):
-  1. RSI < 25 (oversold extremo) — [FIX 19.0] Endurecido: era <40, agora <25 para tendência forte
+LONG requer pelo menos 3 de: [FIX 19.2] Relaxado de 4 para 3 — mercado normal não tem 4 indicadores alinhados simultaneamente
+  1. RSI < 35 (oversold) — [FIX 19.2] Relaxado: era <25, agora <35 para capturar mais oportunidades
   2. MACD bullish (histogram positivo e crescente)
   3. Preço acima da EMA50 OU divergência MACD confirmada se abaixo
-  4. BB position < 20 (perto da banda inferior = desconto real)
-  5. Volume ratio > 1.2 (confirmação de volume) MAS Volume ratio > 5.0 com preço caindo = REJEIÇÃO (capitulação, não exaustão)
-  6. Tendência geral BULLISH (obrigatório, exceto com divergência MACD)
+  4. BB position < 30 (perto da banda inferior = desconto) — [FIX 19.2] era <20
+  5. Volume ratio > 1.0 (confirmação de volume) MAS Volume ratio > 5.0 com preço caindo = REJEIÇÃO
+  6. Tendência geral BULLISH ou SIDEWAYS (preferência BULLISH)
   7. Funding rate negativo (shorts pagando longs = pressão de alta)
   PROIBIÇÕES ABSOLUTAS PARA LONG:
-  - NUNCA abra LONG com RSI entre 35-65 (zona neutra — sem sinal claro)
+  - NUNCA abra LONG com RSI entre 40-60 (zona neutra central — sem sinal claro) — [FIX 19.2] era 35-65
   - NUNCA abra LONG em tendência BEARISH sem divergência MACD confirmada
   - NUNCA abra LONG quando Volume ratio > 5.0 E preço caindo (indica capitulação/rompimento de suporte)
 
-SHORT requer TODOS os 3 obrigatórios + pelo menos 2 adicionais (era 1, agora 2):
+SHORT requer TODOS os 3 obrigatórios + pelo menos 1 adicional: [FIX 19.2] Relaxado de 2 para 1 adicional
   OBRIGATÓRIOS (todos devem estar presentes):
-  1. RSI > 75 (sobrecomprado) — [FIX 19.0] Endurecido para 75 (era 80 para tendência forte)
+  1. RSI > 70 (sobrecomprado) — [FIX 19.2] Relaxado: era 75, agora 70 para capturar mais oportunidades
   2. MACD bearish OU perdendo força (histograma decrescente ou negativo)
-  3. BB position > 90 (preço na Banda de Bollinger Superior — sobrevalorizado extremo)
-  ADICIONAIS (pelo menos 2 — era 1):
+  3. BB position > 80 (preço na Banda de Bollinger Superior) — [FIX 19.2] era >90
+  ADICIONAIS (pelo menos 1):
   4. Tendência geral BEARISH ou SIDEWAYS (NUNCA SHORT em tendência BULLISH forte sem divergência MACD)
   5. Funding rate positivo (longs pagando shorts = pressão de queda)
-  6. Volume ratio > 1.2 (confirmação de volume na queda)
+  6. Volume ratio > 1.0 (confirmação de volume na queda)
   7. Mudança 24h > +5% (ativo sobrecomprado no dia — candidato a reversão)
   PROIBIÇÕES ABSOLUTAS PARA SHORT:
-  - NUNCA abra SHORT em ativo com alta relativa > +8% no dia (momentum forte)
-  - NUNCA abra SHORT com RSI < 75 — [FIX 19.0] Endurecido (era 70)
+  - NUNCA abra SHORT em ativo com alta relativa > +10% no dia (momentum forte) — [FIX 19.2] era >8%
+  - NUNCA abra SHORT com RSI < 70 — [FIX 19.2] Relaxado (era 75)
   - NUNCA abra SHORT em ativo com tendência BULLISH confirmada sem divergência MACD
 
 [FIX 19.0] REINTERPRETAÇÃO DE VOLUME RATIO:
@@ -956,11 +954,11 @@ SHORT requer TODOS os 3 obrigatórios + pelo menos 2 adicionais (era 1, agora 2)
   - Se Volume Ratio > 5.0 E preço subindo forte: NÃO abra SHORT (rompimento de resistência).
   - Se Volume Ratio > 5.0 E preço caindo forte: NÃO abra LONG (capitulação/rompimento de suporte).
 
-FILTROS DE REJEIÇÃO (NÃO abra posição se):
-  - Volatilidade > 8% (risco de whipsaw)
-  - Volume ratio < 0.5 (sem liquidez)
-  - RSI entre 35-65 SEM divergência MACD confirmada (zona neutra ampliada) — [FIX 19.0] Era 45-55
-  - Mudança 24h > 10% (movimento já exausto)
+FILTROS DE REJEIÇÃO (NÃO abra posição se): [FIX 19.2] Relaxados para permitir mais trades de qualidade
+  - Volatilidade > 10% (risco de whipsaw) — [FIX 19.2] era >8%
+  - Volume ratio < 0.4 (sem liquidez) — [FIX 19.2] era <0.5
+  - RSI entre 40-60 SEM divergência MACD confirmada (zona neutra central) — [FIX 19.2] era 35-65
+  - Mudança 24h > 15% (movimento já exausto) — [FIX 19.2] era >10%
   - Volume ratio > 5.0 com preço movendo >3% na mesma direção (continuação, não reversão)
 
 [FIX 19.0] REGRAS CRÍTICAS BASEADAS EM DADOS (25/03/2026 — Análise HARD_STOP):
