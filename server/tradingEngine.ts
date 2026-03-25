@@ -122,8 +122,8 @@ export class TradingEngine {
   private static readonly ISOLATED_MARGIN_MODE = "isolated";
   private static readonly CROSS_MARGIN_MODE = "cross";
 
-  // [FIX 17.0] Symbol blacklist — pares com histórico de perdas consistentes
-  // Atualizado em 24/03/2026 19:09 BRT — Learning Engine delta desde baseline 12:21 BRT
+  // [FIX 18.0] Symbol blacklist — pares com histórico de perdas consistentes
+  // Atualizado em 25/03/2026 — FIX 18.0: +RESOLV_USDT, +PTB_USDT | FIX 17.0: +7 pares (24/03/2026 19:09 BRT)
   private static readonly SYMBOL_BLACKLIST = new Set([
     // === BANIDOS ANTERIORES (FIX 14.0) ===
     "RDNT_USDT",    // WR 0%, PnL total -$4.59 (histórico)
@@ -152,6 +152,9 @@ export class TradingEngine {
     "UAI_USDT",     // WR 0%, PnL delta -$0.33
     "PHA_USDT",     // WR 0%, PnL delta -$0.307
     "DEXE_USDT",    // WR 0%, PnL delta -$0.260
+    // === NOVOS BANIDOS (FIX 18.0) — análise 25/03/2026 ===
+    "RESOLV_USDT",  // WR 0%, PnL total -$0.9945 (3 trades histórico)
+    "PTB_USDT",     // WR 17%, PnL total -$2.3313 (6 trades histórico)
   ]);
 
   private get db() { return getDatabase(); }
@@ -581,14 +584,58 @@ export class TradingEngine {
   // Position Monitoring — Hard stops + Trailing + AI decisions
   // --------------------------------------------------------------------------
 
+  // [FIX 18.0] HARD_STOP WATCHDOG: Timeout por posição no loop de monitoramento
+  // Bug raiz: loop travado durante downtime do Fly.io fazia o bot não verificar o stop-loss
+  // por longos períodos, permitindo que o P&L caísse muito além do limite configurado.
+  // Solução: cada posição tem timeout de 90s; se exceder, força fechamento de emergência.
+  private static readonly MONITOR_POSITION_TIMEOUT_MS = 90_000; // 90 segundos por posição
+
   private async monitorPositions(): Promise<void> {
     for (const [symbol, position] of Array.from(this.positions.entries())) {
       try {
-        const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1000 * 60);
-        const minHoldMinutes = this.getMinHoldMinutes();
+        // [FIX 18.0] Watchdog: garantir que cada iteração complete em até 90s
+        // Se o getMarketSnapshot ou closePosition travar, o timeout força a saída
+        const monitorWithTimeout = async () => {
+          const holdTimeMinutes = (Date.now() - position.entryTime.getTime()) / (1000 * 60);
+          const minHoldMinutes = this.getMinHoldMinutes();
 
-        const snapshot = await this.getMarketSnapshot(symbol);
-        if (!snapshot) continue;
+          const snapshot = await this.getMarketSnapshot(symbol);
+          if (!snapshot) return;
+
+          return { holdTimeMinutes, minHoldMinutes, snapshot };
+        };
+
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`[FIX 18.0] WATCHDOG_TIMEOUT: monitor de ${symbol} excedeu 90s`)),
+            TradingEngine.MONITOR_POSITION_TIMEOUT_MS)
+        );
+
+        let monitorResult: { holdTimeMinutes: number; minHoldMinutes: number; snapshot: MarketSnapshot } | undefined;
+        try {
+          monitorResult = await Promise.race([monitorWithTimeout(), timeoutPromise]) as typeof monitorResult;
+        } catch (watchdogErr) {
+          await this.logEvent("ERROR", symbol, this.errStr(watchdogErr));
+          // Forçar fechamento de emergência se a posição está aberta há mais de 5 minutos
+          const holdMin = (Date.now() - position.entryTime.getTime()) / 60000;
+          if (holdMin > 5) {
+            await this.logEvent("RISK_STOP", symbol,
+              `[FIX 18.0] WATCHDOG_EMERGENCY_CLOSE: timeout no monitoramento após ${holdMin.toFixed(0)}min`);
+            try {
+              await this.config.gateioClient.closePosition(symbol);
+              await this.closePositionRecord(symbol, position.entryPrice, "WATCHDOG_EMERGENCY_CLOSE");
+              this.positions.delete(symbol);
+            } catch (closeErr) {
+              await this.logEvent("ERROR", symbol, `WATCHDOG close failed: ${this.errStr(closeErr)}`);
+            }
+          }
+          continue;
+        }
+
+        if (!monitorResult) continue;
+        const { holdTimeMinutes, minHoldMinutes, snapshot } = monitorResult;
+
+        const holdTimeMinutesOrig = holdTimeMinutes; // alias para compatibilidade
+        void holdTimeMinutesOrig; // evitar warning TS
 
         const pnlPercent = position.side === "BUY"
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
