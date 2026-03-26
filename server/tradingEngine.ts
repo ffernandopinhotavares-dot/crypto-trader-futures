@@ -29,6 +29,8 @@ export interface TradePosition {
   quantoMultiplier: number;
   highWaterMarkPct: number;
   trailingStopPct: number;
+  weakSignal?: boolean;
+  hybridTier?: "BALANCED_20_30" | "ATTACK_50_75";
 }
 
 export interface TradingEngineConfig {
@@ -40,6 +42,8 @@ export interface TradingEngineConfig {
   maxOpenPositions: number;    // kept for compatibility
   timeframe: string;           // analysis timeframe (default "15m")
   aggressiveness: "conservative" | "moderate" | "aggressive";
+  hybridMode?: "off" | "balanced";
+  maxLeverage?: number;
 }
 
 interface MarketSnapshot {
@@ -99,32 +103,97 @@ interface CloseTradeFallback {
   quantoMultiplier?: number;
 }
 
+interface HybridRiskFramework {
+  initialStopAbsPct: number;
+  breakEvenInPct: number;
+  breakEvenLockPct: number;
+  firstTargetInPct: number;
+  firstTargetOutPct: number;
+  secondTargetInPct: number;
+  secondTargetOutPct: number;
+  thirdTargetInPct: number;
+  thirdTargetOutPct: number;
+  finalTargetInPct: number;
+  finalTargetOutPct: number;
+}
+
+interface HybridLeveragePlan extends HybridRiskFramework {
+  leverage: number;
+  tier: "BALANCED_20_30" | "ATTACK_50_75";
+  baseValue: number;
+  reasoning: string[];
+}
+
 // ============================================================================
-// [FIX 20.0] Position Size Manager — Tamanho fixo de $10 por operação conforme configuração do usuário
-// Máximo de $10 USDT por trade, independente do tempo de inatividade
+// [FIX 19.1] Position Escalation Manager — Escalonamento Progressivo de Entrada
+// $20 → (60 min sem sinal) → $40 → (60 min sem sinal) → $80 → reset se fluxo normal
 // ============================================================================
 
 class PositionEscalationManager {
-  // [FIX 20.0] Tamanho fixo de $10 por operação — configuração do usuário (26/03/2026)
-  private readonly FIXED_TRADE_VALUE = 10.0;
+  private readonly BASE_VALUE = 20.0;
+  private readonly SECOND_VALUE = 40.0;
+  private readonly THIRD_VALUE = 80.0;
+  private readonly INACTIVITY_MINUTES = 60;
 
   private lastPositionOpenedAt: Date | null = null;
-  private currentStep: number = 0;
+  private currentStep: number = 0; // 0=base, 1=second, 2=third
 
   /**
-   * Retorna sempre $10 fixo por operação, conforme configuração do usuário.
-   * Máximo absoluto de $10 USDT por trade, independente de qualquer condição.
+   * Verifica se já passou o tempo mínimo sem nova posição.
+   */
+  private hasInactivityReached(now: Date): boolean {
+    if (!this.lastPositionOpenedAt) return false;
+    const elapsed = (now.getTime() - this.lastPositionOpenedAt.getTime()) / (1000 * 60);
+    return elapsed >= this.INACTIVITY_MINUTES;
+  }
+
+  /**
+   * Retorna o valor que deve ser usado na próxima entrada.
+   * Regras:
+   * - Se não passou 60 min sem nova posição → $20 (reset)
+   * - Se passou 60 min (step 0) → $40
+   * - Se passou 60 min novamente (step 1) → $80
+   * - Máximo: $80
    */
   getNextEntryValue(now?: Date): number {
-    return this.FIXED_TRADE_VALUE; // $10 fixo por trade — [FIX 20.0]
+    const currentTime = now || new Date();
+
+    // Primeira entrada ou sem histórico
+    if (!this.lastPositionOpenedAt) {
+      return this.BASE_VALUE;
+    }
+
+    const inactiveLongEnough = this.hasInactivityReached(currentTime);
+
+    // Se encontrou oportunidade antes de 60 min → reset para base
+    if (!inactiveLongEnough) {
+      this.currentStep = 0;
+      return this.BASE_VALUE;
+    }
+
+    // Passou 60 min sem posição → escala progressivamente
+    if (this.currentStep === 0) {
+      return this.SECOND_VALUE; // $40
+    } else {
+      return this.THIRD_VALUE;  // $80 (máximo)
+    }
   }
 
   /**
    * Confirma que uma posição foi aberta com sucesso.
+   * Atualiza o degrau atual do escalonamento.
    */
   confirmOpenedPosition(usedValue: number, openedAt?: Date): void {
     const now = openedAt || new Date();
-    this.currentStep = 0; // sempre step 0 com tamanho fixo
+
+    if (usedValue <= this.BASE_VALUE) {
+      this.currentStep = 0;
+    } else if (usedValue <= this.SECOND_VALUE) {
+      this.currentStep = 1;
+    } else {
+      this.currentStep = 2;
+    }
+
     this.lastPositionOpenedAt = now;
   }
 
@@ -160,7 +229,7 @@ export class TradingEngine {
   private initialBalance: number = 0;
   private highWaterMarkBalance: number = 0; // [FIX 13.0] Melhor baseline para drawdown
 
-  // [FIX 20.0] Position Size Manager — $10 fixo por operação
+  // [FIX 19.1] Escalation Manager — escalonamento progressivo $20 → $40 → $80
   private escalationManager: PositionEscalationManager = new PositionEscalationManager();
 
   // [CREDIT GUARD] Track consecutive AI 402/credit errors
@@ -184,9 +253,13 @@ export class TradingEngine {
 
   // Capital management
   private static readonly CAPITAL_RESERVE_PCT = 0.25; // [FIX 19.0] 25% reserve — máx 75% do capital total deployável
-  // [FIX 20.0] Tamanho fixo de $10 por operação — máximo absoluto por trade
+  // Análise HARD_STOP 25/03/2026: focar em menos posições de maior qualidade ($20 cada)
   // Reserva de 25% garante margem de segurança contra liquidação em cascata
   private static readonly MIN_VOLUME_24H = 1_000_000; // [FIX 17.0] $1M min volume (up from $500k) — anti-slippage: evita NAORIS_USDT-style -$16 losses por falta de liquidez no order book
+  private static readonly HYBRID_BASE_ENTRY_VALUE = 20;
+  private static readonly HYBRID_ATTACK_ENTRY_VALUE = 10;
+  private static readonly HYBRID_ELITE_VOLUME_24H = 75_000_000;
+  private static readonly HYBRID_ULTRA_VOLUME_24H = 150_000_000;
 
   // Win rate monitoring
   private static readonly WIN_RATE_ALERT_THRESHOLD = 40;
@@ -375,7 +448,9 @@ export class TradingEngine {
             confidence: 50,
             quantoMultiplier: qm,
             highWaterMarkPct: 0,
-            trailingStopPct: -(this.config.maxRiskPerTrade ?? 3),
+            weakSignal: false,
+            hybridTier: leverage >= 50 ? "ATTACK_50_75" : "BALANCED_20_30",
+            trailingStopPct: -this.getInitialPriceStopPct(leverage, false),
           });
 
           syncedCount++;
@@ -645,16 +720,11 @@ export class TradingEngine {
           break;
         }
 
-        // Cap leverage
-        decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
-
-        // Macro-adjusted leverage: reduce by 1x if sentiment is NEUTRAL (not RISK_ON)
-        if (this.macroContext?.marketSentiment === "NEUTRAL") {
-          decision.leverage = Math.max(1, decision.leverage - 1);
-        }
+        const hybridPlan = this.resolveHybridLeveragePlan(decision, snapshot);
+        decision.leverage = hybridPlan.leverage;
 
         try {
-          await this.executeDecision(decision);
+          await this.executeDecision(decision, snapshot);
           openedCount++;
           await this.sleep(TradingEngine.API_DELAY_MS * 2);
         } catch (error) {
@@ -662,25 +732,28 @@ export class TradingEngine {
         }
       }
 
-      const escInfo = this.escalationManager.getStatus();
       await this.logEvent("INFO", "SYSTEM",
-        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | Escalation: step=${escInfo.step} next=$${escInfo.nextValue}`);
+        `[SCAN] Opened ${openedCount} positions | Total: ${this.positions.size} | Hybrid active: balanced 20-30x / attack 50-75x`);
 
     } catch (error) {
       await this.logEvent("ERROR", "SYSTEM", `Scan error: ${this.errStr(error)}`);
     }
   }
 
-  // Confidence thresholds — OTIMIZADO PARA MAIS TRADES
+  // Confidence thresholds — híbrido exige sinais mais limpos, especialmente acima de 30x
   private getMinConfidence(): number {
-    return this.config.aggressiveness === "conservative" ? 80
-      : this.config.aggressiveness === "moderate" ? 75
-      : 70; // 70% permite mais oportunidades com alavancagem adaptativa
+    return this.config.aggressiveness === "conservative" ? 88
+      : this.config.aggressiveness === "moderate" ? 84
+      : 80;
   }
 
-  // Leverage limits — MAX 20x conforme solicitação do usuário (atualizado 26/03/2026)
+  // Leverage limits — híbrido 20-30x para setups bons e 50-75x apenas para setups elite
   private getMaxLeverage(): number {
-    return 20; // Limite máximo fixo em 20x — operando com $10 fixo por trade
+    const configured = this.config.maxLeverage;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured >= 1) {
+      return Math.max(1, Math.min(75, Math.floor(configured)));
+    }
+    return 75;
   }
 
   private getConfiguredMaxOpenPositions(): number {
@@ -691,6 +764,211 @@ export class TradingEngine {
 
   private hasReachedOpenPositionLimit(): boolean {
     return this.positions.size >= this.getConfiguredMaxOpenPositions();
+  }
+
+  private roundPct(value: number): number {
+    return Math.round(value * 100) / 100;
+  }
+
+  private getInitialPriceStopPct(leverage: number, weakSignal: boolean = false): number {
+    if (leverage < 20) {
+      return weakSignal ? 1.5 : 2.0;
+    }
+
+    const rawStop = Math.max(0.18, Math.min(0.85, 15 / Math.max(1, leverage)));
+    const adjusted = weakSignal ? rawStop * 0.85 : rawStop;
+    return this.roundPct(adjusted);
+  }
+
+  private getHybridRiskFramework(
+    leverage: number,
+    side: "BUY" | "SELL",
+    weakSignal: boolean = false,
+  ): HybridRiskFramework {
+    if (leverage < 20) {
+      const isSell = side === "SELL";
+      return {
+        initialStopAbsPct: weakSignal ? 1.5 : 2.0,
+        breakEvenInPct: isSell ? 2.0 : 1.5,
+        breakEvenLockPct: 0.1,
+        firstTargetInPct: isSell ? 4.0 : 3.0,
+        firstTargetOutPct: isSell ? 2.0 : 1.5,
+        secondTargetInPct: isSell ? 5.5 : 4.5,
+        secondTargetOutPct: isSell ? 3.5 : 3.0,
+        thirdTargetInPct: 7.0,
+        thirdTargetOutPct: 5.0,
+        finalTargetInPct: 12.0,
+        finalTargetOutPct: 9.0,
+      };
+    }
+
+    const stopAbs = this.getInitialPriceStopPct(leverage, weakSignal);
+    const sideFactor = side === "SELL" ? 1.1 : 1.0;
+    const breakEvenLockPct = Math.max(0.04, stopAbs * 0.15);
+
+    return {
+      initialStopAbsPct: stopAbs,
+      breakEvenInPct: this.roundPct(stopAbs * 1.0 * sideFactor),
+      breakEvenLockPct: this.roundPct(breakEvenLockPct),
+      firstTargetInPct: this.roundPct(stopAbs * 1.7 * sideFactor),
+      firstTargetOutPct: this.roundPct(stopAbs * 0.8 * sideFactor),
+      secondTargetInPct: this.roundPct(stopAbs * 2.7 * sideFactor),
+      secondTargetOutPct: this.roundPct(stopAbs * 1.6 * sideFactor),
+      thirdTargetInPct: this.roundPct(stopAbs * 4.2 * sideFactor),
+      thirdTargetOutPct: this.roundPct(stopAbs * 2.8 * sideFactor),
+      finalTargetInPct: this.roundPct(stopAbs * 6.0 * sideFactor),
+      finalTargetOutPct: this.roundPct(stopAbs * 4.2 * sideFactor),
+    };
+  }
+
+  private isMacroAlignedWithDecision(action: AIDecision["action"], snapshot: MarketSnapshot): boolean {
+    const sentiment = this.macroContext?.marketSentiment;
+    if (!sentiment || sentiment === "NEUTRAL") return true;
+
+    if (action === "OPEN_LONG") {
+      return sentiment === "RISK_ON" && snapshot.trend !== "BEARISH";
+    }
+
+    if (action === "OPEN_SHORT") {
+      return sentiment === "RISK_OFF" && snapshot.trend !== "BULLISH";
+    }
+
+    return true;
+  }
+
+  private isDirectionAlignedWithStructure(action: AIDecision["action"], snapshot: MarketSnapshot): boolean {
+    if (action === "OPEN_LONG") {
+      return snapshot.price >= snapshot.ema20
+        && snapshot.ema20 >= snapshot.ema50
+        && snapshot.macd.bullish
+        && snapshot.rsi >= 50;
+    }
+
+    if (action === "OPEN_SHORT") {
+      return snapshot.price <= snapshot.ema20
+        && snapshot.ema20 <= snapshot.ema50
+        && !snapshot.macd.bullish
+        && snapshot.rsi <= 50;
+    }
+
+    return false;
+  }
+
+  private isLiquidityAttackCandidate(snapshot: MarketSnapshot): boolean {
+    return snapshot.regime === "TRENDING"
+      && snapshot.volume24h >= TradingEngine.HYBRID_ELITE_VOLUME_24H
+      && snapshot.volatility.volatility <= 1.2;
+  }
+
+  private getContractMaxLeverage(contractInfo?: any): number {
+    const candidates = [
+      contractInfo?.leverage_max,
+      contractInfo?.max_leverage,
+      contractInfo?.maxLeverage,
+      contractInfo?.leverageMax,
+    ];
+
+    for (const candidate of candidates) {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return Math.max(1, Math.floor(parsed));
+      }
+    }
+
+    return this.getMaxLeverage();
+  }
+
+  private resolveHybridLeveragePlan(
+    decision: AIDecision,
+    snapshot: MarketSnapshot,
+    contractInfo?: any,
+  ): HybridLeveragePlan {
+    const side = decision.action === "OPEN_SHORT" ? "SELL" : "BUY";
+    const weakSignal = Boolean(decision.weak_signal);
+    const structureAligned = this.isDirectionAlignedWithStructure(decision.action, snapshot);
+    const macroAligned = this.isMacroAlignedWithDecision(decision.action, snapshot);
+    const adxDirectional = decision.action === "OPEN_LONG" ? snapshot.adx.bullish : snapshot.adx.bearish;
+    const adxStrong = snapshot.adx.adx >= 25 && adxDirectional;
+    const adxModerate = snapshot.adx.adx >= 18 && adxDirectional;
+    const volumeConfirmed = snapshot.volumeAnalysis.volumeRatio >= 1.1;
+    const premiumVolume = snapshot.volumeAnalysis.volumeRatio >= 1.35;
+    const notExhausted = decision.action === "OPEN_LONG"
+      ? snapshot.change24h < 10
+      : snapshot.change24h > -10;
+    const acceptableVolatility = snapshot.volatility.volatility <= 1.6;
+    const ultraCleanVolatility = snapshot.volatility.volatility <= 0.9;
+    const ultraLiquidity = snapshot.volume24h >= TradingEngine.HYBRID_ULTRA_VOLUME_24H;
+
+    const eliteSetup = !weakSignal
+      && decision.confidence >= 92
+      && structureAligned
+      && macroAligned
+      && adxStrong
+      && premiumVolume
+      && acceptableVolatility
+      && notExhausted
+      && this.isLiquidityAttackCandidate(snapshot);
+
+    let leverage = 20;
+    let tier: HybridLeveragePlan["tier"] = "BALANCED_20_30";
+    const reasoning: string[] = [];
+
+    if (eliteSetup) {
+      tier = "ATTACK_50_75";
+      if (decision.confidence >= 97 && ultraCleanVolatility && ultraLiquidity && snapshot.volumeAnalysis.volumeRatio >= 1.6) {
+        leverage = 75;
+      } else if (decision.confidence >= 95 && snapshot.volume24h >= TradingEngine.HYBRID_ELITE_VOLUME_24H) {
+        leverage = 60;
+      } else {
+        leverage = 50;
+      }
+      reasoning.push("setup elite");
+    } else {
+      if (decision.confidence >= 89 && structureAligned && adxModerate && volumeConfirmed && macroAligned) {
+        leverage = 30;
+      } else if (decision.confidence >= 84 && structureAligned && (adxModerate || volumeConfirmed)) {
+        leverage = 25;
+      }
+      reasoning.push("setup balanceado");
+    }
+
+    if (!structureAligned) {
+      leverage = 20;
+      tier = "BALANCED_20_30";
+      reasoning.push("estrutura parcial");
+    }
+
+    if (!macroAligned) {
+      leverage = Math.min(leverage, 20);
+      tier = "BALANCED_20_30";
+      reasoning.push("macro não alinhado");
+    }
+
+    if (snapshot.regime === "VOLATILE") {
+      leverage = Math.min(leverage, tier === "ATTACK_50_75" ? 50 : 20);
+      reasoning.push("regime volátil");
+    }
+
+    if (weakSignal) {
+      leverage = Math.min(leverage, 25);
+      tier = "BALANCED_20_30";
+      reasoning.push("sinal fraco");
+    }
+
+    const contractCap = Math.min(this.getMaxLeverage(), this.getContractMaxLeverage(contractInfo));
+    leverage = Math.max(1, Math.min(leverage, contractCap));
+
+    const baseValue = tier === "ATTACK_50_75"
+      ? TradingEngine.HYBRID_ATTACK_ENTRY_VALUE
+      : TradingEngine.HYBRID_BASE_ENTRY_VALUE;
+
+    return {
+      leverage,
+      tier,
+      baseValue,
+      reasoning,
+      ...this.getHybridRiskFramework(leverage, side, weakSignal),
+    };
   }
 
   private isDecisionStructurallyValid(decision: AIDecision, snapshot: MarketSnapshot): boolean {
@@ -844,42 +1122,30 @@ export class TradingEngine {
           ? ((snapshot.price - position.entryPrice) / position.entryPrice) * 100
           : ((position.entryPrice - snapshot.price) / position.entryPrice) * 100;
 
-        // Update trailing stop high-water mark (OTIMIZADO PARA R:R ≥ 1.5x)
-        // [FIX 16.0] Trailing stop redesenhado para garantir ratio R:R mínimo de 1.5x
-        // Diagnóstico 24/03/2026: avg_win=+$0.65 vs avg_loss=-$0.88 → R:R=0.74 (precisa ser ≥1.5)
-        // Causa raiz: trailing stop ativava muito cedo, cortando ganhos antes de atingir 1.5x o risco
-        // Hard stop: leverage>8 → -2.0%, leverage<=8 → -3.0%
-        // Para R:R=1.5x: leverage>8 → TP alvo = +3.0%, leverage<=8 → TP alvo = +4.5%
-        // Nova lógica:
-        //   +1.5% → breakeven (+0.1%) — só protege capital, não corta lucro ainda
-        //   +3.0% → stop move para +1.5% (garante R:R=1.5x para leverage>8)
-        //   +4.5% → stop move para +3.0% (garante R:R=1.5x para leverage<=8)
-        //   +7.0% → stop move para +5.0%
-        //   +12.0% → stop move para +9.0%
-        //   The floor never moves down
+        const riskFramework = this.getHybridRiskFramework(
+          position.leverage,
+          position.side,
+          Boolean(position.weakSignal),
+        );
+
+        // Trailing stop híbrido:
+        // - <20x: preserva a lógica ampla anterior
+        // - 20-30x: trabalha com stop em variação de preço ~0.50%-0.85%
+        // - 50-75x: trabalha com stop em variação de preço ~0.18%-0.30%
         if (pnlPercent > position.highWaterMarkPct) {
           position.highWaterMarkPct = pnlPercent;
-          // [FIX 17.0] Trailing stop diferenciado por side:
-          // SELL (SHORT): breakeven em +2.0% (vs +1.5% para BUY) — dados mostram que shorts fecham cedo
-          // demais com medo de repiques. Avg win SHORT = $0.34 (75% dos wins < 1.0%). Dar mais espaço.
-          const isSell = position.side === "SELL";
-          const breakevenLevel = isSell ? 2.0 : 1.5;   // SHORT: +2.0% | LONG: +1.5%
-          const firstTargetIn = isSell ? 4.0 : 3.0;    // SHORT: +4.0% | LONG: +3.0%
-          const firstTargetOut = isSell ? 2.0 : 1.5;   // SHORT: stop → +2.0% | LONG: +1.5%
-          const secondTargetIn = isSell ? 5.5 : 4.5;   // SHORT: +5.5% | LONG: +4.5%
-          const secondTargetOut = isSell ? 3.5 : 3.0;  // SHORT: stop → +3.5% | LONG: +3.0%
-          if (pnlPercent >= 12.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 9.0);
-          } else if (pnlPercent >= 7.0) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 5.0);
-          } else if (pnlPercent >= secondTargetIn) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, secondTargetOut);
-          } else if (pnlPercent >= firstTargetIn) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, firstTargetOut);
-          } else if (pnlPercent >= breakevenLevel) {
-            position.trailingStopPct = Math.max(position.trailingStopPct, 0.1); // Breakeven + taxas
+
+          if (pnlPercent >= riskFramework.finalTargetInPct) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, riskFramework.finalTargetOutPct);
+          } else if (pnlPercent >= riskFramework.thirdTargetInPct) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, riskFramework.thirdTargetOutPct);
+          } else if (pnlPercent >= riskFramework.secondTargetInPct) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, riskFramework.secondTargetOutPct);
+          } else if (pnlPercent >= riskFramework.firstTargetInPct) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, riskFramework.firstTargetOutPct);
+          } else if (pnlPercent >= riskFramework.breakEvenInPct) {
+            position.trailingStopPct = Math.max(position.trailingStopPct, riskFramework.breakEvenLockPct);
           }
-          // Abaixo do breakevenLevel: não mover stop — deixar o HARD_STOP inicial atuar
         }
 
         // Hard stop-loss / trailing stop — ALWAYS enforced, bypasses cooldown
@@ -892,11 +1158,14 @@ export class TradingEngine {
           continue;
         }
 
-        // Max hold time protection — close positions held too long with small P&L
-        // [FIX 17.0] Mantido 120min mas threshold P&L reduzido de 0.5% para 0.3%
-        // Motivo: TIME_STOP com WR=50% e avg -$0.016 — neutro, mas libera capital para trades melhores
-        // Trades de 1-2h com P&L < 0.3% estão estagnados — fechar e realocar
-        if (holdTimeMinutes > 120 && Math.abs(pnlPercent) < 0.3) {
+        // Time-stop híbrido:
+        // - alta alavancagem deve resolver rápido; se ficar parada, libera capital
+        const stagnationMinutes = position.leverage >= 50 ? 40 : 90;
+        const stagnationThreshold = position.leverage >= 50
+          ? Math.max(0.08, riskFramework.breakEvenInPct * 0.45)
+          : Math.max(0.15, riskFramework.breakEvenInPct * 0.40);
+
+        if (holdTimeMinutes > stagnationMinutes && Math.abs(pnlPercent) < stagnationThreshold) {
           const reason = `[TIME_STOP] Held ${holdTimeMinutes.toFixed(0)}m with only ${pnlPercent.toFixed(2)}% P&L — freeing capital`;
           await this.logEvent("INFO", symbol, reason);
           await this.closePosition(symbol, snapshot.price, reason);
@@ -1010,8 +1279,8 @@ export class TradingEngine {
 
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
-    const currentEntryValue = this.escalationManager.getNextEntryValue();
-    const maxNewPositions = Math.max(0, Math.floor(deployableBalance / currentEntryValue)); // [FIX 20.0] Tamanho fixo: $10 por trade
+    const currentEntryValue = TradingEngine.HYBRID_BASE_ENTRY_VALUE;
+    const maxNewPositions = Math.max(0, Math.floor(deployableBalance / currentEntryValue)); // [FIX 19.1] Escalonamento: $20/$40/$80 por trade
 
     // Macro context for AI
     const macroInfo = this.macroContext
@@ -1026,7 +1295,7 @@ FILOSOFIA:
 - QUALIDADE COM FREQUÊNCIA: Selecione os 1-3 melhores setups. Não exija perfeição — exija boa confluência (3+ indicadores).
 - CONFLUÊNCIA OBRIGATÓRIA: Mínimo 3 indicadores alinhados para abrir posição. [FIX 19.2] era 4, relaxado para 3.
 - RESPEITE A TENDÊNCIA: NUNCA opere contra a tendência dominante sem divergência MACD confirmada.
-- ALAVANCAGEM ADAPTATIVA: Use alavancagem máxima permitida apenas quando houver rompimento claro com alto volume.
+- ALAVANCAGEM HÍBRIDA: Use 20x/25x/30x para setups bons. Use 50x/60x/75x SOMENTE em setups elite com ADX forte, EMA alinhada, volume acima da média e macro alinhado.
 - RESPEITE O MACRO: Se BTC está bearish, priorize SHORTS. Se bullish, priorize LONGS.
 - USE ADX COMO FILTRO DE REGIME: ADX >= 25 indica tendência forte; evite reversão contra tendência forte.
 - NÃO use restrição rígida por horário. Julgue apenas a estrutura do setup.
@@ -1101,7 +1370,7 @@ FILTROS DE REJEIÇÃO (NÃO abra posição se): [FIX 19.2] Relaxados para permit
 EXCHANGE: Gate.io Futures (USDT-M) — Símbolos: BTC_USDT, ETH_USDT
 
 PERFIL: ${this.config.aggressiveness}
-- Alavancagem: 1-${maxLev}x (use MENOR alavancagem para menor confiança)
+- Alavancagem híbrida: 20/25/30x para setups bons; 50/60/75x só para setups elite. O engine pode reduzir se o contrato suportar menos.
 - Confiança mínima: ${minConf}%
 
 CAPITAL:
@@ -1115,7 +1384,8 @@ REGRAS:
 - NUNCA repita símbolo
 - Se nenhum trade é EXCEPCIONAL, retorne [] (prefira 0 trades a trades mediocres)
 - Na dúvida, NÃO opere (retorne [])
-- Alavancagem deve ser proporcional à confiança: 75-80% → ${Math.max(1, maxLev-2)}x, 80-90% → ${Math.max(1, maxLev-1)}x, 90%+ → ${maxLev}x
+- A alavancagem é apenas uma sugestão inicial. Prefira 20/25/30 em setups bons. Só use 50/60/75 se o setup for elite.
+- O engine normalizará a alavancagem final de forma determinística.
 - Se o sinal é fraco (conflito parcial de tendência), adicione "weak_signal":true
 
 Responda APENAS com JSON array:
@@ -1155,6 +1425,12 @@ Responda APENAS com JSON array:
     pnlPercent: number
   ): Promise<AIDecision> {
     const holdTime = (Date.now() - position.entryTime.getTime()) / (1000 * 60);
+    const riskFramework = this.getHybridRiskFramework(
+      position.leverage,
+      position.side,
+      Boolean(position.weakSignal),
+    );
+    const noiseBand = Math.max(0.10, riskFramework.breakEvenInPct * 0.80);
 
     const prompt = `Posição aberta:
 - Symbol: ${position.symbol}
@@ -1164,7 +1440,7 @@ Responda APENAS com JSON array:
 - P&L: ${pnlPercent.toFixed(2)}%
 - Leverage: ${position.leverage}x
 - Tempo: ${holdTime.toFixed(0)} min
-- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo mínimo R:R 1.5x: +3.0%
+- Trailing stop: ${position.trailingStopPct.toFixed(2)}% (HWM: ${position.highWaterMarkPct.toFixed(2)}%) | Alvo mínimo R:R 1.5x: +${riskFramework.firstTargetInPct.toFixed(2)}%
 
 Indicadores:
 - RSI: ${snapshot.rsi.toFixed(1)}
@@ -1182,12 +1458,12 @@ CONTEXTO MACRO: BTC ${this.macroContext?.btcTrend ?? "N/A"} | Sentimento: ${this
 
 REGRAS (siga rigorosamente):
 
-1. ZONA DE RUÍDO (|P&L| < 1%):
+1. ZONA DE RUÍDO (|P&L| < ${noiseBand.toFixed(2)}%):
    - NÃO feche por ruído. Dê espaço para o trade respirar.
    
-2. POSIÇÃO LUCRATIVA (P&L > +1.5%):
+2. POSIÇÃO LUCRATIVA (P&L > +${riskFramework.breakEvenInPct.toFixed(2)}%):
    - HOLD absoluto se a tendência continuar a seu favor (RSI subindo para LONGs, caindo para SHORTs).
-   - OBJETIVO R:R ≥1.5x: alvo mínimo +3.0% antes de considerar fechamento discricionário.
+   - OBJETIVO R:R ≥1.5x: alvo mínimo +${riskFramework.firstTargetInPct.toFixed(2)}% antes de considerar fechamento discricionário.
    - NÃO feche antes de atingir o alvo mínimo de R:R, a menos que haja PICO CLIMÁTICO (volume explosivo + RSI > 85 ou < 15).
    - O trailing stop do sistema já protege os lucros após atingir o alvo. SUA MISSÃO: deixar o trade correr até o alvo.
    
@@ -1417,36 +1693,42 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
   // Trade Execution
   // --------------------------------------------------------------------------
 
-  private async executeDecision(decision: AIDecision): Promise<void> {
+  private async executeDecision(decision: AIDecision, snapshot?: MarketSnapshot): Promise<void> {
     const side: "BUY" | "SELL" = decision.action === "OPEN_LONG" ? "BUY" : "SELL";
 
-    decision.leverage = Math.min(decision.leverage, this.getMaxLeverage());
-
     try {
+      const executionSnapshot = snapshot ?? await this.getMarketSnapshot(decision.symbol);
+      if (!executionSnapshot) {
+        await this.logEvent("INFO", decision.symbol, `[HYBRID] Snapshot unavailable at execution. Trade skipped.`);
+        return;
+      }
+
       const balance = await this.config.gateioClient.getBalance();
       const totalBalance = parseFloat(balance.totalBalance);
       const available = parseFloat(balance.availableBalance);
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // [FIX 20.0] Tamanho fixo de $10 por operação — máximo absoluto por trade
-      const targetSize = this.escalationManager.getNextEntryValue();
-      const baseValue = Math.min(deployable, targetSize);
-      const notionalValue = baseValue * decision.leverage;
-
       const ticker = await this.config.gateioClient.getTicker(decision.symbol);
       const currentPrice = parseFloat(ticker.lastPrice);
       if (currentPrice <= 0) return;
 
       const contractInfo = await this.getCachedContractInfo(decision.symbol);
+      const hybridPlan = this.resolveHybridLeveragePlan(decision, executionSnapshot, contractInfo);
+      decision.leverage = hybridPlan.leverage;
+
+      const baseValue = Math.min(deployable, hybridPlan.baseValue);
+      if (baseValue < 2.0) return;
+
+      const notionalValue = baseValue * decision.leverage;
       const quantoMultiplier = parseFloat(contractInfo.quantoMultiplier || contractInfo.quanto_multiplier || "0.001");
       const contractValue = currentPrice * quantoMultiplier;
       const rawContracts = notionalValue / contractValue;
       const contracts = Math.floor(rawContracts);
       if (contracts <= 0) return;
 
-      // Margin mode
-      const targetMarginMode = totalBalance >= TradingEngine.ISOLATED_MARGIN_THRESHOLD
+      // Margin mode: qualquer coisa >=20x fica em isolated para limitar blast radius
+      const targetMarginMode = decision.leverage >= 20 || totalBalance >= TradingEngine.ISOLATED_MARGIN_THRESHOLD
         ? TradingEngine.ISOLATED_MARGIN_MODE
         : TradingEngine.CROSS_MARGIN_MODE;
       try {
@@ -1459,21 +1741,18 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         console.log(`Margin mode note for ${decision.symbol}:`, this.errStr(e));
       }
 
-      // Set leverage
       try {
         await this.config.gateioClient.setLeverage(decision.symbol, decision.leverage);
       } catch (e) {
         console.log(`Leverage note for ${decision.symbol}:`, this.errStr(e));
       }
 
-      // Place market order
       const order = await this.config.gateioClient.placeOrder({
         symbol: decision.symbol,
         side,
         size: contracts,
       });
 
-      // Record position in memory
       this.positions.set(decision.symbol, {
         symbol: decision.symbol,
         side,
@@ -1484,14 +1763,11 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         confidence: decision.confidence,
         quantoMultiplier,
         highWaterMarkPct: 0,
-        // [FIX 19.0] Stop-loss dinâmico baseado na qualidade do sinal
-        // Sinal fraco (weak_signal=true): SL=-1.5% — mitiga risco de operações especulativas
-        // Sinal forte: leverage>8 → SL=-1.5% | leverage<=8 → SL=-2.0%
-        // Análise HARD_STOP 25/03/2026: 70% dos trades nunca foram favoráveis (HWM=0%)
-        trailingStopPct: decision.weak_signal ? -1.5 : -2.0,
+        weakSignal: Boolean(decision.weak_signal),
+        hybridTier: hybridPlan.tier,
+        trailingStopPct: -hybridPlan.initialStopAbsPct,
       });
 
-      // Record trade in DB
       await this.db.insert(trades).values({
         id: nanoid(),
         userId: this.config.userId,
@@ -1505,20 +1781,23 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         takeProfit: "0",
         status: "OPEN",
         rsiAtEntry: String(decision.confidence),
-        macdAtEntry: JSON.stringify({ leverage: decision.leverage }),
+        macdAtEntry: JSON.stringify({
+          leverage: decision.leverage,
+          hybridTier: hybridPlan.tier,
+          entryValue: baseValue,
+          stopPriceMovePct: hybridPlan.initialStopAbsPct,
+        }),
         bbAtEntry: JSON.stringify({ reasoning: decision.reasoning }),
         bybitOrderId: order.orderId,
       });
 
-      // [FIX 20.0] Confirmar abertura no position size manager
-      this.escalationManager.confirmOpenedPosition(targetSize);
+      // Mantemos a confirmação apenas para evitar dependências colaterais em outros fluxos.
+      this.escalationManager.confirmOpenedPosition(baseValue);
 
-      const appliedSL = decision.weak_signal ? -1.5 : -2.0;
-      const escStatus = this.escalationManager.getStatus();
       await this.logEvent(
         "POSITION_OPENED",
         decision.symbol,
-        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} (step:${escStatus.step}) | SL:${appliedSL}%${decision.weak_signal ? ' [WEAK]' : ''} | ${decision.reasoning}`
+        `${side} ${contracts}ct @ ${currentPrice} | Lev:${decision.leverage}x | Conf:${decision.confidence}% | Base:$${baseValue.toFixed(2)} | Tier:${hybridPlan.tier} | SL:${hybridPlan.initialStopAbsPct}%${decision.weak_signal ? " [WEAK]" : ""} | T1:${hybridPlan.firstTargetInPct}% | ${hybridPlan.reasoning.join(" / ")} | ${decision.reasoning}`
       );
     } catch (error) {
       await this.logEvent("ERROR", decision.symbol, `Execute error: ${this.errStr(error)}`);
