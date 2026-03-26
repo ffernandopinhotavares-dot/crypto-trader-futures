@@ -1,6 +1,6 @@
 /**
  * Technical Indicators for Trading
- * Implements RSI, MACD, Bollinger Bands, EMA, and Volume analysis
+ * Implements RSI, MACD, Bollinger Bands, EMA, ADX, and Volume analysis
  */
 
 // ============================================================================
@@ -23,7 +23,7 @@ export function calculateRSI(
     );
   }
 
-  const changes = [];
+  const changes: number[] = [];
   for (let i = 1; i < prices.length; i++) {
     changes.push(prices[i] - prices[i - 1]);
   }
@@ -52,8 +52,17 @@ export function calculateRSI(
     }
   }
 
-  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-  const rsi = 100 - 100 / (1 + rs);
+  let rsi: number;
+  if (avgLoss === 0 && avgGain === 0) {
+    rsi = 50;
+  } else if (avgLoss === 0) {
+    rsi = 100;
+  } else if (avgGain === 0) {
+    rsi = 0;
+  } else {
+    const rs = avgGain / avgLoss;
+    rsi = 100 - 100 / (1 + rs);
+  }
 
   return {
     rsi: Math.round(rsi * 100) / 100,
@@ -75,18 +84,17 @@ export interface MACDResult {
 }
 
 function calculateEMA(prices: number[], period: number): number[] {
+  if (prices.length === 0) return [];
+
   const ema: number[] = [];
+  const seedPeriod = Math.max(1, Math.min(period, prices.length));
   const multiplier = 2 / (period + 1);
 
-  // First EMA is SMA
-  let sum = 0;
-  for (let i = 0; i < period; i++) {
-    sum += prices[i];
-  }
-  ema[period - 1] = sum / period;
+  // Seed EMA with available SMA to avoid NaN on short arrays
+  const seed = prices.slice(0, seedPeriod).reduce((sum, price) => sum + price, 0) / seedPeriod;
+  ema[seedPeriod - 1] = seed;
 
-  // Calculate rest of EMA
-  for (let i = period; i < prices.length; i++) {
+  for (let i = seedPeriod; i < prices.length; i++) {
     ema[i] = prices[i] * multiplier + ema[i - 1] * (1 - multiplier);
   }
 
@@ -197,6 +205,119 @@ export function calculateEMAValue(
   return Math.round(ema[ema.length - 1] * 100) / 100;
 }
 
+
+// ============================================================================
+// ADX (Average Directional Index)
+// ============================================================================
+
+export interface ADXResult {
+  adx: number;
+  plusDI: number;
+  minusDI: number;
+  trendStrength: "WEAK" | "MODERATE" | "STRONG";
+  bullish: boolean;
+  bearish: boolean;
+}
+
+export function calculateADX(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period: number = 14
+): ADXResult {
+  if (highs.length !== lows.length || lows.length !== closes.length) {
+    throw new Error("High, low and close arrays must have the same length.");
+  }
+
+  if (closes.length < period + 1) {
+    throw new Error(
+      `Not enough data for ADX calculation. Need at least ${period + 1} candles.`
+    );
+  }
+
+  const trueRanges: number[] = [];
+  const plusDMs: number[] = [];
+  const minusDMs: number[] = [];
+
+  for (let i = 1; i < closes.length; i++) {
+    const upMove = highs[i] - highs[i - 1];
+    const downMove = lows[i - 1] - lows[i];
+
+    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+
+    const range1 = highs[i] - lows[i];
+    const range2 = Math.abs(highs[i] - closes[i - 1]);
+    const range3 = Math.abs(lows[i] - closes[i - 1]);
+    trueRanges.push(Math.max(range1, range2, range3));
+  }
+
+  const smooth = (values: number[]): number[] => {
+    const output: number[] = [];
+    let rolling = values.slice(0, period).reduce((sum, value) => sum + value, 0);
+    output[period - 1] = rolling;
+
+    for (let i = period; i < values.length; i++) {
+      rolling = rolling - rolling / period + values[i];
+      output[i] = rolling;
+    }
+
+    return output;
+  };
+
+  const smoothedTR = smooth(trueRanges);
+  const smoothedPlusDM = smooth(plusDMs);
+  const smoothedMinusDM = smooth(minusDMs);
+
+  const dxValues: number[] = [];
+  for (let i = period - 1; i < trueRanges.length; i++) {
+    const tr = smoothedTR[i];
+    const plusDI = tr > 0 ? (smoothedPlusDM[i] / tr) * 100 : 0;
+    const minusDI = tr > 0 ? (smoothedMinusDM[i] / tr) * 100 : 0;
+    const sum = plusDI + minusDI;
+    const dx = sum === 0 ? 0 : (Math.abs(plusDI - minusDI) / sum) * 100;
+    dxValues.push(dx);
+  }
+
+  if (dxValues.length === 0) {
+    return {
+      adx: 0,
+      plusDI: 0,
+      minusDI: 0,
+      trendStrength: "WEAK",
+      bullish: false,
+      bearish: false,
+    };
+  }
+
+  const adxPeriod = Math.min(period, dxValues.length);
+  let adx = dxValues.slice(0, adxPeriod).reduce((sum, value) => sum + value, 0) / adxPeriod;
+  for (let i = adxPeriod; i < dxValues.length; i++) {
+    adx = ((adx * (period - 1)) + dxValues[i]) / period;
+  }
+
+  const lastSmoothedIndex = trueRanges.length - 1;
+  const lastTR = smoothedTR[lastSmoothedIndex];
+  const plusDI = lastTR > 0 ? (smoothedPlusDM[lastSmoothedIndex] / lastTR) * 100 : 0;
+  const minusDI = lastTR > 0 ? (smoothedMinusDM[lastSmoothedIndex] / lastTR) * 100 : 0;
+
+  let trendStrength: ADXResult["trendStrength"] = "WEAK";
+  if (adx >= 25) {
+    trendStrength = "STRONG";
+  } else if (adx >= 18) {
+    trendStrength = "MODERATE";
+  }
+
+  return {
+    adx: Math.round(adx * 100) / 100,
+    plusDI: Math.round(plusDI * 100) / 100,
+    minusDI: Math.round(minusDI * 100) / 100,
+    trendStrength,
+    bullish: plusDI > minusDI,
+    bearish: minusDI > plusDI,
+  };
+}
+
 // ============================================================================
 // Volume Analysis
 // ============================================================================
@@ -221,7 +342,7 @@ export function analyzeVolume(
   const lastVolumes = volumes.slice(-period);
   const volumeMA = lastVolumes.reduce((a, b) => a + b, 0) / period;
   const currentVolume = volumes[volumes.length - 1];
-  const volumeRatio = currentVolume / volumeMA;
+  const volumeRatio = volumeMA > 0 ? currentVolume / volumeMA : 1;
 
   return {
     volumeMA: Math.round(volumeMA * 100) / 100,
