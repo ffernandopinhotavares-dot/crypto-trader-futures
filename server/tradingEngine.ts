@@ -100,75 +100,31 @@ interface CloseTradeFallback {
 }
 
 // ============================================================================
-// [FIX 19.1] Position Escalation Manager — Escalonamento Progressivo de Entrada
-// $20 → (60 min sem sinal) → $40 → (60 min sem sinal) → $80 → reset se fluxo normal
+// [FIX 20.0] Position Size Manager — Tamanho fixo de $10 por operação conforme configuração do usuário
+// Máximo de $10 USDT por trade, independente do tempo de inatividade
 // ============================================================================
 
 class PositionEscalationManager {
-  private readonly BASE_VALUE = 20.0;
-  private readonly SECOND_VALUE = 40.0;
-  private readonly THIRD_VALUE = 80.0;
-  private readonly INACTIVITY_MINUTES = 60;
+  // [FIX 20.0] Tamanho fixo de $10 por operação — configuração do usuário (26/03/2026)
+  private readonly FIXED_TRADE_VALUE = 10.0;
 
   private lastPositionOpenedAt: Date | null = null;
-  private currentStep: number = 0; // 0=base, 1=second, 2=third
+  private currentStep: number = 0;
 
   /**
-   * Verifica se já passou o tempo mínimo sem nova posição.
-   */
-  private hasInactivityReached(now: Date): boolean {
-    if (!this.lastPositionOpenedAt) return false;
-    const elapsed = (now.getTime() - this.lastPositionOpenedAt.getTime()) / (1000 * 60);
-    return elapsed >= this.INACTIVITY_MINUTES;
-  }
-
-  /**
-   * Retorna o valor que deve ser usado na próxima entrada.
-   * Regras:
-   * - Se não passou 60 min sem nova posição → $20 (reset)
-   * - Se passou 60 min (step 0) → $40
-   * - Se passou 60 min novamente (step 1) → $80
-   * - Máximo: $80
+   * Retorna sempre $10 fixo por operação, conforme configuração do usuário.
+   * Máximo absoluto de $10 USDT por trade, independente de qualquer condição.
    */
   getNextEntryValue(now?: Date): number {
-    const currentTime = now || new Date();
-
-    // Primeira entrada ou sem histórico
-    if (!this.lastPositionOpenedAt) {
-      return this.BASE_VALUE;
-    }
-
-    const inactiveLongEnough = this.hasInactivityReached(currentTime);
-
-    // Se encontrou oportunidade antes de 60 min → reset para base
-    if (!inactiveLongEnough) {
-      this.currentStep = 0;
-      return this.BASE_VALUE;
-    }
-
-    // Passou 60 min sem posição → escala progressivamente
-    if (this.currentStep === 0) {
-      return this.SECOND_VALUE; // $40
-    } else {
-      return this.THIRD_VALUE;  // $80 (máximo)
-    }
+    return this.FIXED_TRADE_VALUE; // $10 fixo por trade — [FIX 20.0]
   }
 
   /**
    * Confirma que uma posição foi aberta com sucesso.
-   * Atualiza o degrau atual do escalonamento.
    */
   confirmOpenedPosition(usedValue: number, openedAt?: Date): void {
     const now = openedAt || new Date();
-
-    if (usedValue <= this.BASE_VALUE) {
-      this.currentStep = 0;
-    } else if (usedValue <= this.SECOND_VALUE) {
-      this.currentStep = 1;
-    } else {
-      this.currentStep = 2;
-    }
-
+    this.currentStep = 0; // sempre step 0 com tamanho fixo
     this.lastPositionOpenedAt = now;
   }
 
@@ -204,7 +160,7 @@ export class TradingEngine {
   private initialBalance: number = 0;
   private highWaterMarkBalance: number = 0; // [FIX 13.0] Melhor baseline para drawdown
 
-  // [FIX 19.1] Escalation Manager — escalonamento progressivo $20 → $40 → $80
+  // [FIX 20.0] Position Size Manager — $10 fixo por operação
   private escalationManager: PositionEscalationManager = new PositionEscalationManager();
 
   // [CREDIT GUARD] Track consecutive AI 402/credit errors
@@ -228,7 +184,7 @@ export class TradingEngine {
 
   // Capital management
   private static readonly CAPITAL_RESERVE_PCT = 0.25; // [FIX 19.0] 25% reserve — máx 75% do capital total deployável
-  // Análise HARD_STOP 25/03/2026: focar em menos posições de maior qualidade ($20 cada)
+  // [FIX 20.0] Tamanho fixo de $10 por operação — máximo absoluto por trade
   // Reserva de 25% garante margem de segurança contra liquidação em cascata
   private static readonly MIN_VOLUME_24H = 1_000_000; // [FIX 17.0] $1M min volume (up from $500k) — anti-slippage: evita NAORIS_USDT-style -$16 losses por falta de liquidez no order book
 
@@ -722,9 +678,9 @@ export class TradingEngine {
       : 70; // 70% permite mais oportunidades com alavancagem adaptativa
   }
 
-  // Leverage limits — MAX 5x por configuração do usuário (FIX MAX_LEVERAGE)
+  // Leverage limits — MAX 20x conforme solicitação do usuário (atualizado 26/03/2026)
   private getMaxLeverage(): number {
-    return 5; // Limite máximo fixo em 5x conforme configuração do usuário
+    return 20; // Limite máximo fixo em 20x — operando com $10 fixo por trade
   }
 
   private getConfiguredMaxOpenPositions(): number {
@@ -1055,7 +1011,7 @@ export class TradingEngine {
     const minConf = this.getMinConfidence();
     const maxLev = this.getMaxLeverage();
     const currentEntryValue = this.escalationManager.getNextEntryValue();
-    const maxNewPositions = Math.max(0, Math.floor(deployableBalance / currentEntryValue)); // [FIX 19.1] Escalonamento: $20/$40/$80 por trade
+    const maxNewPositions = Math.max(0, Math.floor(deployableBalance / currentEntryValue)); // [FIX 20.0] Tamanho fixo: $10 por trade
 
     // Macro context for AI
     const macroInfo = this.macroContext
@@ -1473,9 +1429,7 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
       const reserveFloor = totalBalance * TradingEngine.CAPITAL_RESERVE_PCT;
       const deployable = Math.max(0, available - reserveFloor);
 
-      // [FIX 19.1] Escalonamento progressivo de entrada
-      // $20 → (60 min sem sinal) → $40 → (60 min sem sinal) → $80 → reset se fluxo normal
-      // O escalationManager decide o valor com base no tempo desde a última posição aberta
+      // [FIX 20.0] Tamanho fixo de $10 por operação — máximo absoluto por trade
       const targetSize = this.escalationManager.getNextEntryValue();
       const baseValue = Math.min(deployable, targetSize);
       const notionalValue = baseValue * decision.leverage;
@@ -1556,7 +1510,7 @@ JSON: {"action":"CLOSE"|"HOLD","symbol":"${position.symbol}","confidence":0,"lev
         bybitOrderId: order.orderId,
       });
 
-      // [FIX 19.1] Confirmar abertura no escalation manager
+      // [FIX 20.0] Confirmar abertura no position size manager
       this.escalationManager.confirmOpenedPosition(targetSize);
 
       const appliedSL = decision.weak_signal ? -1.5 : -2.0;
